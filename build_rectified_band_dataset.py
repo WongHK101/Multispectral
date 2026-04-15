@@ -8,6 +8,7 @@ from typing import Dict, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from utils.rectification_utils import (
     build_validity_mask_from_warp,
@@ -17,7 +18,25 @@ from utils.rectification_utils import (
 from utils.spectral_image_utils import load_image_preserve_dtype
 
 
-BANDS = ("G", "R", "RE", "NIR")
+DEFAULT_BANDS = ("G", "R", "RE", "NIR")
+
+
+def _parse_bands(bands) -> Tuple[str, ...]:
+    if bands is None:
+        return tuple(DEFAULT_BANDS)
+    if isinstance(bands, str):
+        items = [item.strip() for item in bands.split(",")]
+    else:
+        items = [str(item).strip() for item in bands]
+    parsed = []
+    for item in items:
+        if not item:
+            continue
+        if item not in parsed:
+            parsed.append(item)
+    if not parsed:
+        raise ValueError("No valid bands provided to build_rectified_band_dataset.")
+    return tuple(parsed)
 
 
 def _load_manifest(scene_root: Path) -> Dict[str, object]:
@@ -58,8 +77,8 @@ def _warp_raw_array(raw_array: np.ndarray, homography: np.ndarray, target_size: 
     source_dtype = source.dtype
     if source.ndim == 3 and source.shape[2] == 1:
         source = source[..., 0]
-    if source.ndim != 2:
-        raise ValueError(f"Expected single-band raw array, got shape={source.shape}")
+    if source.ndim not in (2, 3):
+        raise ValueError(f"Expected 2D/3D raw array, got shape={source.shape}")
 
     if np.issubdtype(source_dtype, np.integer):
         working = source.astype(np.float32)
@@ -73,9 +92,23 @@ def _warp_raw_array(raw_array: np.ndarray, homography: np.ndarray, target_size: 
     return np.ascontiguousarray(warped)
 
 
+def _save_image_with_sidecar(path: Path, image_array: np.ndarray, metadata: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(image_array)
+    if arr.ndim == 2:
+        Image.fromarray(arr).save(path)
+    elif arr.ndim == 3:
+        Image.fromarray(arr).save(path)
+    else:
+        raise ValueError(f"Unsupported warped image shape for save: {arr.shape}")
+    sidecar_path = path.with_suffix(path.suffix + ".meta.json")
+    sidecar_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def build_rectified_band_dataset(prepared_root: Path,
                                  rectified_root: Path,
-                                 homography_json: Path) -> Dict[str, object]:
+                                 homography_json: Path,
+                                 bands: Tuple[str, ...] | str | None = None) -> Dict[str, object]:
     prepared_root = prepared_root.resolve()
     rectified_root = rectified_root.resolve()
     homography_json = homography_json.resolve()
@@ -87,14 +120,17 @@ def build_rectified_band_dataset(prepared_root: Path,
     if not rgb_items:
         raise RuntimeError(f"No RGB images found in scene manifest: {rgb_scene_root}")
 
+    band_list = _parse_bands(bands)
+
     summary = {
         "prepared_root": str(prepared_root),
         "rectified_root": str(rectified_root),
         "homography_json": str(homography_json),
+        "bands_order": list(band_list),
         "bands": {},
     }
 
-    for band in BANDS:
+    for band in band_list:
         raw_scene_root = prepared_root / f"{band}_raw"
         raw_manifest = _load_manifest(raw_scene_root)
         image_map = {
@@ -139,6 +175,7 @@ def build_rectified_band_dataset(prepared_root: Path,
             target_size = _rgb_target_size(rgb_scene_root, image_name)
             warped = _warp_raw_array(loaded.array, homography=homography, target_size=target_size)
             mask = build_validity_mask_from_warp(loaded.array.shape[:2], homography=homography, target_size=target_size)
+            is_scalar = (loaded.channel_count == 1) or (np.asarray(warped).ndim == 2) or (np.asarray(warped).ndim == 3 and np.asarray(warped).shape[2] == 1)
 
             image_out_path = rect_scene_root / "images" / image_name
             mask_out_path = rect_scene_root / "validity_masks" / f"{Path(image_name).stem}.png"
@@ -153,7 +190,10 @@ def build_rectified_band_dataset(prepared_root: Path,
                     "transform_mode": scene_manifest["transform_mode"],
                 }
             )
-            save_scalar_tiff_with_sidecar(image_out_path, warped, sidecar)
+            if is_scalar:
+                save_scalar_tiff_with_sidecar(image_out_path, warped, sidecar)
+            else:
+                _save_image_with_sidecar(image_out_path, warped, sidecar)
             cv2.imwrite(str(mask_out_path), (mask * 255.0).astype(np.uint8))
 
             scene_manifest["images"].append(
@@ -164,9 +204,9 @@ def build_rectified_band_dataset(prepared_root: Path,
                     "validity_mask_path": str(mask_out_path),
                     "frame_id": raw_item.get("frame_id", ""),
                     "paired_group_id": raw_item.get("paired_group_id", ""),
-                    "modality_type": "scalar_band",
+                    "modality_type": "scalar_band" if is_scalar else "rgb",
                     "band_name": band,
-                    "carrier_mode": "replicated_scalar_rgb",
+                    "carrier_mode": "replicated_scalar_rgb" if is_scalar else "native_rgb",
                     "metadata": sidecar,
                     "scene_kind": "rectified_band",
                     "rectification_status": "rectified",
@@ -195,12 +235,14 @@ def main() -> None:
     ap.add_argument("--prepared_root", required=True, help="Prepared raw root containing RGB and *_raw scenes.")
     ap.add_argument("--rectified_root", required=True, help="Root where *_rectified scenes will be written.")
     ap.add_argument("--homography_json", required=True, help="Fixed homography JSON produced by estimate_band_homographies.py.")
+    ap.add_argument("--bands", default="G,R,RE,NIR", help="Comma-separated modality list to build (e.g., G,R,RE,NIR or T).")
     args = ap.parse_args()
 
     summary = build_rectified_band_dataset(
         prepared_root=Path(args.prepared_root),
         rectified_root=Path(args.rectified_root),
         homography_json=Path(args.homography_json),
+        bands=args.bands,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

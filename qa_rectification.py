@@ -21,7 +21,25 @@ from utils.rectification_utils import (
 from utils.spectral_image_utils import load_image_preserve_dtype, normalize_scalar_band_image
 
 
-BANDS = ("G", "R", "RE", "NIR")
+DEFAULT_BANDS = ("G", "R", "RE", "NIR")
+
+
+def _parse_bands(bands) -> List[str]:
+    if bands is None:
+        return list(DEFAULT_BANDS)
+    if isinstance(bands, str):
+        items = [item.strip() for item in bands.split(",")]
+    else:
+        items = [str(item).strip() for item in bands]
+    parsed: List[str] = []
+    for item in items:
+        if not item:
+            continue
+        if item not in parsed:
+            parsed.append(item)
+    if not parsed:
+        raise ValueError("No valid bands provided to qa_rectification.")
+    return parsed
 
 
 def _load_manifest(scene_root: Path) -> Dict[str, object]:
@@ -46,7 +64,23 @@ def _save_uint8_image(path: Path, array: np.ndarray) -> None:
 
 def _load_scalar_image(path: Path, dynamic_range: str, radiometric_mode: str) -> np.ndarray:
     loaded = load_image_preserve_dtype(path)
-    return normalize_scalar_band_image(loaded, loaded.metadata, mode=radiometric_mode, dynamic_range=dynamic_range)
+    raw = np.asarray(loaded.array)
+    if raw.ndim == 2 or (raw.ndim == 3 and raw.shape[2] == 1):
+        return normalize_scalar_band_image(loaded, loaded.metadata, mode=radiometric_mode, dynamic_range=dynamic_range)
+    if raw.ndim == 3 and raw.shape[2] >= 3:
+        arr = raw.astype(np.float32, copy=False)
+        if np.issubdtype(raw.dtype, np.integer):
+            if str(dynamic_range).lower() == "uint8":
+                denom = 255.0
+            elif str(dynamic_range).lower() == "uint16":
+                denom = 65535.0
+            else:
+                denom = float(np.iinfo(raw.dtype).max)
+            arr = arr / max(denom, 1.0)
+        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+        gray = np.nan_to_num(gray, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.clip(gray, 0.0, 1.0).astype(np.float32)
+    raise ValueError(f"Unsupported image shape for QA scalar projection: {raw.shape}")
 
 
 def _summary_without_frames(summary: dict) -> dict:
@@ -56,6 +90,7 @@ def _summary_without_frames(summary: dict) -> dict:
 def run_rectification_qa(prepared_root: Path,
                          rectified_root: Path,
                          out_root: Path,
+                         bands: List[str] | str | None = None,
                          frame_count: int = 6,
                          radiometric_mode: str = "exposure_normalized",
                          input_dynamic_range: str = "uint16",
@@ -75,14 +110,16 @@ def run_rectification_qa(prepared_root: Path,
 
     rgb_scene_root = prepared_root / "RGB"
     rgb_items = _image_map(_load_manifest(rgb_scene_root))
+    band_list = _parse_bands(bands)
     summary = {
         "prepared_root": str(prepared_root),
         "rectified_root": str(rectified_root),
         "out_root": str(out_root),
+        "bands_order": band_list,
         "bands": {},
     }
 
-    for band in BANDS:
+    for band in band_list:
         raw_scene_root = prepared_root / f"{band}_raw"
         rect_scene_root = rectified_root / f"{band}_rectified"
         raw_map = _image_map(_load_manifest(raw_scene_root))
@@ -227,6 +264,7 @@ def main() -> None:
     ap.add_argument("--rectified_root", required=True, help="Root containing *_rectified scenes.")
     ap.add_argument("--out_root", required=True, help="Output directory for QA overlays and summary JSON.")
     ap.add_argument("--frame_count", type=int, default=6)
+    ap.add_argument("--bands", default="G,R,RE,NIR", help="Comma-separated modality list to QA (e.g., G,R,RE,NIR or T).")
     ap.add_argument("--input_dynamic_range", default="uint16", choices=["uint8", "uint16", "float"])
     ap.add_argument("--radiometric_mode", default="exposure_normalized", choices=["raw_dn", "exposure_normalized", "reflectance_ready_stub"])
     ap.add_argument("--rectification_edge_dilate_radius", type=int, default=1)
@@ -239,6 +277,7 @@ def main() -> None:
         prepared_root=Path(args.prepared_root),
         rectified_root=Path(args.rectified_root),
         out_root=Path(args.out_root),
+        bands=args.bands,
         frame_count=args.frame_count,
         radiometric_mode=args.radiometric_mode,
         input_dynamic_range=args.input_dynamic_range,
@@ -255,7 +294,7 @@ def main() -> None:
                     "delta_edge_f1": summary["bands"][band]["delta_edge_f1"],
                     "delta_grad_ncc": summary["bands"][band]["delta_grad_ncc"],
                 }
-                for band in BANDS
+                for band in summary.get("bands", {}).keys()
             }
         },
         indent=2,

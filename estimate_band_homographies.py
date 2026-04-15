@@ -34,7 +34,25 @@ from utils.rectification_utils import (
 from utils.spectral_image_utils import load_image_preserve_dtype
 
 
-BANDS = ("G", "R", "RE", "NIR")
+DEFAULT_BANDS = ("G", "R", "RE", "NIR")
+
+
+def _parse_bands(bands) -> List[str]:
+    if bands is None:
+        return list(DEFAULT_BANDS)
+    if isinstance(bands, str):
+        items = [item.strip() for item in bands.split(",")]
+    else:
+        items = [str(item).strip() for item in bands]
+    parsed: List[str] = []
+    for item in items:
+        if not item:
+            continue
+        if item not in parsed:
+            parsed.append(item)
+    if not parsed:
+        raise ValueError("No valid bands provided.")
+    return parsed
 
 
 def _load_manifest(scene_root: Path) -> Dict[str, object]:
@@ -332,6 +350,7 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
 def estimate_band_homographies(
     prepared_root: Path,
     out_json: Path,
+    bands: Sequence[str] | str | None = None,
     frame_count: int = 12,
     input_dynamic_range: str = "uint16",
     radiometric_mode: str = "exposure_normalized",
@@ -429,6 +448,7 @@ def estimate_band_homographies(
         "minima_use_all_if_needed": bool(minima_use_all_if_needed),
         "rectification_enable_residual_refine": bool(rectification_enable_residual_refine),
     }
+    band_list = _parse_bands(bands)
 
     payload = {
         "version": 3,
@@ -437,6 +457,7 @@ def estimate_band_homographies(
         "target_plane_root": str((prepared_root / "RGB").resolve()),
         "input_dynamic_range": input_dynamic_range,
         "radiometric_mode": radiometric_mode,
+        "bands_order": band_list,
         "config": config,
         "bands": {},
     }
@@ -451,7 +472,7 @@ def estimate_band_homographies(
         fine_threshold=float(config["minima_fine_threshold"]),
     )
 
-    for band_name in BANDS:
+    for band_name in band_list:
         payload["bands"][band_name] = _estimate_for_band(prepared_root, band_name, config, matcher=matcher)
 
     write_rectification_diagnostics_json(payload, out_json)
@@ -462,6 +483,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Estimate one global band transform per band to the RGB training plane.")
     ap.add_argument("--prepared_root", required=True, help="Prepared raw root containing RGB and *_raw scenes.")
     ap.add_argument("--out_json", required=True, help="Output JSON file for band-global rectification transforms.")
+    ap.add_argument("--bands", default="G,R,RE,NIR", help="Comma-separated list of modalities to estimate (e.g., G,R,RE,NIR or T).")
     ap.add_argument("--frame_count", type=int, default=12)
     ap.add_argument("--input_dynamic_range", default="uint16", choices=["uint8", "uint16", "float"])
     ap.add_argument("--radiometric_mode", default="exposure_normalized", choices=["raw_dn", "exposure_normalized", "reflectance_ready_stub"])
@@ -508,6 +530,7 @@ def main() -> None:
     payload = estimate_band_homographies(
         prepared_root=Path(args.prepared_root),
         out_json=Path(args.out_json),
+        bands=args.bands,
         frame_count=args.frame_count,
         input_dynamic_range=args.input_dynamic_range,
         radiometric_mode=args.radiometric_mode,
@@ -560,7 +583,7 @@ def main() -> None:
                         "accepted_ratio": _safe_float(payload["bands"][band_name].get("accepted_ratio", 0.0), 0.0),
                         "scores": payload["bands"][band_name]["scores"],
                     }
-                    for band_name in BANDS
+                    for band_name in payload.get("bands", {}).keys()
                 },
             },
             indent=2,

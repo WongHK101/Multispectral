@@ -26,13 +26,36 @@ def load_raw_band_image(path: str | Path,
                         dynamic_range: str = "uint16",
                         radiometric_mode: str = "exposure_normalized") -> np.ndarray:
     loaded = load_image_preserve_dtype(path)
-    arr = normalize_scalar_band_image(
-        image=loaded,
-        metadata=loaded.metadata,
-        mode=radiometric_mode,
-        dynamic_range=dynamic_range,
-    )
-    return np.ascontiguousarray(arr.astype(np.float32))
+    raw = np.asarray(loaded.array)
+
+    # Scalar path (multispectral single-band TIFF, etc.).
+    if raw.ndim == 2 or (raw.ndim == 3 and raw.shape[2] == 1):
+        arr = normalize_scalar_band_image(
+            image=loaded,
+            metadata=loaded.metadata,
+            mode=radiometric_mode,
+            dynamic_range=dynamic_range,
+        )
+        return np.ascontiguousarray(arr.astype(np.float32))
+
+    # RGB/false-color thermal path: convert to robust grayscale proxy for matching.
+    if raw.ndim == 3 and raw.shape[2] >= 3:
+        arr = raw.astype(np.float32, copy=False)
+        if np.issubdtype(raw.dtype, np.integer):
+            if str(dynamic_range).lower() == "uint8":
+                denom = 255.0
+            elif str(dynamic_range).lower() == "uint16":
+                denom = 65535.0
+            else:
+                denom = float(np.iinfo(raw.dtype).max)
+            arr = arr / max(denom, 1.0)
+        # Luma-style projection keeps edge structure stable for cross-modal matching.
+        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+        gray = np.nan_to_num(gray, nan=0.0, posinf=0.0, neginf=0.0)
+        gray = np.clip(gray, 0.0, 1.0)
+        return np.ascontiguousarray(gray.astype(np.float32))
+
+    raise ValueError(f"Unsupported band image shape for rectification loading: {raw.shape}")
 
 
 def normalize_homography(homography: np.ndarray) -> np.ndarray:
