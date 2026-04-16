@@ -418,8 +418,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         validity_mask = getattr(viewpoint_cam, "validity_mask", None)
         use_masked_band_loss = (
-            getattr(args, "stage2_mode", "none") == "band_transfer"
-            and bool(getattr(args, "use_validity_mask", False))
+            bool(getattr(args, "use_validity_mask", False))
             and validity_mask is not None
         )
 
