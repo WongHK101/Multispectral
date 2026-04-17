@@ -1,42 +1,97 @@
-# UAV-FGS Anonymous Review Code
+# Anonymous Review Code
 
-This package contains the anonymous review code for the paper's RGB-T UAV 3D Gaussian Splatting pipeline. It is a minimal, self-contained adaptation of the original 3D Gaussian Splatting codebase, with the additional scripts required for:
+This repository contains the anonymous review code for a UAV multispectral 3D Gaussian Splatting pipeline.
 
-- CFR-based raw RGB-T standardization from cross-FoV image pairs
-- RGB-stage 3DGS reconstruction
-- thermal-stage 3DGS transfer/training
-- controllable RGB-T fusion and sweep evaluation
-- GT-view and auxiliary evaluation used by the paper
+The current mainline supports:
 
-This review package intentionally omits non-essential viewer/build artifacts, internal campaign scripts, summary generators, and local experiment records.
+- RGB geometry anchoring with 3D Gaussian Splatting
+- band-specific transfer for `G / R / RE / NIR`
+- learning-based rectification for raw UAV multispectral captures
+- strict train/test protocols for raw scenes
+- false-color and spectral-index proxy product export
+- masked and common-mask offline evaluation
 
-## Quick Start (Reviewer, Copy-Paste)
+This package is prepared for anonymous academic review. It keeps the current multispectral pipeline and the auxiliary scripts required for protocol generation, evaluation, and ablation support.
 
-This repository is derived from the original 3D Gaussian Splatting codebase, and the review-time setup steps and checks needed for reproduction are listed here.
+## 1. What Is Included
 
-### 1) System prerequisites
+The core entry points are:
 
-The CUDA extensions in `submodules/` require both:
+- `run_spectralindexgs_pipeline.py`
+  - end-to-end raw multispectral pipeline
+- `prepare_official_ms_scene.py`
+  - converts official aligned multispectral scenes into repo-native scene layout
+- `train.py`
+  - 3DGS training entry point
+- `render.py`
+  - offline rendering
+- `metrics.py`
+  - standard 3DGS metrics
+- `masked_metrics.py`
+  - offline masked evaluation for a single model
+- `common_mask_eval.py`
+  - common-mask evaluation across multiple compared methods
+- `build_spectral_products.py`
+  - false-color and spectral-index product construction
+- `freeze_protocol_assets.py`
+  - protocol split freezing and command-template generation
+
+The repository also contains required runtime modules:
+
+- `arguments/`
+- `gaussian_renderer/`
+- `scene/`
+- `utils/`
+- `lpipsPyTorch/`
+- `submodules/`
+
+## 2. Current Protocol Summary
+
+The repository currently supports two scene families:
+
+### 2.1 Raw UAV multispectral scenes
+
+These scenes are expected to come from raw UAV captures with:
+
+- an RGB image per capture
+- four single-band images: `G`, `R`, `RE`, `NIR`
+
+For raw scenes, the intended protocol is:
+
+- frozen train/test split
+- train-only SfM / COLMAP mapping
+- held-out test image localization into the frozen train reconstruction
+- no post-registration bundle adjustment
+- no point-cloud growth driven by test images
+
+### 2.2 Official aligned multispectral scenes
+
+These scenes already provide aligned image-space geometry / transforms and therefore do **not** go through the raw rectification path.
+
+For official aligned scenes, the intended protocol is:
+
+- dataset-provided aligned transforms
+- no raw-scene rectification
+- no raw-scene SfM protocol repair
+
+## 3. System Requirements
+
+The CUDA extensions in `submodules/` require:
 
 - a system CUDA toolkit with `nvcc`
 - a system C/C++ compiler
 
-The Conda environment below installs the PyTorch CUDA runtime, but it does not replace the system compiler toolchain needed to build the extensions.
+The Conda environment installs the PyTorch CUDA runtime, but that runtime alone does not replace the system build toolchain required to compile the CUDA extensions.
 
-Windows prerequisites:
+### 3.1 Windows prerequisites
 
 - NVIDIA GPU and driver
-- CUDA toolkit with `nvcc` available on `PATH` (CUDA 11.8 is the intended match here)
-- Visual Studio 2019 or 2022 Build Tools with the MSVC x64 C/C++ toolchain
-- a shell where `cl` is available
-- COLMAP on `PATH` (or pass `--colmap <path>`)
-- ExifTool on `PATH` (or pass `--exiftool <path>`)
+- CUDA toolkit with `nvcc` on `PATH`
+- Visual Studio Build Tools with the MSVC x64 C/C++ toolchain
+- COLMAP on `PATH` (or provide the path explicitly)
+- ExifTool on `PATH` (or provide the path explicitly)
 
-Recommended Windows shell:
-
-- Start from `x64 Native Tools Command Prompt for VS 2019/2022`, or any shell where `cl` is already available before installing the CUDA extensions.
-
-Windows preflight checks:
+Preflight checks:
 
 ```powershell
 where.exe nvcc
@@ -45,22 +100,15 @@ where.exe colmap
 where.exe exiftool
 ```
 
-Linux prerequisites:
+### 3.2 Linux prerequisites
 
 - NVIDIA GPU and driver
-- CUDA toolkit with `nvcc` available on `PATH`
+- CUDA toolkit with `nvcc` on `PATH`
 - GCC/G++ toolchain
 - COLMAP on `PATH`
 - ExifTool on `PATH`
 
-Linux example (Ubuntu):
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential gcc g++ cmake ninja-build colmap libimage-exiftool-perl
-```
-
-Linux preflight checks:
+Preflight checks:
 
 ```bash
 which nvcc
@@ -69,27 +117,29 @@ which colmap
 which exiftool
 ```
 
-### 2) Create environment
+## 4. Environment Setup
 
-Recommended explicit setup:
+### 4.1 Create a Conda environment
+
+Recommended setup:
 
 ```bash
-conda create -n uav-fgs python=3.10.18 pip=25.2 numpy=1.26.4 -y
-conda activate uav-fgs
+conda create -n spectralindexgs python=3.10.18 pip=25.2 numpy=1.26.4 -y
+conda activate spectralindexgs
 conda install -y pytorch==2.0.1 torchvision==0.15.2 pytorch-cuda=11.8 -c pytorch -c nvidia -c defaults
 python -m pip install -r requirements.txt
 ```
 
-Equivalent one-shot alternative:
+The repository also ships an `environment.yml` file if you prefer a one-shot environment creation flow:
 
 ```bash
 conda env create -f environment.yml
 conda activate uav-fgs
 ```
 
-### 3) Install CUDA extensions (required)
+### 4.2 Install CUDA extensions
 
-Run these commands from the repository root, in the same shell that already sees `nvcc` and the system compiler:
+Run the following commands from the repository root:
 
 ```bash
 python -m pip install --no-build-isolation submodules/simple-knn
@@ -97,228 +147,370 @@ python -m pip install --no-build-isolation submodules/diff-gaussian-rasterizatio
 python -m pip install --no-build-isolation submodules/fused-ssim
 ```
 
-Standard non-editable installs are intentional here. They are sufficient for review reproduction and are more robust than editable installs across different `pip` and `setuptools` versions.
+### 4.3 Optional external rectification dependency
 
-### 4) Sanity checks
+The raw multispectral rectification path uses an external MINIMA checkout at runtime.
 
-Do not rely only on the `conda` or `pip` exit text. Always run the checks below after installation, especially if package manager output included warnings such as cache, clobber, or safety messages.
+This repository does **not** automatically download MINIMA. If you want to run raw-scene rectification, prepare a local MINIMA checkout and pass its path through:
 
-Toolchain checks:
+- `--minima_root`
 
-Windows:
+Supported matcher options currently exposed by the bridge:
 
-```powershell
-where.exe nvcc
-where.exe cl
-where.exe colmap
-where.exe exiftool
-```
+- `--minima_method roma`
+- `--minima_method xoftr`
 
-Linux:
+The default and more stable backend in the current experiments is `roma`.
 
-```bash
-which nvcc
-which g++
-which colmap
-which exiftool
-```
-
-Python/runtime checks:
+### 4.4 Sanity checks
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 python -c "import cv2, diff_gaussian_rasterization, simple_knn, fused_ssim; print('extensions OK')"
 python train.py -h
 python render.py -h
-python metrics.py -h
-python cfr.py -h
-python run_uavfgs_pipeline.py -h
+python run_spectralindexgs_pipeline.py -h
+python prepare_official_ms_scene.py -h
+python build_spectral_products.py -h
+python masked_metrics.py -h
+python common_mask_eval.py -h
 ```
 
-### 5) Smoke tests
+## 5. Data Assumptions
 
-Dataset layout:
+### 5.1 Raw UAV multispectral scenes
+
+Raw scenes are prepared by `prepare_m3m_multispectral.py`.
+
+The expected capture structure is:
+
+- one RGB image per capture, for example `DJI_xxx_D.JPG`
+- four single-band images per capture:
+  - `MS_G.TIF`
+  - `MS_R.TIF`
+  - `MS_RE.TIF`
+  - `MS_NIR.TIF`
+
+The current code is designed to tolerate slight naming drift between the RGB and multispectral files in DJI-style data. Pairing is done by capture/frame identity rather than by requiring an exact full timestamp-stem match.
+
+### 5.2 Official aligned multispectral scenes
+
+Official aligned scenes are prepared by `prepare_official_ms_scene.py`.
+
+Supported image roots:
+
+- `images`
+- `images_2`
+- `images_4`
+
+In the current protocol, `images_2` is the typical choice for the official aligned scenes.
+
+## 6. Frozen Split Assets
+
+If you want to reproduce the strict held-out evaluation protocol, first freeze the protocol assets:
+
+```bash
+python freeze_protocol_assets.py --out_root <SPLIT_ROOT>
+```
+
+This generates:
+
+- `split_v1.json`
+- per-scene `train.txt`
+- per-scene `test.txt`
+- protocol-pack metadata
+- official-MS command templates
+
+## 7. Main Raw-Scene Pipeline
+
+The primary entry point for raw multispectral scenes is:
+
+```bash
+python run_spectralindexgs_pipeline.py \
+  --raw_root <RAW_SCENE_ROOT> \
+  --prepared_root <PREPARED_ROOT> \
+  --rectified_root <RECTIFIED_ROOT> \
+  --out_root <OUT_ROOT> \
+  --protocol_split <SPLIT_JSON> \
+  --raw_sfm_protocol train_only_register_test \
+  --rectification_backend minima \
+  --minima_method roma \
+  --minima_root <MINIMA_ROOT> \
+  --rgb_iter 30000 \
+  --band_iter 60000 \
+  --rgb_res 8 \
+  --band_res 8 \
+  --input_dynamic_range uint16 \
+  --radiometric_mode exposure_normalized \
+  --auto_render
+```
+
+### 7.1 Pipeline stages
+
+The current pipeline stages are:
+
+1. `01_prepare`
+2. `02_train_rgb`
+3. `03_build_rectified_bands`
+4. `04_train_band_g`
+5. `05_train_band_r`
+6. `06_train_band_re`
+7. `07_train_band_nir`
+8. `08_build_products`
+9. `09_optional_render`
+
+### 7.2 Important defaults and semantics
+
+- `band_iter` currently follows a **final-iteration** semantics
+- for example, `rgb_iter=30000` and `band_iter=60000` means:
+  - RGB is trained to `30000`
+  - each band stage restores the RGB checkpoint and continues to iteration `60000`
+- `rgb_res` and `band_res` are passed to `train.py`
+- raw single-band TIFF data commonly uses:
+  - `--input_dynamic_range uint16`
+  - `--radiometric_mode exposure_normalized`
+
+### 7.3 Typical output structure
 
 ```text
-<DATA_ROOT>/
-  rgb/
-  thermal/
+<OUT_ROOT>/
+  Model_RGB/
+  Model_G/
+  Model_R/
+  Model_RE/
+  Model_NIR/
+  Products/
+    false_color_nir_r_g/
+    false_color_re_nir_r/
+    false_color_nir_re_g/
+    ndvi_gray/
+    ndvi_pseudocolor/
+    ndre_gray/
+    ndre_pseudocolor/
+    gndvi_gray/
+    gndvi_pseudocolor/
+    savi_gray/
+    savi_pseudocolor/
+    osavi_gray/
+    osavi_pseudocolor/
 ```
 
-If `--rgb_dir` is omitted, the pipeline first looks for `<DATA_ROOT>/RGB` and then falls back to `<DATA_ROOT>/rgb`.
+## 8. Official Aligned Scene Workflow
 
-Lightweight CFR smoke test on a real scene:
+Official aligned scenes do not use the raw rectification pipeline.
+
+### 8.1 Prepare the aligned scene
 
 ```bash
-python cfr.py --rgb_dir <DATA_ROOT>/rgb --th_dir <DATA_ROOT>/thermal --out_dir <TMP_CFR_OUT> --samples 3 --align fit --stage both --comparison
+python prepare_official_ms_scene.py \
+  --source_root <OFFICIAL_SCENE_ROOT> \
+  --out_root <PREPARED_ROOT> \
+  --image_root images_2 \
+  --split_json <SPLIT_JSON>
 ```
 
-Lightweight pipeline smoke test:
+### 8.2 Train the RGB model
 
-1. Prepare a tiny paired subset at:
+```bash
+python train.py \
+  -s <PREPARED_ROOT>/RGB \
+  -m <OUT_ROOT>/Model_RGB \
+  -r 1 \
+  --eval \
+  --iterations 30000 \
+  --checkpoint_iterations 30000 \
+  --save_iterations 30000 \
+  --test_iterations 30000 \
+  --disable_viewer \
+  --modality_kind rgb
+```
+
+### 8.3 Train the four band models
+
+Example for `G`:
+
+```bash
+python train.py \
+  -s <PREPARED_ROOT>/G_aligned \
+  -m <OUT_ROOT>/Model_G \
+  -r 1 \
+  --eval \
+  --iterations 60000 \
+  --checkpoint_iterations 60000 \
+  --save_iterations 60000 \
+  --test_iterations 60000 \
+  --start_checkpoint <OUT_ROOT>/Model_RGB/chkpnt30000.pth \
+  --modality_kind band \
+  --target_band G \
+  --single_band_mode true \
+  --single_band_replicate_to_rgb true \
+  --input_dynamic_range uint8 \
+  --radiometric_mode raw_dn \
+  --stage2_mode band_transfer \
+  --reset_appearance_features true \
+  --freeze_geometry true \
+  --freeze_opacity true \
+  --tied_scalar_carrier true \
+  --feature_lr 0.001 \
+  --lambda_dssim 0 \
+  --require_rectified_band_scene false \
+  --use_validity_mask false \
+  --disable_viewer
+```
+
+Repeat analogously for `R`, `RE`, and `NIR`.
+
+### 8.4 Build spectral products
+
+```bash
+python build_spectral_products.py \
+  --g_model_dir <OUT_ROOT>/Model_G \
+  --r_model_dir <OUT_ROOT>/Model_R \
+  --re_model_dir <OUT_ROOT>/Model_RE \
+  --nir_model_dir <OUT_ROOT>/Model_NIR \
+  --g_iter 60000 \
+  --r_iter 60000 \
+  --re_iter 60000 \
+  --nir_iter 60000 \
+  --out_root <OUT_ROOT>/Products \
+  --require_opacity_match true
+```
+
+## 9. Evaluation
+
+### 9.1 Standard metrics
+
+```bash
+python metrics.py -m <MODEL_DIR_1> <MODEL_DIR_2> ...
+```
+
+### 9.2 Masked offline metrics
+
+```bash
+python masked_metrics.py -m <MODEL_DIR> --split test --out_json <OUT_JSON>
+```
+
+By default, the script parses `source_path` from `cfg_args` and looks for validity masks under:
 
 ```text
-<TINY_ROOT>/
-  rgb/
-  thermal/
+<source_path>/validity_masks
 ```
 
-2. Copy a few paired RGB/T images from one scene into the two folders above.
-
-3. Run the first two pipeline steps:
+### 9.3 Common-mask comparison across methods
 
 ```bash
-python run_uavfgs_pipeline.py --data_root <TINY_ROOT> --out_root <TINY_OUT> --rgb_dir <TINY_ROOT>/rgb --to_step 2
+python common_mask_eval.py \
+  --method E0=<RUN_ROOT_0> \
+  --method E1=<RUN_ROOT_1> \
+  --method E2=<RUN_ROOT_2> \
+  --out_json <OUT_JSON>
 ```
 
-### 6) Run full pipeline
+### 9.4 Paired confidence-interval reports
 
-Full dataset layout:
+```bash
+python paired_ci_report.py -h
+```
+
+### 9.5 Masked panel export
+
+```bash
+python export_masked_panels.py -h
+```
+
+## 10. Method Boundary
+
+The current implementation is intended to support:
+
+- shared-geometry band carriers
+- tied scalar carriers
+- per-Gaussian spectral index proxy export
+- rectification-assisted raw multispectral supervision
+
+It is **not** intended to claim:
+
+- native N-channel rendering
+- exact SH-level nonlinear index closure
+- exact physical spectral radiance reconstruction
+
+## 11. Frequently Asked Questions
+
+### Why is `band_iter` set to `60000`?
+
+Because the current code uses a final-iteration semantics for stage-2 training.
+
+If:
+
+- `rgb_iter = 30000`
+- `band_iter = 60000`
+
+then the intended behavior is:
+
+- RGB trains to `30000`
+- each band model restores the RGB checkpoint and trains until iteration `60000`
+
+### Do raw scenes need `--protocol_split`?
+
+If you want the intended strict held-out protocol, the answer is yes.
+
+The raw-scene main protocol is built around:
+
+- frozen splits
+- train-only SfM
+- held-out test localization
+
+### Why do official aligned scenes not use rectification?
+
+Because they already belong to a dataset-provided aligned protocol.
+
+The current preparation script additionally normalizes the split by enforcing the RGB/G/R/RE/NIR group-id intersection so that the train/test views are truly matched across all five modalities.
+
+### Does the pipeline modify the raw data root?
+
+It should not.
+
+Prepared data, rectified data, model outputs, audit files, and protocol artifacts are expected to be written to separate directories such as:
+
+- `prepared_root`
+- `rectified_root`
+- `out_root`
+- frozen protocol-pack directories
+
+## 12. Repository Layout
 
 ```text
-<DATA_ROOT>/
-  rgb/
-  thermal/
+arguments/                     CLI arguments
+gaussian_renderer/             renderer
+scene/                         scene, dataset, and camera loaders
+utils/                         helper utilities, including the MINIMA bridge
+submodules/                    CUDA extensions
+
+prepare_m3m_multispectral.py   raw M3M scene preparation
+prepare_official_ms_scene.py   official aligned MS preparation
+freeze_protocol_assets.py      frozen split / protocol-pack generation
+estimate_band_homographies.py  rectification estimation
+build_rectified_band_dataset.py
+qa_rectification.py
+run_spectralindexgs_pipeline.py
+build_spectral_products.py
+train.py
+render.py
+metrics.py
+masked_metrics.py
+common_mask_eval.py
+paired_ci_report.py
+export_masked_panels.py
 ```
 
-Main command:
+## 13. Notes
+
+- This README reflects the **current multispectral mainline**.
+- If the README and the code ever diverge, use the current CLI help and code behavior as the authoritative reference:
 
 ```bash
-python run_uavfgs_pipeline.py --data_root <DATA_ROOT> --out_root <OUT_ROOT>
-```
-
-Equivalent explicit lowercase-RGB form:
-
-```bash
-python run_uavfgs_pipeline.py --data_root <DATA_ROOT> --out_root <OUT_ROOT> --rgb_dir <DATA_ROOT>/rgb
-```
-
-The pipeline is resumable by default. To rerun from scratch, use cleaning flags such as:
-
-`--clean_fit --clean_input --clean_thermal_ud --clean_blend_out --force`
-
-## Package Layout
-
-The package keeps the same root-level structure expected by the original 3DGS codebase:
-
-- `train.py`, `render.py`, `metrics.py`: inherited 3DGS training/rendering/metric entry points
-- `run_uavfgs_pipeline.py`: one-command end-to-end pipeline used in this work
-- `cfr.py`: crop/FoV/resolution standardization for raw RGB-T pairs
-- `convert_uavfgs.py`: COLMAP + input conversion helper
-- `eval_crop_metrics.py`: crop/alignment evaluation helper
-- `metrics_plus.py`: extended GT-view metrics and auxiliary diagnostics
-- `novel_view_metrics.py`: optional no-reference novel-view evaluation
-- `blend_model_strict_endpoints.py`: RGB-T Gaussian fusion/export
-- `eval_blend_sweep.py`: fusion-sweep evaluation
-- `arguments/`, `gaussian_renderer/`, `scene/`, `utils/`, `lpipsPyTorch/`: required runtime code
-- `submodules/`: vendored CUDA extensions required by the optimizer/renderer
-
-## Environment
-
-This repository is tested with:
-
-- Python `3.10`
-- PyTorch `2.0.1` + TorchVision `0.15.2`
-- CUDA runtime `11.8` via `pytorch-cuda=11.8`
-- Conda-based setup
-
-The environment spec is:
-
-- `environment.yml` for Conda + PyTorch/CUDA
-- `requirements.txt` for the remaining Python packages
-
-`requirements.txt` intentionally relies on the default PyPI index so that link-scrubbing on anonymous review platforms does not affect installation.
-
-The package uses `opencv-python-headless` because the review code does not require OpenCV GUI windows. `opencv-python` is also acceptable if preferred locally.
-
-Important note for extension builds:
-
-- PyTorch CUDA runtime from Conda is not enough by itself
-- the extension build additionally requires system `nvcc`
-- the extension build additionally requires a visible system compiler (`cl` on Windows, `g++` on Linux)
-
-## External Tools
-
-The full raw-pair pipeline expects:
-
-- COLMAP on `PATH`, or pass `--colmap <path>`
-- ExifTool on `PATH`, or pass `--exiftool <path>`
-
-`cfr.py` has fallback behavior when ExifTool is unavailable, but the full review pipeline should still be configured with COLMAP and ExifTool available.
-
-## Data Assumptions
-
-The end-to-end pipeline expects a dataset root of the form:
-
-```text
-<DATA_ROOT>/
-  rgb/
-  thermal/
-```
-
-The full benchmark and anonymous review access information should be provided separately in the review materials.
-
-## Main Entry Point
-
-The primary entry point used in this project is:
-
-```bash
-python run_uavfgs_pipeline.py --data_root <DATA_ROOT> --out_root <OUT_ROOT>
-```
-
-This orchestrates the review package pipeline in order:
-
-1. CFR standardization from raw RGB-T pairs
-2. crop/alignment evaluation
-3. COLMAP conversion and reconstruction
-4. stage-1 RGB 3DGS training/rendering/metrics
-5. thermal undistortion and layout normalization
-6. stage-2 thermal 3DGS training/rendering/metrics
-7. RGB-T Gaussian blending
-8. fusion-sweep evaluation
-
-The script is resumable by default and writes per-step state files under:
-
-```text
-<DATA_ROOT>/_pipeline_state/
-```
-
-## Important Defaults
-
-The review package follows the current code defaults, not older README snapshots.
-
-- `run_metrics_plus=true`
-- `run_novel_view_metrics=false`
-- fusion `dc_y_from=lerp`
-- blend `endpoint_mode=blend`
-
-Please treat `run_uavfgs_pipeline.py -h` as the authoritative source of current CLI defaults.
-
-## Minimal Direct Usage
-
-If you want to run steps separately, the main scripts are:
-
-```bash
-python cfr.py -h
-python convert_uavfgs.py -h
+python run_spectralindexgs_pipeline.py -h
 python train.py -h
 python render.py -h
-python metrics.py -h
-python metrics_plus.py -h
-python novel_view_metrics.py -h
-python blend_model_strict_endpoints.py -h
-python eval_blend_sweep.py -h
 ```
 
-## Troubleshooting
-
-- If `cl` is missing on Windows, reopen the session from a Visual Studio developer prompt and reinstall the CUDA extensions from that shell.
-- If `nvcc` is missing, install a system CUDA toolkit and reopen the shell before building the extensions.
-- If `conda env create` or `conda install` prints cache, safety, or clobber warnings, complete the installation, then run the sanity checks above. If the sanity checks fail, clean the Conda cache and recreate the environment.
-- If extension installation fails, first confirm that `python -c "import torch"` works in the active environment, then confirm that `nvcc` and the system compiler are visible in the same shell.
-
-## Notes on Scope
-
-- This package is prepared for anonymous academic review.
-- It intentionally excludes non-core viewers, build caches, internal analysis scripts, and local result tables.
-- It preserves third-party license headers and upstream attribution where required by inherited components.
+- This repository is packaged for anonymous academic review and therefore intentionally avoids non-essential local viewers, cached runs, and internal experiment tables.
