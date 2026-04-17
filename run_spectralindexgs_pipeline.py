@@ -316,6 +316,17 @@ def _train_rgb(repo_root: Path, prepared_root: Path, out_root: Path, args) -> No
         "--disable_viewer",
         "--eval",
         "--modality_kind", "rgb",
+        "--ss_enable", "false",
+        "--ss_prune_before_thermal", "false",
+        "--ss_prune_after_rgb", "false",
+        "--clamp_scale_after_densify", "false",
+        "--clamp_scale_after_rgb_final", "false",
+        "--thermal_reset_features", "false",
+        "--t_struct_grad_w", "0.0",
+        "--sgf_disable", "false",
+        "--baseline_modules_off", "false",
+        "--baseline_restore_ssp", "false",
+        "--baseline_restore_stt", "false",
     ]
     _run(cmd, cwd=repo_root)
 
@@ -442,6 +453,17 @@ def _train_band(repo_root: Path, rectified_root: Path, out_root: Path, args, ban
         "--use_validity_mask", "true" if args.use_validity_mask else "false",
         "--rectified_root", str(rectified_root),
         "--rectification_method", str(args.rectification_method),
+        "--ss_enable", "false",
+        "--ss_prune_before_thermal", "false",
+        "--ss_prune_after_rgb", "false",
+        "--clamp_scale_after_densify", "false",
+        "--clamp_scale_after_rgb_final", "false",
+        "--thermal_reset_features", "false",
+        "--t_struct_grad_w", "0.0",
+        "--sgf_disable", "false",
+        "--baseline_modules_off", "false",
+        "--baseline_restore_ssp", "false",
+        "--baseline_restore_stt", "false",
     ]
     if args.rectification_config:
         cmd.extend(["--rectification_config", str(Path(args.rectification_config).resolve())])
