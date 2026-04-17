@@ -698,10 +698,18 @@ def write_rectification_diagnostics_json(diag, out_path):
     out_path.write_text(json.dumps(diag, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def build_scale_adapters(source_shape: Sequence[int], target_shape: Sequence[int], alignment_scale: float) -> Dict[str, np.ndarray]:
+def build_scale_adapters(
+    source_shape: Sequence[int],
+    target_shape: Sequence[int],
+    alignment_scale: float,
+    alignment_max_dim: int = 0,
+) -> Dict[str, np.ndarray]:
     src_h, src_w = int(source_shape[0]), int(source_shape[1])
     tgt_h, tgt_w = int(target_shape[0]), int(target_shape[1])
     scale = float(alignment_scale)
+    max_dim = int(alignment_max_dim)
+    if max_dim > 0:
+        scale = min(scale, float(max_dim) / float(max(src_h, src_w, tgt_h, tgt_w, 1)))
     scaled_src_w = max(int(round(src_w * scale)), 8)
     scaled_src_h = max(int(round(src_h * scale)), 8)
     scaled_tgt_w = max(int(round(tgt_w * scale)), 8)
@@ -718,6 +726,7 @@ def build_scale_adapters(source_shape: Sequence[int], target_shape: Sequence[int
         "source_shape_align": (scaled_src_h, scaled_src_w),
         "target_shape_align": (scaled_tgt_h, scaled_tgt_w),
         "alignment_scale": scale,
+        "alignment_max_dim": max_dim,
     }
 
 
@@ -732,7 +741,8 @@ def scale_transform_from_alignment(H_align: np.ndarray, scale_adapters: dict) ->
 def prepare_frame_batch(frame_records: Sequence[dict],
                         input_dynamic_range: str,
                         radiometric_mode: str,
-                        alignment_scale: float) -> List[dict]:
+                        alignment_scale: float,
+                        alignment_max_dim: int = 0) -> List[dict]:
     frame_batch: List[dict] = []
     for record in frame_records:
         rgb_full = load_rgb_plane_image(record["rgb_path"])
@@ -741,7 +751,12 @@ def prepare_frame_batch(frame_records: Sequence[dict],
             dynamic_range=input_dynamic_range,
             radiometric_mode=radiometric_mode,
         )
-        scale_adapters = build_scale_adapters(band_full.shape, rgb_full.shape, alignment_scale=alignment_scale)
+        scale_adapters = build_scale_adapters(
+            band_full.shape,
+            rgb_full.shape,
+            alignment_scale=alignment_scale,
+            alignment_max_dim=alignment_max_dim,
+        )
         rgb_align = cv2.resize(
             rgb_full,
             (int(scale_adapters["target_shape_align"][1]), int(scale_adapters["target_shape_align"][0])),

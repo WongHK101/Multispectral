@@ -25,7 +25,7 @@ class Camera(nn.Module):
                  modality_type = "rgb", band_name = "", carrier_mode = "native_rgb",
                  image_metadata = None, input_dynamic_range = "uint8", radiometric_mode = "raw_dn",
                  single_band_mode = False, single_band_replicate_to_rgb = None,
-                 validity_mask = None
+                 validity_mask = None, scene_kind = "", rectification_status = ""
                  ):
         super(Camera, self).__init__()
 
@@ -40,8 +40,11 @@ class Camera(nn.Module):
         self.band_name = band_name or ""
         self.carrier_mode = carrier_mode or "native_rgb"
         self.image_metadata = dict(image_metadata or {})
+        self.scene_kind = scene_kind or ""
+        self.rectification_status = rectification_status or ""
         self.original_scalar_image = None
         self.validity_mask = None
+        self.validity_mask_source = "none"
 
         try:
             self.data_device = torch.device(data_device)
@@ -98,8 +101,10 @@ class Camera(nn.Module):
             self.validity_mask = mask_tensor.clamp(0.0, 1.0).to(self.data_device)
             if self.alpha_mask is not None:
                 self.validity_mask = self.validity_mask * self.alpha_mask
+            self.validity_mask_source = "external"
         elif self.alpha_mask is not None:
             self.validity_mask = self.alpha_mask.clone()
+            self.validity_mask_source = "alpha_fallback"
 
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]

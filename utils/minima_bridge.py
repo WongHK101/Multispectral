@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Optional
 
 import numpy as np
+from PIL import Image
 
 # Compatibility shim for older MINIMA third-party code paths on modern NumPy.
 if not hasattr(np, "float"):
@@ -61,6 +63,7 @@ def build_minima_matcher(
     roma_size: str = "large",
     match_threshold: float = 0.3,
     fine_threshold: float = 0.1,
+    match_max_dim: int = 1600,
 ) -> "MinimaMatcherBridge":
     return MinimaMatcherBridge(
         backend=backend,
@@ -70,6 +73,7 @@ def build_minima_matcher(
         roma_size=roma_size,
         match_threshold=match_threshold,
         fine_threshold=fine_threshold,
+        match_max_dim=match_max_dim,
     )
 
 
@@ -92,6 +96,7 @@ class MinimaMatcherBridge:
         roma_size: str = "large",
         match_threshold: float = 0.3,
         fine_threshold: float = 0.1,
+        match_max_dim: int = 1600,
     ):
         self.backend = str(backend).strip().lower()
         if self.backend not in {"roma", "xoftr"}:
@@ -102,7 +107,109 @@ class MinimaMatcherBridge:
         self.roma_size = str(roma_size).strip().lower()
         self.match_threshold = float(match_threshold)
         self.fine_threshold = float(fine_threshold)
+        self.match_max_dim = int(match_max_dim)
         self._matcher_from_paths = self._build_matcher_from_paths()
+
+    @staticmethod
+    def _image_to_uint8_rgb(path: str | Path) -> Image.Image:
+        with Image.open(path) as image:
+            array = np.asarray(image)
+
+        if array.ndim == 2:
+            work = array.astype(np.float32)
+            finite = work[np.isfinite(work)]
+            if finite.size:
+                lo, hi = np.percentile(finite, [1.0, 99.0])
+            else:
+                lo, hi = 0.0, 1.0
+            if not np.isfinite(hi) or hi <= lo:
+                info = np.iinfo(array.dtype) if np.issubdtype(array.dtype, np.integer) else None
+                lo = 0.0
+                hi = float(info.max) if info is not None else float(np.max(work) if work.size else 1.0)
+                if hi <= lo:
+                    hi = 1.0
+            gray = np.clip((work - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+            rgb = np.repeat((gray * 255.0 + 0.5).astype(np.uint8)[..., None], 3, axis=2)
+            return Image.fromarray(rgb, mode="RGB")
+
+        if array.ndim == 3 and array.shape[2] == 1:
+            array = array[..., 0]
+            return MinimaMatcherBridge._image_to_uint8_rgb_from_array(array)
+
+        if array.ndim == 3:
+            rgb = array[..., :3]
+            if rgb.dtype != np.uint8:
+                work = rgb.astype(np.float32)
+                finite = work[np.isfinite(work)]
+                if finite.size:
+                    lo, hi = np.percentile(finite, [1.0, 99.0])
+                else:
+                    lo, hi = 0.0, 1.0
+                if not np.isfinite(hi) or hi <= lo:
+                    info = np.iinfo(rgb.dtype) if np.issubdtype(rgb.dtype, np.integer) else None
+                    lo = 0.0
+                    hi = float(info.max) if info is not None else float(np.max(work) if work.size else 1.0)
+                    if hi <= lo:
+                        hi = 1.0
+                rgb = np.clip((work - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+                rgb = (rgb * 255.0 + 0.5).astype(np.uint8)
+            return Image.fromarray(rgb, mode="RGB")
+
+        raise ValueError(f"Unsupported image shape for MINIMA matching: {array.shape} from {path}")
+
+    @staticmethod
+    def _image_to_uint8_rgb_from_array(array: np.ndarray) -> Image.Image:
+        work = array.astype(np.float32)
+        finite = work[np.isfinite(work)]
+        if finite.size:
+            lo, hi = np.percentile(finite, [1.0, 99.0])
+        else:
+            lo, hi = 0.0, 1.0
+        if not np.isfinite(hi) or hi <= lo:
+            info = np.iinfo(array.dtype) if np.issubdtype(array.dtype, np.integer) else None
+            lo = 0.0
+            hi = float(info.max) if info is not None else float(np.max(work) if work.size else 1.0)
+            if hi <= lo:
+                hi = 1.0
+        gray = np.clip((work - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        rgb = np.repeat((gray * 255.0 + 0.5).astype(np.uint8)[..., None], 3, axis=2)
+        return Image.fromarray(rgb, mode="RGB")
+
+    @staticmethod
+    def _prepare_match_input(path: str | Path, temp_root: Path, max_dim: int) -> Dict[str, object]:
+        path = Path(path).resolve()
+        with Image.open(path) as image:
+            original_size = (int(image.width), int(image.height))
+
+        if max_dim <= 0 or max(original_size) <= int(max_dim):
+            return {
+                "path": str(path),
+                "original_size": original_size,
+                "match_size": original_size,
+                "scale_to_original": (1.0, 1.0),
+                "resized_for_matching": False,
+            }
+
+        scale = float(max_dim) / float(max(original_size))
+        match_size = (
+            max(1, int(round(original_size[0] * scale))),
+            max(1, int(round(original_size[1] * scale))),
+        )
+        rgb_image = MinimaMatcherBridge._image_to_uint8_rgb(path)
+        resampling = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+        rgb_image = rgb_image.resize(match_size, resampling)
+        out_path = temp_root / f"{path.stem}_match_{match_size[0]}x{match_size[1]}.png"
+        rgb_image.save(out_path)
+        return {
+            "path": str(out_path),
+            "original_size": original_size,
+            "match_size": match_size,
+            "scale_to_original": (
+                float(original_size[0]) / float(match_size[0]),
+                float(original_size[1]) / float(match_size[1]),
+            ),
+            "resized_for_matching": True,
+        }
 
     def _resolve_ckpt(self, default_name: str) -> Optional[str]:
         if self.ckpt:
@@ -178,13 +285,36 @@ class MinimaMatcherBridge:
     def match(self, rgb_path: str | Path, band_path: str | Path) -> Dict[str, object]:
         rgb = str(Path(rgb_path).resolve())
         band = str(Path(band_path).resolve())
-        with _temporary_cwd(self.minima_root):
-            result = self._matcher_from_paths(rgb, band)
+        with tempfile.TemporaryDirectory(prefix="minima_match_") as temp_dir:
+            temp_root = Path(temp_dir)
+            rgb_input = self._prepare_match_input(rgb, temp_root, self.match_max_dim)
+            band_input = self._prepare_match_input(band, temp_root, self.match_max_dim)
+            with _temporary_cwd(self.minima_root):
+                result = self._matcher_from_paths(str(rgb_input["path"]), str(band_input["path"]))
         parsed = self._to_numpy_matches(result if isinstance(result, dict) else {})
+        if parsed["mkpts0"].size:
+            parsed["mkpts0"][:, 0] *= float(rgb_input["scale_to_original"][0])
+            parsed["mkpts0"][:, 1] *= float(rgb_input["scale_to_original"][1])
+        if parsed["mkpts1"].size:
+            parsed["mkpts1"][:, 0] *= float(band_input["scale_to_original"][0])
+            parsed["mkpts1"][:, 1] *= float(band_input["scale_to_original"][1])
         parsed.update(
             {
                 "backend": self.backend,
                 "success": parsed["mkpts0"].shape[0] > 0,
+                "debug": {
+                    "match_max_dim": int(self.match_max_dim),
+                    "rgb": {
+                        "original_size": list(rgb_input["original_size"]),
+                        "match_size": list(rgb_input["match_size"]),
+                        "resized_for_matching": bool(rgb_input["resized_for_matching"]),
+                    },
+                    "band": {
+                        "original_size": list(band_input["original_size"]),
+                        "match_size": list(band_input["match_size"]),
+                        "resized_for_matching": bool(band_input["resized_for_matching"]),
+                    },
+                },
             }
         )
         return parsed

@@ -131,6 +131,20 @@ def run_rectification_qa(prepared_root: Path,
             selected_names = common_names[:frame_count]
         else:
             selected_names = selected_names[:frame_count]
+        available_selected_names = []
+        skipped_missing_rgb_plane = 0
+        for image_name in selected_names:
+            if not (rgb_scene_root / "images" / image_name).exists():
+                skipped_missing_rgb_plane += 1
+                continue
+            if image_name not in raw_map or image_name not in rect_map:
+                continue
+            available_selected_names.append(image_name)
+        selected_names = available_selected_names
+        if skipped_missing_rgb_plane:
+            print(f"[qa_rectification:{band}] skipped {skipped_missing_rgb_plane} QA frames missing from RGB training plane")
+        if not selected_names:
+            raise RuntimeError(f"No QA frames available for band {band} after RGB-plane availability filtering.")
 
         band_dir = out_root / band
         band_dir.mkdir(parents=True, exist_ok=True)

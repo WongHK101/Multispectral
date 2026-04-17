@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -16,6 +17,17 @@ FALSE_COLOR_PRODUCTS = {
     "false_color_re_nir_r": ("RE", "NIR", "R"),
     "false_color_nir_re_g": ("NIR", "RE", "G"),
 }
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(text, encoding=encoding)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def _load_vertex(path: Path):
@@ -181,13 +193,13 @@ def _write_product_model(out_dir: Path, out_iter: int, reference_model_dir: Path
     cfg_path = reference_model_dir / "cfg_args"
     if cfg_path.exists():
         cfg_text = cfg_path.read_text(encoding="utf-8", errors="ignore")
-        (out_dir / "cfg_args").write_text(_rewrite_model_path(cfg_text, str(out_dir)), encoding="utf-8")
+        _atomic_write_text(out_dir / "cfg_args", _rewrite_model_path(cfg_text, str(out_dir)), encoding="utf-8")
 
     summary = {
         "out_iter": out_iter,
         "gaussian_count": int(len(reference_vertex)),
     }
-    (out_dir / "product_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _atomic_write_text(out_dir / "product_summary.json", json.dumps(summary, indent=2), encoding="utf-8")
 
 
 def _build_false_color_vertex(reference_payload: Dict[str, object], models: Dict[str, Dict[str, object]], mapping: Tuple[str, str, str]):

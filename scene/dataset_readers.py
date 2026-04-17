@@ -166,9 +166,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
+    names = vertices.data.dtype.names or ()
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    if {"red", "green", "blue"}.issubset(names):
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    else:
+        colors = np.full_like(positions, 0.5, dtype=np.float32)
+    if {"nx", "ny", "nz"}.issubset(names):
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = np.zeros_like(positions, dtype=np.float32)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -223,18 +230,30 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             sys.exit(1)
 
     if eval:
-        if "360" in path:
-            llffhold = 8
-        if llffhold:
-            print("------------LLFF HOLD-------------")
-            cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
-            cam_names = sorted(cam_names)
-            test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
+        explicit_test_file = os.path.join(path, "sparse/0", "test.txt")
+        explicit_train_file = os.path.join(path, "sparse/0", "train.txt")
+        explicit_train_names_list = None
+        if os.path.exists(explicit_test_file):
+            print("------------EXPLICIT HOLDOUT-------------")
+            with open(explicit_test_file, 'r', encoding="utf-8") as file:
+                test_cam_names_list = [line.strip() for line in file if line.strip()]
+            if os.path.exists(explicit_train_file):
+                with open(explicit_train_file, 'r', encoding="utf-8") as file:
+                    explicit_train_names_list = [line.strip() for line in file if line.strip()]
         else:
-            with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
-                test_cam_names_list = [line.strip() for line in file]
+            if "360" in path:
+                llffhold = 8
+            if llffhold:
+                print("------------LLFF HOLD-------------")
+                cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
+                cam_names = sorted(cam_names)
+                test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
+            else:
+                with open(explicit_test_file, 'r', encoding="utf-8") as file:
+                    test_cam_names_list = [line.strip() for line in file if line.strip()]
     else:
         test_cam_names_list = []
+        explicit_train_names_list = None
 
     reading_dir = "images" if images == None else images
     scene_manifest = _load_scene_manifest_payload(path)
@@ -246,7 +265,19 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         manifest_by_name=manifest_by_name, scene_manifest=scene_manifest)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
+    if explicit_train_names_list is not None:
+        explicit_train_names = set(explicit_train_names_list)
+        train_cam_infos = [
+            c for c in cam_infos
+            if (Path(c.image_name).name in explicit_train_names or c.image_name in explicit_train_names)
+        ]
+        registered_train_names = {Path(c.image_name).name for c in train_cam_infos} | {c.image_name for c in train_cam_infos}
+        missing_train = sorted([name for name in explicit_train_names_list if name not in registered_train_names])
+        if missing_train:
+            print(f"[WARN] Explicit train split has {len(missing_train)} names not registered by COLMAP. First few: {missing_train[:8]}")
+        print(f"[INFO] Explicit train split consumed: requested={len(explicit_train_names_list)} runtime={len(train_cam_infos)}")
+    else:
+        train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
@@ -285,7 +316,13 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
+            frame_file_path = str(frame["file_path"])
+            if Path(frame_file_path).suffix:
+                cam_name = frame_file_path
+            else:
+                cam_name = frame_file_path + extension
+            if not os.path.isabs(cam_name):
+                cam_name = os.path.join(path, cam_name)
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
@@ -297,7 +334,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            image_path = os.path.join(path, cam_name)
+            image_path = cam_name
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
             meta_entry = manifest_by_name.get(Path(cam_name).name, {}) or manifest_by_name.get(image_name, {})

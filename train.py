@@ -11,6 +11,7 @@
 
 import json
 import os
+import hashlib
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -128,6 +129,180 @@ def masked_l1_loss(network_output: torch.Tensor, gt: torch.Tensor, mask: torch.T
     denom = valid_mask.sum().clamp_min(eps) * float(diff.shape[0])
     return (diff * valid_mask).sum() / denom
 
+
+def _sha256_names(names) -> str:
+    payload = "\n".join(sorted(str(name) for name in names)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_name_file(path: Path):
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _load_transform_names(path: Path):
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    names = []
+    for frame in payload.get("frames", []):
+        value = frame.get("file_path", "")
+        if value:
+            names.append(Path(str(value).replace("\\", "/")).stem)
+    return names
+
+
+def _detect_split_source(source_path: str) -> dict:
+    root = Path(source_path)
+    sparse0 = root / "sparse" / "0"
+    explicit_test = sparse0 / "test.txt"
+    explicit_train = sparse0 / "train.txt"
+    protocol_split = sparse0 / "protocol_split.json"
+    install_audit = sparse0 / "protocol_split_install_audit.json"
+    if explicit_test.exists():
+        train_names = _read_name_file(explicit_train)
+        test_names = _read_name_file(explicit_test)
+        installed_protocol_split = ""
+        if install_audit.exists():
+            try:
+                installed_protocol_split = str(json.loads(install_audit.read_text(encoding="utf-8")).get("installed_protocol_split", ""))
+            except Exception:
+                installed_protocol_split = ""
+        return {
+            "split_source": "explicit_test_txt",
+            "train_txt": str(explicit_train) if explicit_train.exists() else "",
+            "test_txt": str(explicit_test),
+            "protocol_split_json": str(protocol_split) if protocol_split.exists() else "",
+            "protocol_split_source_path": installed_protocol_split,
+            "protocol_split_install_audit": str(install_audit) if install_audit.exists() else "",
+            "protocol_split_json_sha256": _sha256_file(protocol_split),
+            "installed_train_count": len(train_names),
+            "installed_test_count": len(test_names),
+            "installed_overlap_count": len(set(train_names) & set(test_names)) if train_names else None,
+            "train_names_sha256": _sha256_names(train_names),
+            "test_names_sha256": _sha256_names(test_names),
+            "train_names_preview": train_names[:8],
+            "test_names_preview": test_names[:8],
+        }
+    if (root / "transforms_train.json").exists() and (root / "transforms_test.json").exists():
+        train_json = root / "transforms_train.json"
+        test_json = root / "transforms_test.json"
+        train_names = _load_transform_names(train_json)
+        test_names = _load_transform_names(test_json)
+        prepared_manifest = root.parent / "official_ms_prepared_manifest.json"
+        official_split_source = ""
+        if prepared_manifest.exists():
+            try:
+                official_split_source = str(json.loads(prepared_manifest.read_text(encoding="utf-8")).get("split_json", ""))
+            except Exception:
+                official_split_source = ""
+        return {
+            "split_source": "transforms_train_test_json",
+            "transforms_train_json": str(train_json),
+            "transforms_test_json": str(test_json),
+            "protocol_split_source_path": official_split_source,
+            "transforms_train_json_sha256": _sha256_file(train_json),
+            "transforms_test_json_sha256": _sha256_file(test_json),
+            "installed_train_count": len(train_names),
+            "installed_test_count": len(test_names),
+            "installed_overlap_count": len(set(train_names) & set(test_names)),
+            "train_names_sha256": _sha256_names(train_names),
+            "test_names_sha256": _sha256_names(test_names),
+            "train_names_preview": train_names[:8],
+            "test_names_preview": test_names[:8],
+        }
+    return {"split_source": "legacy_or_unspecified"}
+
+
+def _camera_collection_audit(cameras) -> dict:
+    mask_ratios = []
+    mask_source_counts = {}
+    modalities = set()
+    bands = set()
+    scene_kinds = set()
+    rectification_statuses = set()
+    image_sizes = set()
+    names = []
+    for camera in cameras:
+        names.append(getattr(camera, "image_name", ""))
+        modalities.add(str(getattr(camera, "source_modality", "")))
+        bands.add(str(getattr(camera, "band_name", "")))
+        scene_kinds.add(str(getattr(camera, "scene_kind", "")))
+        rectification_statuses.add(str(getattr(camera, "rectification_status", "")))
+        image_sizes.add(f"{getattr(camera, 'image_width', 0)}x{getattr(camera, 'image_height', 0)}")
+        source = str(getattr(camera, "validity_mask_source", "none"))
+        mask_source_counts[source] = mask_source_counts.get(source, 0) + 1
+        mask = getattr(camera, "validity_mask", None)
+        if mask is not None:
+            try:
+                mask_ratios.append(float(mask.detach().float().mean().item()))
+            except Exception:
+                pass
+    out = {
+        "count": len(cameras),
+        "names_sha256": _sha256_names(names),
+        "names_preview": names[:8],
+        "modalities": sorted(modalities),
+        "bands": sorted(bands),
+        "scene_kinds": sorted(scene_kinds),
+        "rectification_statuses": sorted(rectification_statuses),
+        "image_sizes": sorted(image_sizes),
+        "validity_mask_source_counts": mask_source_counts,
+        "validity_mask_present_count": len(mask_ratios),
+    }
+    if mask_ratios:
+        out.update(
+            {
+                "validity_mask_ratio_mean": sum(mask_ratios) / len(mask_ratios),
+                "validity_mask_ratio_min": min(mask_ratios),
+                "validity_mask_ratio_max": max(mask_ratios),
+            }
+        )
+    return out
+
+
+def _write_training_protocol_audit(model_path: str, payload: dict) -> None:
+    audit_path = Path(model_path) / "training_protocol_audit.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _finalize_training_protocol_audit(payload: dict) -> dict:
+    expected = bool(payload.get("masked_loss_active_expected", False))
+    observed = bool(payload.get("masked_loss_observed", False))
+    payload["masked_loss_mandatory"] = expected
+    payload["masked_loss_protocol_ok"] = (not expected) or observed
+
+    train = payload.get("train_cameras", {})
+    scene_kinds = set(train.get("scene_kinds", []))
+    rectification_statuses = set(train.get("rectification_statuses", []))
+    rectification_applied = "rectified" in rectification_statuses
+    official_aligned = scene_kinds == {"official_ms_aligned"}
+    payload["rectification_applied"] = rectification_applied
+    payload["official_ms_no_rectification_audit"] = {
+        "is_official_ms_aligned": official_aligned,
+        "scene_kinds": sorted(scene_kinds),
+        "rectification_statuses": sorted(rectification_statuses),
+        "rectification_applied": rectification_applied,
+        "protocol_ok": (not official_aligned) or (rectification_statuses == {"aligned_by_dataset"} and not rectification_applied),
+    }
+    return payload
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, ss_args=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -137,6 +312,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+
+    train_cameras_initial = scene.getTrainCameras()
+    test_cameras_initial = scene.getTestCameras()
+    training_protocol_audit = {
+        "source_path": str(dataset.source_path),
+        "model_path": str(dataset.model_path),
+        "iterations": int(opt.iterations),
+        "checkpoint": str(checkpoint) if checkpoint else "",
+        "stage2_mode": str(getattr(args, "stage2_mode", "")),
+        "modality_kind": str(getattr(args, "modality_kind", "")),
+        "target_band": str(getattr(args, "target_band", "")),
+        "use_validity_mask": bool(getattr(args, "use_validity_mask", False)),
+        "require_rectified_band_scene": bool(getattr(args, "require_rectified_band_scene", False)),
+        "rectified_root": str(getattr(args, "rectified_root", "")),
+        "rectification_method": str(getattr(args, "rectification_method", "")),
+        "split": _detect_split_source(dataset.source_path),
+        "runtime_detected_train_count": len(train_cameras_initial),
+        "runtime_detected_test_count": len(test_cameras_initial),
+        "train_cameras": _camera_collection_audit(train_cameras_initial),
+        "test_cameras": _camera_collection_audit(test_cameras_initial),
+        "masked_loss_active_expected": bool(getattr(args, "use_validity_mask", False))
+        and any(getattr(cam, "validity_mask", None) is not None for cam in train_cameras_initial),
+        "external_validity_mask_present": any(
+            getattr(cam, "validity_mask_source", "") == "external" for cam in train_cameras_initial
+        ),
+        "masked_loss_observed": False,
+        "masked_loss_observed_steps": 0,
+        "masked_loss_ratio_samples": [],
+    }
+    _write_training_protocol_audit(dataset.model_path, _finalize_training_protocol_audit(training_protocol_audit))
 
 
     # Optional: sparse support gating for densification (disabled by default).
@@ -423,6 +628,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
         if use_masked_band_loss:
+            training_protocol_audit["masked_loss_observed"] = True
+            training_protocol_audit["masked_loss_observed_steps"] += 1
+            if len(training_protocol_audit["masked_loss_ratio_samples"]) < 16:
+                try:
+                    training_protocol_audit["masked_loss_ratio_samples"].append(
+                        float(validity_mask.detach().float().mean().item())
+                    )
+                except Exception:
+                    pass
             Ll1 = masked_l1_loss(image, gt_image, validity_mask.cuda())
             ssim_value = torch.tensor(1.0, dtype=image.dtype, device=image.device)
             loss = Ll1
@@ -552,6 +766,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     project_features_to_tied_scalar_rgb(gaussians)
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    _write_training_protocol_audit(dataset.model_path, _finalize_training_protocol_audit(training_protocol_audit))
 
     # Optional: one-shot final clamp at the end of RGB stage.
     # This runs after normal training saves and overwrites final artifacts.

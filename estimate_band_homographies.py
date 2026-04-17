@@ -84,18 +84,35 @@ def load_frame_records(prepared_root: Path, band_name: str) -> List[dict]:
     band_map = _image_map(_load_manifest(raw_scene_root))
     common_names = sorted(set(rgb_map.keys()) & set(band_map.keys()))
     records = []
+    skipped_missing_rgb_plane = 0
+    skipped_missing_band_source = 0
     for image_name in common_names:
         rgb_item = rgb_map[image_name]
         band_item = band_map[image_name]
+        rgb_path = rgb_scene_root / "images" / image_name
+        band_path = Path(str(band_item.get("source_path") or (raw_scene_root / "images" / image_name)))
+        if not rgb_path.exists():
+            skipped_missing_rgb_plane += 1
+            continue
+        if not band_path.exists():
+            skipped_missing_band_source += 1
+            continue
         records.append(
             {
                 "frame_id": str(band_item.get("frame_id", image_name)),
                 "image_name": image_name,
-                "rgb_path": str(rgb_scene_root / "images" / image_name),
-                "band_path": str(band_item.get("source_path") or (raw_scene_root / "images" / image_name)),
+                "rgb_path": str(rgb_path),
+                "band_path": str(band_path),
                 "rgb_meta": rgb_item.get("metadata", {}) if isinstance(rgb_item, dict) else {},
                 "band_meta": band_item.get("metadata", {}) if isinstance(band_item, dict) else {},
             }
+        )
+    if skipped_missing_rgb_plane or skipped_missing_band_source:
+        print(
+            f"[rectification:{band_name}] filtered unavailable frames: "
+            f"missing_rgb_plane={skipped_missing_rgb_plane}, "
+            f"missing_band_source={skipped_missing_band_source}, "
+            f"usable={len(records)}"
         )
     return records
 
@@ -160,6 +177,7 @@ def _run_matching_for_record(matcher, record: dict, config: dict) -> dict:
         "conf_median": conf_stats["median"],
         "quality_score": float(quality),
         "accepted": bool(accepted),
+        "matcher_debug": match_res.get("debug", {}),
     }
     return {
         "record": record,
@@ -187,13 +205,21 @@ def _maybe_refine_transform(
             "theta_opt": [],
         }
 
-    refine_count = int(max(6, min(len(accepted_records), int(config.get("rectification_estimation_frames", 12)))))
+    refine_count = int(max(4, min(len(accepted_records), int(config.get("rectification_refine_frames", 6)))))
     refine_records = accepted_records[:refine_count]
+    print(
+        f"[rectification:refine] enabled with frames={len(refine_records)}, "
+        f"alignment_scale={float(config.get('rectification_alignment_scale', 0.25))}, "
+        f"alignment_max_dim={int(config.get('rectification_alignment_max_dim', 640))}, "
+        f"backend={config.get('rectification_optimizer_backend', 'opencv_search')}",
+        flush=True,
+    )
     frame_batch = prepare_frame_batch(
         frame_records=refine_records,
         input_dynamic_range=str(config["input_dynamic_range"]),
         radiometric_mode=str(config["radiometric_mode"]),
         alignment_scale=float(config.get("rectification_alignment_scale", 0.25)),
+        alignment_max_dim=int(config.get("rectification_alignment_max_dim", 640)),
     )
     reference = frame_batch[0]
     h0_align = scale_transform_to_alignment(np.asarray(t_full, dtype=np.float64), reference["scale_adapters"])
@@ -206,6 +232,11 @@ def _maybe_refine_transform(
 
     t_align = np.asarray(opt_result["best_T"], dtype=np.float64)
     t_refined = scale_transform_from_alignment(t_align, reference["scale_adapters"])
+    print(
+        f"[rectification:refine] finished score={float(opt_result.get('best_score', 0.0)):.4f} "
+        f"iterations={opt_result.get('num_iterations', 0)} restarts={opt_result.get('num_restarts', 0)}",
+        flush=True,
+    )
     return {
         "T_opt": np.asarray(t_refined, dtype=np.float64),
         "optimizer": {
@@ -243,6 +274,11 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
     all_diags: List[dict] = []
     stage_diags: List[dict] = []
 
+    print(
+        f"[rectification:{band_name}] start MINIMA estimation: total_frames={n_total}, "
+        f"min_good_frames={min_good_frames}, schedule={candidate_schedule}",
+        flush=True,
+    )
     for count in candidate_schedule:
         stage_records = _candidate_records_by_count(
             records=records,
@@ -255,14 +291,33 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
             "new_records": len(new_records),
             "accepted_before": len(accepted_items),
         }
-        for record in new_records:
+        print(
+            f"[rectification:{band_name}] candidate_count={count}, "
+            f"new_records={len(new_records)}, accepted={len(accepted_items)}/{min_good_frames}",
+            flush=True,
+        )
+        for idx, record in enumerate(new_records, start=1):
             attempted_names.add(record["image_name"])
+            print(
+                f"[rectification:{band_name}] matching {idx}/{len(new_records)} "
+                f"frame_id={record.get('frame_id')} image={record.get('image_name')}",
+                flush=True,
+            )
             result = _run_matching_for_record(matcher, record, config)
             all_diags.append(result["diag"])
             if result["accepted"]:
                 accepted_items.append(result)
             else:
                 rejected_items.append(result)
+            diag = result["diag"]
+            print(
+                f"[rectification:{band_name}] result accepted={diag['accepted']} "
+                f"raw={diag['num_matches_raw']} conf={diag['num_matches_after_conf']} "
+                f"inliers={diag['num_inliers']} inlier_ratio={diag['inlier_ratio']:.3f} "
+                f"reproj={diag['reproj_error']:.3f} coverage={diag['coverage']:.3f} "
+                f"accepted_total={len(accepted_items)}/{min_good_frames}",
+                flush=True,
+            )
         stage_info["accepted_after"] = len(accepted_items)
         stage_info["attempted_total"] = len(attempted_names)
         stage_diags.append(stage_info)
@@ -274,6 +329,11 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
             f"[{band_name}] MINIMA matching produced insufficient high-quality frames: "
             f"accepted={len(accepted_items)} < min_good_frames={min_good_frames}, attempted={len(attempted_names)}, total={n_total}"
         )
+    print(
+        f"[rectification:{band_name}] accepted {len(accepted_items)} high-quality frames "
+        f"after attempting {len(attempted_names)}/{n_total}",
+        flush=True,
+    )
 
     accepted_sorted = sorted(accepted_items, key=lambda item: item["quality_score"], reverse=True)
     t_full = robust_aggregate_homographies_weighted(
@@ -301,6 +361,7 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
         input_dynamic_range=str(config["input_dynamic_range"]),
         radiometric_mode=str(config["radiometric_mode"]),
         alignment_scale=float(config.get("rectification_alignment_scale", 0.25)),
+        alignment_max_dim=int(config.get("rectification_alignment_max_dim", 640)),
     )
     reference_frame = frame_batch[0]
     t_opt_align = scale_transform_to_alignment(t_opt_full, reference_frame["scale_adapters"])
@@ -310,6 +371,12 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
         evaluation,
         min_improved_ratio=float(config.get("rectification_min_improved_ratio", 0.6)),
         max_severe_outliers=int(config.get("rectification_max_severe_outliers", 0)),
+    )
+    print(
+        f"[rectification:{band_name}] QA pass={bool(band_pass)} "
+        f"delta_edge={evaluation.get('delta_edge_f1', 0.0):.4f} "
+        f"delta_grad={evaluation.get('delta_grad_ncc', 0.0):.4f}",
+        flush=True,
     )
 
     rgb_shape_full = reference_frame["rgb_full"].shape
@@ -362,6 +429,8 @@ def estimate_band_homographies(
     rectification_edge_dilate_radius: int = 1,
     rectification_residual_reg: float = 1e-3,
     rectification_alignment_scale: float = 0.25,
+    rectification_alignment_max_dim: int = 640,
+    rectification_refine_frames: int = 6,
     rectification_min_structure_score: float | None = None,
     rectification_debug_use_legacy_ecc: bool = False,
     rectification_min_improved_ratio: float = 0.6,
@@ -374,6 +443,7 @@ def estimate_band_homographies(
     minima_roma_size: str = "large",
     minima_match_threshold: float = 0.3,
     minima_fine_threshold: float = 0.1,
+    minima_match_max_dim: int = 1600,
     minima_match_conf_thresh: float = 0.2,
     minima_min_matches: int = 80,
     minima_min_inlier_ratio: float = 0.30,
@@ -419,6 +489,8 @@ def estimate_band_homographies(
         "rectification_edge_dilate_radius": int(rectification_edge_dilate_radius),
         "rectification_residual_reg": float(rectification_residual_reg),
         "rectification_alignment_scale": float(rectification_alignment_scale),
+        "rectification_alignment_max_dim": int(rectification_alignment_max_dim),
+        "rectification_refine_frames": int(rectification_refine_frames),
         "rectification_min_structure_score": rectification_min_structure_score,
         "rectification_debug_use_legacy_ecc": bool(rectification_debug_use_legacy_ecc),
         "rectification_min_improved_ratio": float(rectification_min_improved_ratio),
@@ -431,6 +503,7 @@ def estimate_band_homographies(
         "minima_roma_size": str(minima_roma_size),
         "minima_match_threshold": float(minima_match_threshold),
         "minima_fine_threshold": float(minima_fine_threshold),
+        "minima_match_max_dim": int(minima_match_max_dim),
         "minima_match_conf_thresh": float(minima_match_conf_thresh),
         "minima_min_matches": int(minima_min_matches),
         "minima_min_inlier_ratio": float(minima_min_inlier_ratio),
@@ -470,6 +543,7 @@ def estimate_band_homographies(
         roma_size=str(config["minima_roma_size"]),
         match_threshold=float(config["minima_match_threshold"]),
         fine_threshold=float(config["minima_fine_threshold"]),
+        match_max_dim=int(config["minima_match_max_dim"]),
     )
 
     for band_name in band_list:
@@ -495,6 +569,8 @@ def main() -> None:
     ap.add_argument("--rectification_edge_dilate_radius", type=int, default=1)
     ap.add_argument("--rectification_residual_reg", type=float, default=1e-3)
     ap.add_argument("--rectification_alignment_scale", type=float, default=0.25)
+    ap.add_argument("--rectification_alignment_max_dim", type=int, default=640)
+    ap.add_argument("--rectification_refine_frames", type=int, default=6)
     ap.add_argument("--rectification_min_structure_score", type=float, default=None)
     ap.add_argument("--rectification_debug_use_legacy_ecc", type=str, default="false")
     ap.add_argument("--rectification_min_improved_ratio", type=float, default=0.6)
@@ -508,6 +584,7 @@ def main() -> None:
     ap.add_argument("--minima_roma_size", default="large", choices=["large", "tiny"])
     ap.add_argument("--minima_match_threshold", type=float, default=0.3)
     ap.add_argument("--minima_fine_threshold", type=float, default=0.1)
+    ap.add_argument("--minima_match_max_dim", type=int, default=1600)
     ap.add_argument("--minima_match_conf_thresh", type=float, default=0.2)
     ap.add_argument("--minima_min_matches", type=int, default=80)
     ap.add_argument("--minima_min_inlier_ratio", type=float, default=0.30)
@@ -542,6 +619,8 @@ def main() -> None:
         rectification_edge_dilate_radius=args.rectification_edge_dilate_radius,
         rectification_residual_reg=args.rectification_residual_reg,
         rectification_alignment_scale=args.rectification_alignment_scale,
+        rectification_alignment_max_dim=args.rectification_alignment_max_dim,
+        rectification_refine_frames=args.rectification_refine_frames,
         rectification_min_structure_score=args.rectification_min_structure_score,
         rectification_debug_use_legacy_ecc=str(args.rectification_debug_use_legacy_ecc).strip().lower() not in ("0", "false", "no", "off"),
         rectification_min_improved_ratio=args.rectification_min_improved_ratio,
@@ -554,6 +633,7 @@ def main() -> None:
         minima_roma_size=args.minima_roma_size,
         minima_match_threshold=args.minima_match_threshold,
         minima_fine_threshold=args.minima_fine_threshold,
+        minima_match_max_dim=args.minima_match_max_dim,
         minima_match_conf_thresh=args.minima_match_conf_thresh,
         minima_min_matches=args.minima_min_matches,
         minima_min_inlier_ratio=args.minima_min_inlier_ratio,

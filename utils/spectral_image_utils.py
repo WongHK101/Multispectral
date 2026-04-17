@@ -202,6 +202,10 @@ def normalize_scalar_band_image(image, metadata, mode, dynamic_range):
 
     if arr.ndim == 3 and arr.shape[2] == 1:
         arr = arr[..., 0]
+    elif arr.ndim == 3 and arr.shape[2] >= 3:
+        # Some aligned benchmark bands are stored as RGB/JPG grayscale proxies.
+        # Keep the scalar-band semantics by collapsing the carrier channels late.
+        arr = arr[..., :3].astype(np.float32, copy=False).mean(axis=2)
     if arr.ndim != 2:
         raise ValueError(f"Expected a single-band image, got shape={arr.shape}")
 

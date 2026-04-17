@@ -121,7 +121,9 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   radiometric_mode=getattr(args, "radiometric_mode", "raw_dn"),
                   single_band_mode=bool(getattr(args, "single_band_mode", False)),
                   single_band_replicate_to_rgb=getattr(args, "single_band_replicate_to_rgb", None),
-                  validity_mask=validity_mask)
+                  validity_mask=validity_mask,
+                  scene_kind=getattr(cam_info, "scene_kind", ""),
+                  rectification_status=getattr(cam_info, "rectification_status", ""))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []

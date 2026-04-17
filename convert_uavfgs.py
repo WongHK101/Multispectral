@@ -203,6 +203,36 @@ def read_image_names(model_dir: Path):
     return names
 
 
+def read_name_list(path: Path) -> List[str]:
+    if not path or not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _name_keys(name: str) -> set:
+    normalized = str(name).replace("\\", "/").strip()
+    return {normalized, Path(normalized).name}
+
+
+def _registered_name_hits(registered_names: List[str], required_names: List[str]) -> Tuple[List[str], List[str]]:
+    registered_keys = set()
+    for name in registered_names:
+        registered_keys.update(_name_keys(name))
+    hits = []
+    missing = []
+    for name in required_names:
+        if _name_keys(name) & registered_keys:
+            hits.append(name)
+        else:
+            missing.append(name)
+    return hits, missing
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def select_best_sparse_model(sparse_root: Path) -> Path:
     if not sparse_root.exists():
         raise FileNotFoundError(f"sparse root not found: {sparse_root}")
@@ -714,6 +744,52 @@ def main():
     parser.add_argument("--min_model_size", type=int, default=10)
     parser.add_argument("--init_min_num_inliers", type=int, default=100)
     parser.add_argument("--abs_pose_min_num_inliers", type=int, default=30)
+    parser.add_argument(
+        "--image_list_path",
+        default="",
+        help=(
+            "Optional COLMAP image list used by feature_extractor and image_undistorter. "
+            "For strict protocol runs this should contain train+test images only."
+        ),
+    )
+    parser.add_argument(
+        "--mapper_image_list_path",
+        default="",
+        help="Optional COLMAP image list passed only to mapper, typically the frozen train split.",
+    )
+    parser.add_argument(
+        "--register_images_after_mapper",
+        action="store_true",
+        help=(
+            "After train-only mapping, localize remaining database images into the frozen mapper model "
+            "with image_registrator before undistortion."
+        ),
+    )
+    parser.add_argument(
+        "--registration_required_image_list_path",
+        default="",
+        help="Optional list of images that must be registered by image_registrator, typically held-out test images.",
+    )
+    parser.add_argument(
+        "--registration_audit_path",
+        default="",
+        help="Optional JSON path for train-only SfM / test-localization audit payload.",
+    )
+    parser.add_argument(
+        "--fail_on_missing_registration",
+        action="store_true",
+        help="Fail if any image in --registration_required_image_list_path is not localized.",
+    )
+    parser.add_argument(
+        "--strict_no_point_growth_after_registration",
+        action="store_true",
+        help="Fail if image_registrator increases the 3D point count, guarding against test-driven triangulation.",
+    )
+    parser.add_argument(
+        "--image_registrator_args",
+        default="",
+        help="Extra arguments appended to COLMAP image_registrator.",
+    )
 
     parser.add_argument("--use_model_aligner", action="store_true")
     parser.add_argument("--model_aligner_args", default="")
@@ -724,23 +800,31 @@ def main():
 
     root = Path(args.source_path)
     input_dir = root / "input"
+    feature_image_list = Path(args.image_list_path).resolve() if args.image_list_path else None
+    mapper_image_list = Path(args.mapper_image_list_path).resolve() if args.mapper_image_list_path else None
+    registration_required_list = Path(args.registration_required_image_list_path).resolve() if args.registration_required_image_list_path else None
+    registration_audit_path = Path(args.registration_audit_path).resolve() if args.registration_audit_path else None
     distorted_dir = root / "distorted"
     sparse_root = distorted_dir / "sparse"
     db_path = distorted_dir / "database.db"
     sparse_aligned = distorted_dir / "sparse_aligned"
+    sparse_registered = distorted_dir / "sparse_registered"
 
     distorted_dir.mkdir(parents=True, exist_ok=True)
     sparse_root.mkdir(parents=True, exist_ok=True)
 
     colmap_exe = args.colmap_executable
 
-    run_cmd([
+    feature_cmd = [
         colmap_exe, "feature_extractor",
         "--database_path", str(db_path),
         "--image_path", str(input_dir),
         "--ImageReader.camera_model", str(args.camera),
         "--ImageReader.single_camera", "1",
-    ])
+    ]
+    if feature_image_list:
+        feature_cmd += ["--image_list_path", str(feature_image_list)]
+    run_cmd(feature_cmd)
 
     if args.matching == "spatial":
         run_cmd([colmap_exe, "spatial_matcher", "--database_path", str(db_path)] + split_args(args.matcher_args))
@@ -751,7 +835,7 @@ def main():
     else:
         run_cmd([colmap_exe, "vocab_tree_matcher", "--database_path", str(db_path)] + split_args(args.matcher_args))
 
-    run_cmd([
+    mapper_cmd = [
         colmap_exe, "mapper",
         "--database_path", str(db_path),
         "--image_path", str(input_dir),
@@ -760,7 +844,10 @@ def main():
         "--Mapper.min_model_size", str(args.min_model_size),
         "--Mapper.init_min_num_inliers", str(args.init_min_num_inliers),
         "--Mapper.abs_pose_min_num_inliers", str(args.abs_pose_min_num_inliers),
-    ])
+    ]
+    if mapper_image_list:
+        mapper_cmd += ["--image_list_path", str(mapper_image_list)]
+    run_cmd(mapper_cmd)
 
     best_model = select_best_sparse_model(sparse_root)
 
@@ -806,13 +893,99 @@ def main():
     
         aligned_model_for_undistort = sparse_aligned
 
-    run_cmd([
+    raw_sfm_audit = {
+        "protocol": "all_images_sfm",
+        "source_path": str(root),
+        "input_dir": str(input_dir),
+        "feature_image_list_path": str(feature_image_list) if feature_image_list else "",
+        "feature_image_list_count": len(read_name_list(feature_image_list)) if feature_image_list else None,
+        "mapper_image_list_path": str(mapper_image_list) if mapper_image_list else "",
+        "sfm_images_used_for_mapper_count": len(read_name_list(mapper_image_list)) if mapper_image_list else None,
+        "mapper_model_path": str(best_model),
+        "mapper_registered_image_count": read_num_registered_images(best_model),
+        "mapper_points3d_count": read_num_points3d(best_model),
+        "test_localization_requested": bool(args.register_images_after_mapper),
+        "test_localization_count": None,
+        "test_localization_missing_count": None,
+        "post_registration_ba_applied": False,
+        "triangulation_extended_with_test": False,
+    }
+
+    if args.register_images_after_mapper:
+        required_names = read_name_list(registration_required_list) if registration_required_list else []
+        before_points = read_num_points3d(aligned_model_for_undistort)
+        before_names = read_image_names(aligned_model_for_undistort)
+        if sparse_registered.exists():
+            shutil.rmtree(sparse_registered)
+        sparse_registered.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            colmap_exe, "image_registrator",
+            "--database_path", str(db_path),
+            "--input_path", str(aligned_model_for_undistort),
+            "--output_path", str(sparse_registered),
+            "--Mapper.fix_existing_frames", "1",
+        ] + split_args(args.image_registrator_args)
+        run_cmd(cmd)
+
+        after_names = read_image_names(sparse_registered)
+        after_points = read_num_points3d(sparse_registered)
+        localized_required, missing_required = _registered_name_hits(after_names, required_names)
+        point_growth = after_points > before_points if before_points >= 0 and after_points >= 0 else False
+        raw_sfm_audit.update({
+            "protocol": "train_only_sfm_test_localization",
+            "registration_input_model_path": str(aligned_model_for_undistort),
+            "registration_output_model_path": str(sparse_registered),
+            "registration_required_image_list_path": str(registration_required_list) if registration_required_list else "",
+            "registration_required_image_count": len(required_names),
+            "train_model_registered_image_count": len(before_names),
+            "registered_model_image_count": len(after_names),
+            "test_localization_count": len(localized_required),
+            "test_localization_missing_count": len(missing_required),
+            "test_localization_missing_preview": missing_required[:16],
+            "points3d_before_registration": before_points,
+            "points3d_after_registration": after_points,
+            "triangulation_extended_with_test": bool(point_growth),
+            "post_registration_ba_applied": False,
+            "post_registration_ba_note": (
+                "No explicit post-registration bundle adjustment is launched by this pipeline. "
+                "COLMAP image_registrator may internally refine localized test poses; "
+                "existing train frames are fixed and point growth is guarded."
+            ),
+            "registration_refinement_policy": (
+                "COLMAP image_registrator internal refinement may run; "
+                "existing train frames are fixed and point growth is guarded."
+            ),
+            "fix_existing_frames": True,
+        })
+        if args.fail_on_missing_registration and missing_required:
+            if registration_audit_path:
+                _write_json(registration_audit_path, raw_sfm_audit)
+            raise RuntimeError(
+                f"image_registrator failed to localize {len(missing_required)}/{len(required_names)} required images. "
+                f"First missing: {missing_required[:8]}"
+            )
+        if args.strict_no_point_growth_after_registration and point_growth:
+            if registration_audit_path:
+                _write_json(registration_audit_path, raw_sfm_audit)
+            raise RuntimeError(
+                f"image_registrator increased 3D point count from {before_points} to {after_points}; "
+                "strict no-test-triangulation guard failed."
+            )
+        aligned_model_for_undistort = sparse_registered
+
+    if registration_audit_path:
+        _write_json(registration_audit_path, raw_sfm_audit)
+
+    undistort_cmd = [
         colmap_exe, "image_undistorter",
         "--image_path", str(input_dir),
         "--input_path", str(aligned_model_for_undistort),
         "--output_path", str(root),
         "--output_type", "COLMAP",
-    ])
+    ]
+    if feature_image_list:
+        undistort_cmd += ["--image_list_path", str(feature_image_list)]
+    run_cmd(undistort_cmd)
 
     # Make the output compatible with 3DGS (expects <root>/sparse/0).
     try:
@@ -820,6 +993,8 @@ def main():
         export_model_as_txt(colmap_exe, model0)
         ensure_camera_models_supported_for_3dgs(colmap_exe, model0)
         export_model_as_txt(colmap_exe, model0)  # keep TXT after possible BIN regen
+        if registration_audit_path and registration_audit_path.exists():
+            shutil.copy2(registration_audit_path, model0 / "raw_sfm_protocol_audit.json")
         log_info(f"3DGS layout: images={root/'images'} | sparse_model={model0}")
     except Exception as e:
         log_warn(f"Failed to normalize/export sparse model for 3DGS: {e}")
@@ -869,4 +1044,3 @@ if __name__ == "__main__":
     except Exception as e:
         log_err(str(e))
         raise
-

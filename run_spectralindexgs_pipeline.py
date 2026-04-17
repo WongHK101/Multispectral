@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -53,6 +54,133 @@ def _load_scene_manifest_payload(scene_root: Path) -> dict:
         return json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _split_entry_to_image_name(entry) -> str:
+    if isinstance(entry, dict):
+        value = entry.get("image_name") or entry.get("rgb_image") or entry.get("path") or entry.get("file_path")
+    else:
+        value = entry
+    name = Path(str(value).replace("\\", "/")).name.strip()
+    if not name:
+        raise ValueError(f"Invalid split entry: {entry!r}")
+    return name
+
+
+def _sha256_names(names) -> str:
+    return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
+
+
+def _install_protocol_split(scene_root: Path, split_json: str) -> None:
+    if not split_json:
+        return
+    split_path = Path(split_json).resolve()
+    if not split_path.exists():
+        raise FileNotFoundError(f"Protocol split file does not exist: {split_path}")
+    payload = json.loads(split_path.read_text(encoding="utf-8"))
+    train_entries = payload.get("train", [])
+    test_entries = payload.get("test", payload.get("eval", []))
+    if not test_entries:
+        raise RuntimeError(f"Protocol split has no test/eval entries: {split_path}")
+
+    train_names = [_split_entry_to_image_name(item) for item in train_entries]
+    test_names = [_split_entry_to_image_name(item) for item in test_entries]
+    overlap = sorted(set(train_names) & set(test_names))
+    if overlap:
+        raise RuntimeError(f"Protocol split train/test overlap: {overlap[:8]}")
+    sparse0 = scene_root / "sparse" / "0"
+    if not sparse0.exists():
+        raise FileNotFoundError(f"Cannot install protocol split before sparse/0 exists: {sparse0}")
+    (sparse0 / "train.txt").write_text("\n".join(train_names) + ("\n" if train_names else ""), encoding="utf-8")
+    (sparse0 / "test.txt").write_text("\n".join(test_names) + "\n", encoding="utf-8")
+    shutil.copy2(split_path, sparse0 / "protocol_split.json")
+    audit = {
+        "scene_root": str(scene_root),
+        "installed_protocol_split": str(split_path),
+        "runtime_split_source_expected": "explicit_test_txt",
+        "installed_train_count": len(train_names),
+        "installed_test_count": len(test_names),
+        "installed_overlap_count": len(overlap),
+        "train_names_sha256": _sha256_names(train_names),
+        "test_names_sha256": _sha256_names(test_names),
+        "test_names_preview": test_names[:8],
+        "train_txt": str(sparse0 / "train.txt"),
+        "test_txt": str(sparse0 / "test.txt"),
+        "protocol_split_json": str(sparse0 / "protocol_split.json"),
+    }
+    (sparse0 / "protocol_split_install_audit.json").write_text(
+        json.dumps(audit, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"[INFO] Installed protocol split: {split_path} -> {sparse0 / 'test.txt'} ({len(test_names)} test views)")
+
+
+def _write_protocol_sfm_lists(scene_root: Path, split_json: str) -> dict:
+    """Write COLMAP image-list files for strict raw-scene train-only SfM.
+
+    COLMAP feature extraction sees train+test protocol images, mapper sees train
+    images only, and image_registrator localizes held-out test images into the
+    frozen train reconstruction.
+    """
+    split_path = Path(split_json).resolve()
+    if not split_path.exists():
+        raise FileNotFoundError(f"Protocol split file does not exist: {split_path}")
+    payload = json.loads(split_path.read_text(encoding="utf-8"))
+    train_names = [_split_entry_to_image_name(item) for item in payload.get("train", [])]
+    test_names = [_split_entry_to_image_name(item) for item in payload.get("test", payload.get("eval", []))]
+    if not train_names or not test_names:
+        raise RuntimeError(
+            f"Strict raw SfM protocol requires non-empty train and test lists: {split_path}"
+        )
+    overlap = sorted(set(train_names) & set(test_names))
+    if overlap:
+        raise RuntimeError(f"Protocol split train/test overlap: {overlap[:8]}")
+
+    protocol_dir = scene_root / "protocol_sfm"
+    protocol_dir.mkdir(parents=True, exist_ok=True)
+    train_list = protocol_dir / "mapper_train_images.txt"
+    test_list = protocol_dir / "localize_test_images.txt"
+    all_list = protocol_dir / "feature_train_test_images.txt"
+    train_list.write_text("\n".join(train_names) + "\n", encoding="utf-8")
+    test_list.write_text("\n".join(test_names) + "\n", encoding="utf-8")
+    all_names = sorted(set(train_names) | set(test_names))
+    all_list.write_text("\n".join(all_names) + "\n", encoding="utf-8")
+
+    audit = {
+        "protocol": "train_only_sfm_test_localization",
+        "scene_root": str(scene_root),
+        "protocol_split": str(split_path),
+        "feature_image_list_path": str(all_list),
+        "feature_image_list_count": len(all_names),
+        "mapper_image_list_path": str(train_list),
+        "sfm_images_used_for_mapper_count": len(train_names),
+        "registration_required_image_list_path": str(test_list),
+        "registration_required_image_count": len(test_names),
+        "train_names_sha256": _sha256_names(train_names),
+        "test_names_sha256": _sha256_names(test_names),
+        "all_names_sha256": _sha256_names(all_names),
+    }
+    (protocol_dir / "raw_sfm_protocol_lists_audit.json").write_text(
+        json.dumps(audit, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return {
+        "feature_image_list": all_list,
+        "mapper_image_list": train_list,
+        "registration_required_image_list": test_list,
+        "audit_path": protocol_dir / "raw_sfm_protocol_audit.json",
+        "lists_audit_path": protocol_dir / "raw_sfm_protocol_lists_audit.json",
+    }
+
+
+def _copy_raw_sfm_audit_to_sparse(scene_root: Path) -> None:
+    src = scene_root / "protocol_sfm" / "raw_sfm_protocol_audit.json"
+    dst_dir = scene_root / "sparse" / "0"
+    if src.exists() and dst_dir.exists():
+        shutil.copy2(src, dst_dir / "raw_sfm_protocol_audit.json")
+    lists_src = scene_root / "protocol_sfm" / "raw_sfm_protocol_lists_audit.json"
+    if lists_src.exists() and dst_dir.exists():
+        shutil.copy2(lists_src, dst_dir / "raw_sfm_protocol_lists_audit.json")
 
 
 def _assert_rectified_scene(scene_root: Path) -> None:
@@ -120,7 +248,7 @@ def _clean_rgb_convert_outputs(rgb_scene_root: Path) -> None:
             shutil.rmtree(target, ignore_errors=True)
 
 
-def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args) -> None:
+def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args, sfm_lists: dict | None = None) -> None:
     sparse0 = rgb_scene_root / "sparse" / "0"
     images_dir = rgb_scene_root / "images"
     if sparse0.exists() and images_dir.exists():
@@ -128,7 +256,7 @@ def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args) -> None:
 
     def _make_convert_cmd(matching_name: str):
         matcher_args = str(args.matcher_args) if matching_name == str(args.matching) else ""
-        return [
+        cmd = [
             sys.executable, "convert_uavfgs.py",
             "-s", str(rgb_scene_root),
             "--colmap_executable", str(args.colmap_executable),
@@ -139,6 +267,19 @@ def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args) -> None:
             "--prior_position_std_m", str(args.prior_position_std_m),
             "--wgs84_code", str(args.wgs84_code),
         ]
+        if sfm_lists and str(args.raw_sfm_protocol).strip().lower() == "train_only_register_test":
+            cmd += [
+                "--image_list_path", str(sfm_lists["feature_image_list"]),
+                "--mapper_image_list_path", str(sfm_lists["mapper_image_list"]),
+                "--register_images_after_mapper",
+                "--registration_required_image_list_path", str(sfm_lists["registration_required_image_list"]),
+                "--registration_audit_path", str(sfm_lists["audit_path"]),
+                "--fail_on_missing_registration",
+                "--strict_no_point_growth_after_registration",
+            ]
+            if str(args.image_registrator_args).strip():
+                cmd += ["--image_registrator_args", str(args.image_registrator_args)]
+        return cmd
 
     try:
         _run(_make_convert_cmd(str(args.matching)), cwd=repo_root)
@@ -155,7 +296,12 @@ def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args) -> None:
 
 def _train_rgb(repo_root: Path, prepared_root: Path, out_root: Path, args) -> None:
     rgb_scene_root = prepared_root / "RGB"
-    _ensure_rgb_colmap(repo_root, rgb_scene_root, args)
+    sfm_lists = None
+    if str(args.protocol_split).strip() and str(args.raw_sfm_protocol).strip().lower() == "train_only_register_test":
+        sfm_lists = _write_protocol_sfm_lists(rgb_scene_root, str(args.protocol_split))
+    _ensure_rgb_colmap(repo_root, rgb_scene_root, args, sfm_lists=sfm_lists)
+    _copy_raw_sfm_audit_to_sparse(rgb_scene_root)
+    _install_protocol_split(rgb_scene_root, str(args.protocol_split))
     model_dir = out_root / "Model_RGB"
     cmd = [
         sys.executable, "train.py",
@@ -197,6 +343,8 @@ def _build_rectified_bands(prepared_root: Path, rectified_root: Path, args) -> N
         rectification_edge_dilate_radius=int(args.rectification_edge_dilate_radius),
         rectification_residual_reg=float(args.rectification_residual_reg),
         rectification_alignment_scale=float(args.rectification_alignment_scale),
+        rectification_alignment_max_dim=int(args.rectification_alignment_max_dim),
+        rectification_refine_frames=int(args.rectification_refine_frames),
         rectification_min_structure_score=args.rectification_min_structure_score,
         rectification_debug_use_legacy_ecc=bool(args.rectification_debug_use_legacy_ecc),
         rectification_min_improved_ratio=float(args.rectification_min_improved_ratio),
@@ -209,6 +357,7 @@ def _build_rectified_bands(prepared_root: Path, rectified_root: Path, args) -> N
         minima_roma_size=str(args.minima_roma_size),
         minima_match_threshold=float(args.minima_match_threshold),
         minima_fine_threshold=float(args.minima_fine_threshold),
+        minima_match_max_dim=int(args.minima_match_max_dim),
         minima_match_conf_thresh=float(args.minima_match_conf_thresh),
         minima_min_matches=int(args.minima_min_matches),
         minima_min_inlier_ratio=float(args.minima_min_inlier_ratio),
@@ -349,6 +498,8 @@ def main() -> None:
     ap.add_argument("--rectification_edge_dilate_radius", type=int, default=1)
     ap.add_argument("--rectification_residual_reg", type=float, default=1e-3)
     ap.add_argument("--rectification_alignment_scale", type=float, default=0.25)
+    ap.add_argument("--rectification_alignment_max_dim", type=int, default=640)
+    ap.add_argument("--rectification_refine_frames", type=int, default=6)
     ap.add_argument("--rectification_min_structure_score", type=float, default=None)
     ap.add_argument("--rectification_qa_fail_fast", type=str, default="true")
     ap.add_argument("--rectification_debug_use_legacy_ecc", type=str, default="false")
@@ -364,6 +515,7 @@ def main() -> None:
     ap.add_argument("--minima_roma_size", default="large", choices=["large", "tiny"])
     ap.add_argument("--minima_match_threshold", type=float, default=0.3)
     ap.add_argument("--minima_fine_threshold", type=float, default=0.1)
+    ap.add_argument("--minima_match_max_dim", type=int, default=1600)
     ap.add_argument("--minima_match_conf_thresh", type=float, default=0.2)
     ap.add_argument("--minima_min_matches", type=int, default=80)
     ap.add_argument("--minima_min_inlier_ratio", type=float, default=0.30)
@@ -384,8 +536,8 @@ def main() -> None:
     ap.add_argument("--link_mode", default="hardlink", choices=["copy", "hardlink", "symlink"])
     ap.add_argument("--rgb_iter", type=int, default=30000)
     ap.add_argument("--band_iter", type=int, default=40000)
-    ap.add_argument("--rgb_res", type=int, default=4)
-    ap.add_argument("--band_res", type=int, default=4)
+    ap.add_argument("--rgb_res", type=int, default=8)
+    ap.add_argument("--band_res", type=int, default=8)
     ap.add_argument("--input_dynamic_range", default="uint16", choices=["uint8", "uint16", "float"])
     ap.add_argument("--band_feature_lr", type=float, default=0.001)
     ap.add_argument("--band_opacity_lr", type=float, default=None)
@@ -400,9 +552,24 @@ def main() -> None:
     ap.add_argument("--camera", default="SIMPLE_RADIAL")
     ap.add_argument("--matching", default="spatial", choices=["spatial", "exhaustive", "sequential", "vocab_tree"])
     ap.add_argument("--matcher_args", default="--SpatialMatching.max_num_neighbors=80 --SpatialMatching.max_distance=500")
+    ap.add_argument(
+        "--raw_sfm_protocol",
+        choices=["train_only_register_test", "all_images"],
+        default="train_only_register_test",
+        help=(
+            "Raw RGB COLMAP protocol when --protocol_split is provided. "
+            "train_only_register_test maps train images only, then localizes held-out test images."
+        ),
+    )
+    ap.add_argument(
+        "--image_registrator_args",
+        default="",
+        help="Extra COLMAP image_registrator args for raw_sfm_protocol=train_only_register_test.",
+    )
     ap.add_argument("--prior_position_std_m", type=float, default=1.0)
     ap.add_argument("--wgs84_code", type=int, default=0)
     ap.add_argument("--sparse_source", default="", help="Optional existing sparse/0 to seed the prepared RGB scene only.")
+    ap.add_argument("--protocol_split", default="", help="Optional frozen split_v1.json copied into sparse/0 before training.")
     ap.add_argument("--auto_render", action="store_true", default=False)
     args = ap.parse_args()
 

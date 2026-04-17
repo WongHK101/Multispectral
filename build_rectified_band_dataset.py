@@ -116,9 +116,24 @@ def build_rectified_band_dataset(prepared_root: Path,
     config = json.loads(homography_json.read_text(encoding="utf-8"))
     rgb_scene_root = prepared_root / "RGB"
     rgb_manifest = _load_manifest(rgb_scene_root)
-    rgb_items = list(rgb_manifest.get("images", []))
+    rgb_items_all = list(rgb_manifest.get("images", []))
+    rgb_items = []
+    skipped_missing_rgb_plane = 0
+    for item in rgb_items_all:
+        image_name = str(item.get("image_name", "")).strip()
+        if not image_name:
+            continue
+        if not (rgb_scene_root / "images" / image_name).exists():
+            skipped_missing_rgb_plane += 1
+            continue
+        rgb_items.append(item)
     if not rgb_items:
         raise RuntimeError(f"No RGB images found in scene manifest: {rgb_scene_root}")
+    if skipped_missing_rgb_plane:
+        print(
+            f"[rectification] filtered {skipped_missing_rgb_plane} RGB manifest frames "
+            f"that are not present in the RGB training plane: {rgb_scene_root / 'images'}"
+        )
 
     band_list = _parse_bands(bands)
 
