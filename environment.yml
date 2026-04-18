@@ -1,4 +1,4 @@
-name: uav-fgs
+name: spectralindexgs
 channels:
   - pytorch
   - nvidia

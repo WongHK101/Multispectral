@@ -257,7 +257,7 @@ def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args, sfm_lists: d
     def _make_convert_cmd(matching_name: str):
         matcher_args = str(args.matcher_args) if matching_name == str(args.matching) else ""
         cmd = [
-            sys.executable, "convert_uavfgs.py",
+        sys.executable, "prepare_scene_colmap.py",
             "-s", str(rgb_scene_root),
             "--colmap_executable", str(args.colmap_executable),
             "--exiftool_executable", str(args.exiftool_executable),

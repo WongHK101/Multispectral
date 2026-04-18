@@ -1,12 +1,14 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-convert_uavfgs.py
+prepare_scene_colmap.py
 
-Prepare COLMAP- and 3DGS-compatible inputs for UAV-FGS.
-This script converts standardized RGB-T data into the camera, database, and
-layout artifacts expected by the downstream reconstruction pipeline and exports
-pose-prior records for GPS-enabled runs.
+Prepare COLMAP- and 3DGS-compatible scene assets for the current
+SpectralIndexGS pipeline.
+This script converts standardized raw or aligned scene folders into the camera,
+database, sparse-model, and layout artifacts expected by the downstream
+reconstruction pipeline, and exports optional pose-prior records for
+GPS-enabled runs.
 """
 
 import argparse

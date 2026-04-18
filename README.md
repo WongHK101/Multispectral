@@ -1,6 +1,6 @@
-# Anonymous Review Code
+# SpectralIndexGS
 
-This repository contains the anonymous review code for a UAV multispectral 3D Gaussian Splatting pipeline.
+This repository contains the current SpectralIndexGS codebase for UAV multispectral 3D Gaussian Splatting.
 
 The current mainline supports:
 
@@ -11,14 +11,16 @@ The current mainline supports:
 - false-color and spectral-index proxy product export
 - masked and common-mask offline evaluation
 
-This package is prepared for anonymous academic review. It keeps the current multispectral pipeline and the auxiliary scripts required for protocol generation, evaluation, and ablation support.
+The repository includes the current multispectral training pipeline, raw-scene rectification workflow, protocol-freezing utilities, product export, and offline evaluation scripts.
 
 ## 1. What Is Included
 
-The core entry points are:
+The main entry points are:
 
 - `run_spectralindexgs_pipeline.py`
   - end-to-end raw multispectral pipeline
+- `prepare_scene_colmap.py`
+  - raw-scene COLMAP preparation with train-only SfM and held-out test localization support
 - `prepare_official_ms_scene.py`
   - converts official aligned multispectral scenes into repo-native scene layout
 - `train.py`
@@ -121,7 +123,7 @@ which exiftool
 
 ### 4.1 Create a Conda environment
 
-Recommended setup:
+Recommended step-by-step setup:
 
 ```bash
 conda create -n spectralindexgs python=3.10.18 pip=25.2 numpy=1.26.4 -y
@@ -130,16 +132,16 @@ conda install -y pytorch==2.0.1 torchvision==0.15.2 pytorch-cuda=11.8 -c pytorch
 python -m pip install -r requirements.txt
 ```
 
-The repository also ships an `environment.yml` file if you prefer a one-shot environment creation flow:
+The repository also ships an `environment.yml` file if you prefer a one-shot Conda flow:
 
 ```bash
 conda env create -f environment.yml
-conda activate uav-fgs
+conda activate spectralindexgs
 ```
 
 ### 4.2 Install CUDA extensions
 
-Run the following commands from the repository root:
+From the repository root, install the CUDA extensions explicitly:
 
 ```bash
 python -m pip install --no-build-isolation submodules/simple-knn
@@ -169,6 +171,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 python -c "import cv2, diff_gaussian_rasterization, simple_knn, fused_ssim; print('extensions OK')"
 python train.py -h
 python render.py -h
+python prepare_scene_colmap.py -h
 python run_spectralindexgs_pipeline.py -h
 python prepare_official_ms_scene.py -h
 python build_spectral_products.py -h
@@ -176,11 +179,23 @@ python masked_metrics.py -h
 python common_mask_eval.py -h
 ```
 
+### 4.5 External tools used by the raw-scene pipeline
+
+For raw UAV scenes, the end-to-end pipeline expects the following tools to be available:
+
+- `colmap`
+- `exiftool`
+
+They can either be visible on `PATH`, or be provided explicitly through:
+
+- `--colmap_executable`
+- `--exiftool_executable`
+
 ## 5. Data Assumptions
 
 ### 5.1 Raw UAV multispectral scenes
 
-Raw scenes are prepared by `prepare_m3m_multispectral.py`.
+Raw scenes are prepared by `prepare_m3m_multispectral.py`, and their RGB geometry is prepared through `prepare_scene_colmap.py` inside the main pipeline.
 
 The expected capture structure is:
 
@@ -245,7 +260,20 @@ python run_spectralindexgs_pipeline.py \
   --auto_render
 ```
 
-### 7.1 Pipeline stages
+### 7.1 What the pipeline does
+
+For raw UAV scenes, the pipeline performs:
+
+1. raw scene preparation
+2. train-only RGB SfM / COLMAP mapping
+3. held-out RGB test localization into the frozen train reconstruction
+4. RGB geometry training
+5. MINIMA-assisted band rectification
+6. per-band stage-2 transfer
+7. spectral product export
+8. optional offline rendering
+
+### 7.2 Pipeline stages
 
 The current pipeline stages are:
 
@@ -259,7 +287,7 @@ The current pipeline stages are:
 8. `08_build_products`
 9. `09_optional_render`
 
-### 7.2 Important defaults and semantics
+### 7.3 Important defaults and semantics
 
 - `band_iter` currently follows a **final-iteration** semantics
 - for example, `rgb_iter=30000` and `band_iter=60000` means:
@@ -270,7 +298,7 @@ The current pipeline stages are:
   - `--input_dynamic_range uint16`
   - `--radiometric_mode exposure_normalized`
 
-### 7.3 Typical output structure
+### 7.4 Typical output structure
 
 ```text
 <OUT_ROOT>/
@@ -307,6 +335,23 @@ python prepare_official_ms_scene.py \
   --out_root <PREPARED_ROOT> \
   --image_root images_2 \
   --split_json <SPLIT_JSON>
+```
+
+If you only want to prepare and inspect a raw scene COLMAP layout outside the full pipeline, you can also run:
+
+```bash
+python prepare_scene_colmap.py \
+  -s <PREPARED_RGB_ROOT> \
+  --colmap_executable colmap \
+  --exiftool_executable exiftool \
+  --image_list_path <TRAIN_PLUS_TEST_LIST> \
+  --mapper_image_list_path <TRAIN_ONLY_LIST> \
+  --register_images_after_mapper \
+  --registration_required_image_list_path <TEST_ONLY_LIST> \
+  --registration_audit_path <AUDIT_JSON> \
+  --fail_on_missing_registration \
+  --strict_no_point_growth_after_registration \
+  --resize
 ```
 
 ### 8.2 Train the RGB model
@@ -486,6 +531,7 @@ utils/                         helper utilities, including the MINIMA bridge
 submodules/                    CUDA extensions
 
 prepare_m3m_multispectral.py   raw M3M scene preparation
+prepare_scene_colmap.py        raw-scene COLMAP preparation
 prepare_official_ms_scene.py   official aligned MS preparation
 freeze_protocol_assets.py      frozen split / protocol-pack generation
 estimate_band_homographies.py  rectification estimation
@@ -504,13 +550,12 @@ export_masked_panels.py
 
 ## 13. Notes
 
-- This README reflects the **current multispectral mainline**.
+- This README reflects the current multispectral mainline.
 - If the README and the code ever diverge, use the current CLI help and code behavior as the authoritative reference:
 
 ```bash
+python prepare_scene_colmap.py -h
 python run_spectralindexgs_pipeline.py -h
 python train.py -h
 python render.py -h
 ```
-
-- This repository is packaged for anonymous academic review and therefore intentionally avoids non-essential local viewers, cached runs, and internal experiment tables.
