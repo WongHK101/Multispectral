@@ -110,6 +110,8 @@ where.exe exiftool
 - COLMAP on `PATH`
 - ExifTool on `PATH`
 
+For raw-scene GPU SIFT on headless Linux, a distro `colmap` package is often not enough, because it may be built without CUDA support. A user-local CUDA-enabled build is the recommended setup for this repository.
+
 Preflight checks:
 
 ```bash
@@ -117,6 +119,41 @@ which nvcc
 which g++
 which colmap
 which exiftool
+```
+
+Recommended user-local CUDA COLMAP install path:
+
+```bash
+$HOME/opt/colmap-cuda/bin/colmap
+```
+
+Example headless Linux build flow:
+
+```bash
+sudo apt-get install -y \
+  build-essential cmake ninja-build git pkg-config \
+  libboost-program-options-dev libboost-filesystem-dev libboost-graph-dev libboost-system-dev \
+  libeigen3-dev libfreeimage-dev libmetis-dev libgoogle-glog-dev libgtest-dev \
+  libsqlite3-dev libglew-dev qtbase5-dev libqt5opengl5-dev libcgal-dev libceres-dev libflann-dev
+
+export PATH=/usr/local/cuda-11.8/bin:$PATH
+
+cmake -S <COLMAP_SRC> -B <COLMAP_BUILD> -GNinja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/opt/colmap-cuda-3.7" \
+  -DCMAKE_INSTALL_RPATH="\$ORIGIN/../lib:/usr/local/cuda-11.8/lib64" \
+  -DCUDA_ENABLED=ON \
+  -DGUI_ENABLED=ON \
+  -DOPENGL_ENABLED=ON \
+  -DBOOST_STATIC=OFF \
+  -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-11.8 \
+  -DCUDA_NVCC_EXECUTABLE=/usr/local/cuda-11.8/bin/nvcc \
+  -DCUDA_NVCC_FLAGS=--std=c++14 \
+  -DCUDA_ARCHS=8.9
+
+cmake --build <COLMAP_BUILD> -j8
+cmake --install <COLMAP_BUILD>
+ln -sfn "$HOME/opt/colmap-cuda-3.7" "$HOME/opt/colmap-cuda"
 ```
 
 ## 4. Environment Setup
@@ -191,6 +228,27 @@ They can either be visible on `PATH`, or be provided explicitly through:
 - `--colmap_executable`
 - `--exiftool_executable`
 
+Current COLMAP resolution order in the scripts is:
+
+1. `SIGS_COLMAP_EXECUTABLE`
+2. `COLMAP_EXECUTABLE`
+3. `~/opt/colmap-cuda/bin/colmap`
+4. `colmap`
+
+For `prepare_scene_colmap.py`, the default `--sift_use_gpu auto` / `--sift_matching_use_gpu auto` behavior is:
+
+- try GPU first
+- if COLMAP GPU SIFT fails in the current runtime, retry on CPU automatically
+
+GPU SIFT memory pressure can be tuned from the pipeline through:
+
+- `--sift_max_image_size`
+- `--sift_max_num_features`
+- `--sift_matching_max_num_matches`
+- `--sift_num_threads`
+
+The defaults mirror COLMAP defaults: `3200`, `8192`, `32768`, and `-1`. If the CUDA COLMAP build starts but reports SiftGPU memory errors, lower these values for the raw SfM step.
+
 ## 5. Data Assumptions
 
 ### 5.1 Raw UAV multispectral scenes
@@ -255,6 +313,9 @@ python run_spectralindexgs_pipeline.py \
   --band_iter 60000 \
   --rgb_res 8 \
   --band_res 8 \
+  --sift_max_image_size 3200 \
+  --sift_max_num_features 8192 \
+  --sift_matching_max_num_matches 32768 \
   --input_dynamic_range uint16 \
   --radiometric_mode exposure_normalized \
   --auto_render

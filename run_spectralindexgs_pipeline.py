@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,22 @@ STEP_NAMES = [
     "09_optional_render",
 ]
 BANDS = ("G", "R", "RE", "NIR")
+
+
+def _default_colmap_executable() -> str:
+    for env_name in ("SIGS_COLMAP_EXECUTABLE", "COLMAP_EXECUTABLE"):
+        value = str(os.environ.get(env_name, "")).strip()
+        if value:
+            return value
+    home = Path.home()
+    candidates = [
+        home / "opt" / "colmap-cuda" / "bin" / "colmap",
+        home / "opt" / "colmap-cuda-3.7" / "bin" / "colmap",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "colmap"
 
 
 def _run(cmd, cwd: Path) -> None:
@@ -264,6 +281,10 @@ def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args, sfm_lists: d
             "--camera", str(args.camera),
             "--matching", str(matching_name),
             "--matcher_args", matcher_args,
+            "--sift_num_threads", str(args.sift_num_threads),
+            "--sift_max_image_size", str(args.sift_max_image_size),
+            "--sift_max_num_features", str(args.sift_max_num_features),
+            "--sift_matching_max_num_matches", str(args.sift_matching_max_num_matches),
             "--prior_position_std_m", str(args.prior_position_std_m),
             "--wgs84_code", str(args.wgs84_code),
         ]
@@ -569,11 +590,22 @@ def main() -> None:
     ap.add_argument("--radiometric_mode", default="exposure_normalized", choices=["raw_dn", "exposure_normalized", "reflectance_ready_stub"])
     ap.add_argument("--savi_l", type=float, default=0.5)
     ap.add_argument("--eps", type=float, default=1e-6)
-    ap.add_argument("--colmap_executable", default="colmap")
+    ap.add_argument(
+        "--colmap_executable",
+        default=_default_colmap_executable(),
+        help=(
+            "COLMAP executable. Defaults to SIGS_COLMAP_EXECUTABLE/COLMAP_EXECUTABLE, "
+            "then ~/opt/colmap-cuda/bin/colmap if present."
+        ),
+    )
     ap.add_argument("--exiftool_executable", default="exiftool")
     ap.add_argument("--camera", default="SIMPLE_RADIAL")
     ap.add_argument("--matching", default="spatial", choices=["spatial", "exhaustive", "sequential", "vocab_tree"])
     ap.add_argument("--matcher_args", default="--SpatialMatching.max_num_neighbors=80 --SpatialMatching.max_distance=500")
+    ap.add_argument("--sift_num_threads", type=int, default=-1)
+    ap.add_argument("--sift_max_image_size", type=int, default=3200)
+    ap.add_argument("--sift_max_num_features", type=int, default=8192)
+    ap.add_argument("--sift_matching_max_num_matches", type=int, default=32768)
     ap.add_argument(
         "--raw_sfm_protocol",
         choices=["train_only_register_test", "all_images"],

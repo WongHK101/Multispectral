@@ -64,25 +64,161 @@ def _should_use_shell(resolved_exe: str) -> bool:
     return low.endswith(".bat") or low.endswith(".cmd")
 
 
-def run_cmd(cmd_list, cwd=None):
+def run_cmd(cmd_list, cwd=None, extra_env: Optional[Dict[str, str]] = None):
     if not cmd_list:
         raise ValueError("Empty command list")
 
     resolved0 = _resolve_executable(cmd_list[0])
     use_shell = _should_use_shell(resolved0)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
 
     if use_shell:
         cmd_str = " ".join([f'"{x}"' if (" " in str(x)) else str(x) for x in [resolved0] + cmd_list[1:]])
         log_info("Running (shell): " + cmd_str)
-        subprocess.run(cmd_str, cwd=cwd, check=True, shell=True)
+        subprocess.run(cmd_str, cwd=cwd, check=True, shell=True, env=env)
     else:
         cmd = [resolved0] + cmd_list[1:]
         log_info("Running: " + " ".join([str(x) for x in cmd]))
-        subprocess.run(cmd, cwd=cwd, check=True)
+        subprocess.run(cmd, cwd=cwd, check=True, env=env)
 
 
 def split_args(s: str):
     return s.strip().split() if s else []
+
+
+def default_colmap_executable() -> str:
+    for env_name in ("SIGS_COLMAP_EXECUTABLE", "COLMAP_EXECUTABLE"):
+        value = str(os.environ.get(env_name, "")).strip()
+        if value:
+            return value
+    home = Path.home()
+    candidates = [
+        home / "opt" / "colmap-cuda" / "bin" / "colmap",
+        home / "opt" / "colmap-cuda-3.7" / "bin" / "colmap",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return "colmap"
+
+
+def normalize_colmap_gpu_mode(mode: str) -> str:
+    value = str(mode).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return "1"
+    if value in {"0", "false", "no", "off"}:
+        return "0"
+    return "auto"
+
+
+def _run_cmd_capture_output(cmd_list, cwd=None, extra_env: Optional[Dict[str, str]] = None) -> str:
+    if not cmd_list:
+        raise ValueError("Empty command list")
+
+    resolved0 = _resolve_executable(cmd_list[0])
+    use_shell = _should_use_shell(resolved0)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    if use_shell:
+        cmd_str = " ".join([f'"{x}"' if (" " in str(x)) else str(x) for x in [resolved0] + cmd_list[1:]])
+        log_info("Running (shell): " + cmd_str)
+        result = subprocess.run(
+            cmd_str,
+            cwd=cwd,
+            check=False,
+            shell=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+    else:
+        cmd = [resolved0] + cmd_list[1:]
+        log_info("Running: " + " ".join([str(x) for x in cmd]))
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            check=False,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+
+    output = result.stdout or ""
+    if output:
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd_list, output=output)
+    return output
+
+
+def _looks_like_colmap_gpu_failure(output: str) -> bool:
+    text = str(output).lower()
+    markers = (
+        "failed to extract features",
+        "not enough gpu memory",
+        "out of memory",
+        "siftgpu not fully supported",
+        "could not connect to display",
+        "could not load the qt platform plugin",
+        "check failed: context_.create()",
+    )
+    return any(marker in text for marker in markers)
+
+
+def run_colmap_gpu_cmd(
+    cmd_prefix: List[str],
+    gpu_flag_name: str,
+    gpu_mode: str,
+    cwd=None,
+    retry_cleanup_paths: Optional[List[Path]] = None,
+) -> None:
+    def gpu_attempt_env() -> Optional[Dict[str, str]]:
+        if os.name == "nt":
+            return None
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return None
+        if os.environ.get("QT_QPA_PLATFORM"):
+            return None
+        return {"QT_QPA_PLATFORM": "offscreen"}
+
+    normalized_mode = normalize_colmap_gpu_mode(gpu_mode)
+    if normalized_mode != "auto":
+        output = _run_cmd_capture_output(
+            cmd_prefix + [gpu_flag_name, normalized_mode],
+            cwd=cwd,
+            extra_env=gpu_attempt_env() if normalized_mode == "1" else None,
+        )
+        if normalized_mode == "1" and _looks_like_colmap_gpu_failure(output):
+            raise RuntimeError(f"{gpu_flag_name}=1 completed with GPU-failure markers in output.")
+        return
+
+    try:
+        log_info(f"{gpu_flag_name}=auto -> trying GPU first")
+        output = _run_cmd_capture_output(cmd_prefix + [gpu_flag_name, "1"], cwd=cwd, extra_env=gpu_attempt_env())
+        if _looks_like_colmap_gpu_failure(output):
+            raise RuntimeError(f"{gpu_flag_name}=1 completed with GPU-failure markers in output.")
+        return
+    except (subprocess.CalledProcessError, RuntimeError):
+        log_warn(
+            f"{gpu_flag_name}=1 failed; retrying with CPU. "
+            "This often means COLMAP GPU SIFT is unavailable in the current runtime."
+        )
+        for path in retry_cleanup_paths or []:
+            if path.exists():
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+
+    run_cmd(cmd_prefix + [gpu_flag_name, "0"], cwd=cwd)
 
 
 
@@ -722,7 +858,14 @@ def ensure_camera_models_supported_for_3dgs(colmap_exe: str, model_dir: Path) ->
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-s", "--source_path", required=True, help="Dataset root (contains input/)")
-    parser.add_argument("--colmap_executable", default="colmap", help="Path/name of colmap executable")
+    parser.add_argument(
+        "--colmap_executable",
+        default=default_colmap_executable(),
+        help=(
+            "Path/name of colmap executable. "
+            "Defaults to SIGS_COLMAP_EXECUTABLE/COLMAP_EXECUTABLE, then ~/opt/colmap-cuda/bin/colmap if present."
+        ),
+    )
     parser.add_argument("--exiftool_executable", default="exiftool", help="Path/name of exiftool executable")
     parser.add_argument(
         "--wgs84_code", type=int, default=0,
@@ -742,6 +885,20 @@ def main():
     parser.add_argument("--camera", default="SIMPLE_RADIAL")
     parser.add_argument("--matching", default="spatial", choices=["spatial", "exhaustive", "sequential", "vocab_tree"])
     parser.add_argument("--matcher_args", default="")
+    parser.add_argument("--sift_num_threads", type=int, default=-1)
+    parser.add_argument("--sift_max_image_size", type=int, default=3200)
+    parser.add_argument("--sift_max_num_features", type=int, default=8192)
+    parser.add_argument("--sift_matching_max_num_matches", type=int, default=32768)
+    parser.add_argument(
+        "--sift_use_gpu",
+        default="auto",
+        help="COLMAP SiftExtraction.use_gpu. Use auto to try GPU first and fall back to CPU if needed.",
+    )
+    parser.add_argument(
+        "--sift_matching_use_gpu",
+        default="auto",
+        help="COLMAP SiftMatching.use_gpu. Use auto to try GPU first and fall back to CPU if needed.",
+    )
     parser.add_argument("--mapper_multiple_models", type=int, default=1)
     parser.add_argument("--min_model_size", type=int, default=10)
     parser.add_argument("--init_min_num_inliers", type=int, default=100)
@@ -816,6 +973,8 @@ def main():
     sparse_root.mkdir(parents=True, exist_ok=True)
 
     colmap_exe = args.colmap_executable
+    sift_use_gpu = normalize_colmap_gpu_mode(args.sift_use_gpu)
+    sift_matching_use_gpu = normalize_colmap_gpu_mode(args.sift_matching_use_gpu)
 
     feature_cmd = [
         colmap_exe, "feature_extractor",
@@ -823,19 +982,42 @@ def main():
         "--image_path", str(input_dir),
         "--ImageReader.camera_model", str(args.camera),
         "--ImageReader.single_camera", "1",
+        "--SiftExtraction.num_threads", str(args.sift_num_threads),
+        "--SiftExtraction.max_image_size", str(args.sift_max_image_size),
+        "--SiftExtraction.max_num_features", str(args.sift_max_num_features),
     ]
     if feature_image_list:
         feature_cmd += ["--image_list_path", str(feature_image_list)]
-    run_cmd(feature_cmd)
+    run_colmap_gpu_cmd(feature_cmd, "--SiftExtraction.use_gpu", sift_use_gpu, retry_cleanup_paths=[db_path])
+
+    matcher_common_args = [
+        "--SiftMatching.max_num_matches", str(args.sift_matching_max_num_matches),
+    ] + split_args(args.matcher_args)
 
     if args.matching == "spatial":
-        run_cmd([colmap_exe, "spatial_matcher", "--database_path", str(db_path)] + split_args(args.matcher_args))
+        run_colmap_gpu_cmd(
+            [colmap_exe, "spatial_matcher", "--database_path", str(db_path)] + matcher_common_args,
+            "--SiftMatching.use_gpu",
+            sift_matching_use_gpu,
+        )
     elif args.matching == "exhaustive":
-        run_cmd([colmap_exe, "exhaustive_matcher", "--database_path", str(db_path)] + split_args(args.matcher_args))
+        run_colmap_gpu_cmd(
+            [colmap_exe, "exhaustive_matcher", "--database_path", str(db_path)] + matcher_common_args,
+            "--SiftMatching.use_gpu",
+            sift_matching_use_gpu,
+        )
     elif args.matching == "sequential":
-        run_cmd([colmap_exe, "sequential_matcher", "--database_path", str(db_path)] + split_args(args.matcher_args))
+        run_colmap_gpu_cmd(
+            [colmap_exe, "sequential_matcher", "--database_path", str(db_path)] + matcher_common_args,
+            "--SiftMatching.use_gpu",
+            sift_matching_use_gpu,
+        )
     else:
-        run_cmd([colmap_exe, "vocab_tree_matcher", "--database_path", str(db_path)] + split_args(args.matcher_args))
+        run_colmap_gpu_cmd(
+            [colmap_exe, "vocab_tree_matcher", "--database_path", str(db_path)] + matcher_common_args,
+            "--SiftMatching.use_gpu",
+            sift_matching_use_gpu,
+        )
 
     mapper_cmd = [
         colmap_exe, "mapper",
