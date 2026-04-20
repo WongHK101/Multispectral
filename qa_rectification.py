@@ -11,6 +11,7 @@ from PIL import Image
 
 from utils.rectification_utils import (
     determine_pass_from_summary,
+    determine_qa_status_from_summary,
     export_rectification_debug_panel,
     load_rgb_plane_image,
     prepare_alignment_images,
@@ -97,7 +98,8 @@ def run_rectification_qa(prepared_root: Path,
                          edge_dilate_radius: int = 1,
                          min_improved_ratio: float = 0.6,
                          max_severe_outliers: int = 0,
-                         qa_scale: float = 1.0) -> Dict[str, object]:
+                         qa_scale: float = 1.0,
+                         warning_continue_enabled: bool | None = None) -> Dict[str, object]:
     prepared_root = prepared_root.resolve()
     rectified_root = rectified_root.resolve()
     out_root = out_root.resolve()
@@ -116,6 +118,7 @@ def run_rectification_qa(prepared_root: Path,
         "rectified_root": str(rectified_root),
         "out_root": str(out_root),
         "bands_order": band_list,
+        "warning_continue_enabled": None if warning_continue_enabled is None else bool(warning_continue_enabled),
         "bands": {},
     }
 
@@ -258,15 +261,57 @@ def run_rectification_qa(prepared_root: Path,
             "num_frames_improved_grad": sum(1 for item in frame_records if item["delta_grad_ncc"] > 0),
             "num_frames_improved_either": sum(1 for item in frame_records if item["delta_edge_f1"] > 0 or item["delta_grad_ncc"] > 0),
             "severe_outlier_count": sum(1 for item in frame_records if item["severe_misalignment"]),
+            "representative_frame_ids": [str(item["frame_id"]) for item in frame_records],
+            "representative_image_names": [str(item["image_name"]) for item in frame_records],
             "per_frame": frame_records,
         }
         band_summary["improved_ratio"] = float(band_summary["num_frames_improved_either"]) / float(max(band_summary["num_frames"], 1))
-        band_summary["pass"] = determine_pass_from_summary(
+        legacy_pass = determine_pass_from_summary(
             band_summary,
             min_improved_ratio=min_improved_ratio,
             max_severe_outliers=max_severe_outliers,
         )
+        qa_info = determine_qa_status_from_summary(
+            band_summary,
+            legacy_pass=bool(legacy_pass),
+            band_name=band,
+            h0_source=str(band_cfg.get("h0_source", "")),
+            match_summary=band_cfg.get("match_summary", {}),
+            homography_stability=band_cfg.get("homography_stability", {}),
+            config=config.get("config", {}),
+            min_improved_ratio=min_improved_ratio,
+            max_severe_outliers=max_severe_outliers,
+        )
+        band_summary["legacy_pass"] = bool(legacy_pass)
+        band_summary["qa_status"] = qa_info["qa_status"]
+        band_summary["qa_warning_codes"] = qa_info["qa_warning_codes"]
+        band_summary["qa_decision_inputs"] = qa_info["decision_inputs"]
+        band_summary["warning_path_reason"] = qa_info["warning_path_reason"]
+        band_summary["qa_notes"] = qa_info["notes"]
+        band_summary["pass"] = bool(qa_info["qa_pass"])
+        estimator_status = str(band_cfg.get("qa_status", "") or "").strip().lower()
+        if estimator_status == "pass_with_warning" and str(qa_info["qa_status"]) == "pass":
+            band_summary["estimator_to_final_qa_note"] = (
+                f"{band} entered the estimator gate as pass_with_warning due to the "
+                "weak-baseline/high-modality-gap warning path, and passed the final "
+                "standalone QA strictly after rectification."
+            )
         summary["bands"][band] = band_summary
+
+    status_counts: Dict[str, int] = {}
+    for band_summary in summary["bands"].values():
+        status = str(band_summary.get("qa_status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+    for status in ("pass", "pass_with_warning", "fail"):
+        status_counts.setdefault(status, 0)
+    summary["qa_status_counts"] = status_counts
+    summary["num_pass"] = int(status_counts.get("pass", 0))
+    summary["num_pass_with_warning"] = int(status_counts.get("pass_with_warning", 0))
+    summary["num_fail"] = int(status_counts.get("fail", 0))
+    summary["qa_protocol_note"] = (
+        "Estimator QA is an online conservative gate; final standalone QA is the "
+        "authoritative post-rectification assessment."
+    )
 
     write_rectification_diagnostics_json(summary, out_root / "rectification_qa_summary.json")
     return summary
@@ -285,6 +330,7 @@ def main() -> None:
     ap.add_argument("--rectification_min_improved_ratio", type=float, default=0.6)
     ap.add_argument("--rectification_max_severe_outliers", type=int, default=0)
     ap.add_argument("--rectification_qa_scale", type=float, default=1.0)
+    ap.add_argument("--rectification_allow_warning_continue", type=str, default="true")
     args = ap.parse_args()
 
     summary = run_rectification_qa(
@@ -299,17 +345,25 @@ def main() -> None:
         min_improved_ratio=args.rectification_min_improved_ratio,
         max_severe_outliers=args.rectification_max_severe_outliers,
         qa_scale=args.rectification_qa_scale,
+        warning_continue_enabled=str(args.rectification_allow_warning_continue).strip().lower() not in ("0", "false", "no", "off"),
     )
     print(json.dumps(
         {
             "bands": {
                 band: {
                     "pass": summary["bands"][band]["pass"],
+                    "legacy_pass": summary["bands"][band].get("legacy_pass", None),
+                    "qa_status": summary["bands"][band].get("qa_status", "unknown"),
+                    "qa_warning_codes": summary["bands"][band].get("qa_warning_codes", []),
+                    "warning_path_reason": summary["bands"][band].get("warning_path_reason", ""),
                     "delta_edge_f1": summary["bands"][band]["delta_edge_f1"],
                     "delta_grad_ncc": summary["bands"][band]["delta_grad_ncc"],
                 }
                 for band in summary.get("bands", {}).keys()
-            }
+            },
+            "qa_status_counts": summary.get("qa_status_counts", {}),
+            "warning_continue_enabled": summary.get("warning_continue_enabled", None),
+            "num_pass_with_warning": summary.get("num_pass_with_warning", 0),
         },
         indent=2,
         ensure_ascii=False,

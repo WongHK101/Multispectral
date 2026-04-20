@@ -218,15 +218,26 @@ def _load_rectification_qa_summary(rectified_root: Path) -> dict:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
-def _assert_rectification_qa_pass(rectified_root: Path, fail_fast: bool = True) -> None:
+def _assert_rectification_qa_pass(
+    rectified_root: Path,
+    fail_fast: bool = True,
+    allow_warning_continue: bool = True,
+) -> None:
     summary = _load_rectification_qa_summary(rectified_root)
     failed = []
     for band in BANDS:
         band_summary = summary.get("bands", {}).get(band, {})
-        if not bool(band_summary.get("pass", False)):
+        qa_status = str(
+            band_summary.get("qa_status", "pass" if bool(band_summary.get("pass", False)) else "fail")
+        ).strip().lower()
+        qa_ok = qa_status == "pass" or (qa_status == "pass_with_warning" and bool(allow_warning_continue))
+        if not qa_ok:
             failed.append(
                 {
                     "band": band,
+                    "qa_status": qa_status,
+                    "qa_warning_codes": band_summary.get("qa_warning_codes", []),
+                    "legacy_pass": band_summary.get("legacy_pass", None),
                     "delta_edge_f1": band_summary.get("delta_edge_f1", None),
                     "delta_grad_ncc": band_summary.get("delta_grad_ncc", None),
                 }
@@ -381,6 +392,15 @@ def _build_rectified_bands(prepared_root: Path, rectified_root: Path, args) -> N
         rectification_debug_use_legacy_ecc=bool(args.rectification_debug_use_legacy_ecc),
         rectification_min_improved_ratio=float(args.rectification_min_improved_ratio),
         rectification_max_severe_outliers=int(args.rectification_max_severe_outliers),
+        rectification_high_modality_bands=str(args.rectification_high_modality_bands),
+        rectification_warning_min_accepted_ratio=float(args.rectification_warning_min_accepted_ratio),
+        rectification_warning_min_delta_edge_f1=float(args.rectification_warning_min_delta_edge_f1),
+        rectification_warning_min_grad_improved_ratio=float(args.rectification_warning_min_grad_improved_ratio),
+        rectification_warning_max_severe_outlier_ratio=float(args.rectification_warning_max_severe_outlier_ratio),
+        rectification_warning_max_severe_outlier_count=int(args.rectification_warning_max_severe_outlier_count),
+        rectification_stability_grid=int(args.rectification_stability_grid),
+        rectification_stability_warn_mean_px=float(args.rectification_stability_warn_mean_px),
+        rectification_stability_max_reject_ratio=float(args.rectification_stability_max_reject_ratio),
         rectification_backend=str(args.rectification_backend),
         minima_method=str(args.minima_method),
         minima_root=str(args.minima_root),
@@ -405,6 +425,7 @@ def _build_rectified_bands(prepared_root: Path, rectified_root: Path, args) -> N
         minima_candidate_ratio_step=float(args.minima_candidate_ratio_step),
         minima_max_candidate_ratio=float(args.minima_max_candidate_ratio),
         minima_use_all_if_needed=bool(args.minima_use_all_if_needed),
+        minima_full_if_frames_le=int(args.minima_full_if_frames_le),
         rectification_enable_residual_refine=bool(args.rectification_enable_residual_refine),
     )
     build_rectified_band_dataset(
@@ -425,8 +446,13 @@ def _build_rectified_bands(prepared_root: Path, rectified_root: Path, args) -> N
             min_improved_ratio=float(args.rectification_min_improved_ratio),
             max_severe_outliers=int(args.rectification_max_severe_outliers),
             qa_scale=float(args.rectification_qa_scale if args.rectification_qa_scale > 0 else args.rectification_alignment_scale),
+            warning_continue_enabled=bool(args.rectification_allow_warning_continue),
         )
-        _assert_rectification_qa_pass(rectified_root, fail_fast=bool(args.rectification_qa_fail_fast))
+        _assert_rectification_qa_pass(
+            rectified_root,
+            fail_fast=bool(args.rectification_qa_fail_fast),
+            allow_warning_continue=bool(args.rectification_allow_warning_continue),
+        )
 
 
 def _train_band(repo_root: Path, rectified_root: Path, out_root: Path, args, band: str) -> None:
@@ -436,7 +462,11 @@ def _train_band(repo_root: Path, rectified_root: Path, out_root: Path, args, ban
             f"Got rgb_iter={args.rgb_iter}, band_iter={args.band_iter}"
         )
     if bool(args.rectification_qa_fail_fast):
-        _assert_rectification_qa_pass(rectified_root, fail_fast=True)
+        _assert_rectification_qa_pass(
+            rectified_root,
+            fail_fast=True,
+            allow_warning_continue=bool(args.rectification_allow_warning_continue),
+        )
     scene_root = rectified_root / f"{band}_rectified"
     if args.require_rectified_band_scene:
         _assert_rectified_scene(scene_root)
@@ -548,7 +578,17 @@ def main() -> None:
     ap.add_argument("--rectification_debug_use_legacy_ecc", type=str, default="false")
     ap.add_argument("--rectification_min_improved_ratio", type=float, default=0.6)
     ap.add_argument("--rectification_max_severe_outliers", type=int, default=0)
+    ap.add_argument("--rectification_high_modality_bands", default="NIR")
+    ap.add_argument("--rectification_warning_min_accepted_ratio", type=float, default=0.80)
+    ap.add_argument("--rectification_warning_min_delta_edge_f1", type=float, default=-0.05)
+    ap.add_argument("--rectification_warning_min_grad_improved_ratio", type=float, default=0.60)
+    ap.add_argument("--rectification_warning_max_severe_outlier_ratio", type=float, default=0.10)
+    ap.add_argument("--rectification_warning_max_severe_outlier_count", type=int, default=1)
+    ap.add_argument("--rectification_stability_grid", type=int, default=5)
+    ap.add_argument("--rectification_stability_warn_mean_px", type=float, default=25.0)
+    ap.add_argument("--rectification_stability_max_reject_ratio", type=float, default=0.25)
     ap.add_argument("--rectification_qa_scale", type=float, default=-1.0)
+    ap.add_argument("--rectification_allow_warning_continue", type=str, default="true")
     ap.add_argument("--rectification_enable_residual_refine", type=str, default="false")
 
     ap.add_argument("--minima_method", default="roma", choices=["roma", "xoftr"])
@@ -574,6 +614,7 @@ def main() -> None:
     ap.add_argument("--minima_candidate_ratio_step", type=float, default=0.15)
     ap.add_argument("--minima_max_candidate_ratio", type=float, default=0.50)
     ap.add_argument("--minima_use_all_if_needed", type=str, default="true")
+    ap.add_argument("--minima_full_if_frames_le", type=int, default=300)
     ap.add_argument("--from_step", type=int, default=1)
     ap.add_argument("--to_step", type=int, default=len(STEP_NAMES))
     ap.add_argument("--link_mode", default="hardlink", choices=["copy", "hardlink", "symlink"])
@@ -632,6 +673,7 @@ def main() -> None:
     args.use_validity_mask = _str2bool(args.use_validity_mask)
     args.rectification_use_metadata_h0 = _str2bool(args.rectification_use_metadata_h0)
     args.rectification_qa_fail_fast = _str2bool(args.rectification_qa_fail_fast)
+    args.rectification_allow_warning_continue = _str2bool(args.rectification_allow_warning_continue)
     args.rectification_debug_use_legacy_ecc = _str2bool(args.rectification_debug_use_legacy_ecc)
     args.rectification_enable_residual_refine = _str2bool(args.rectification_enable_residual_refine)
     args.minima_use_all_if_needed = _str2bool(args.minima_use_all_if_needed)

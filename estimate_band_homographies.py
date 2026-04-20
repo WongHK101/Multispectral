@@ -14,6 +14,9 @@ from utils.minima_match_utils import (
     compute_match_spatial_coverage,
     estimate_homography_ransac,
     filter_matches_by_confidence,
+    homography_pair_displacement_summary,
+    homography_stability_diagnostics,
+    normalize_homography_matrix,
     robust_aggregate_homographies_weighted,
     score_frame_alignment_quality,
 )
@@ -21,6 +24,7 @@ from utils.rectification_utils import (
     build_metadata_assisted_h0,
     build_naive_h0,
     determine_pass_from_summary,
+    determine_qa_status_from_summary,
     evaluate_transform_on_frames,
     metadata_has_alignment_prior,
     optimize_global_transform_opencv_search,
@@ -130,6 +134,221 @@ def _candidate_records_by_count(records: Sequence[dict], count: int, min_structu
         max_frames=int(count),
         min_structure_score=min_structure_score,
     )
+
+
+def _summarize_numeric(values: Sequence[float]) -> dict:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {
+            "n": 0,
+            "min": None,
+            "mean": None,
+            "median": None,
+            "max": None,
+            "std": None,
+        }
+    return {
+        "n": int(arr.size),
+        "min": float(np.min(arr)),
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "max": float(np.max(arr)),
+        "std": float(np.std(arr)),
+    }
+
+
+def _summarize_match_attempts(match_attempts: Sequence[dict]) -> dict:
+    accepted = [item for item in match_attempts if bool(item.get("accepted", False))]
+    keys = (
+        "num_matches_raw",
+        "num_matches_after_conf",
+        "num_inliers",
+        "inlier_ratio",
+        "reproj_error",
+        "coverage",
+        "conf_mean",
+        "quality_score",
+    )
+
+    def summarize_subset(items: Sequence[dict]) -> dict:
+        return {
+            key: _summarize_numeric([float(item.get(key, np.nan)) for item in items])
+            for key in keys
+        }
+
+    total = int(len(match_attempts))
+    return {
+        "num_attempted": total,
+        "num_accepted": int(len(accepted)),
+        "accepted_ratio": float(len(accepted)) / float(max(total, 1)),
+        "all": summarize_subset(match_attempts),
+        "accepted": summarize_subset(accepted),
+    }
+
+
+def _summary_value(summary: dict, key: str, default: float) -> float:
+    value = summary.get(key, default) if isinstance(summary, dict) else default
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _build_candidate_diagnostics(
+    band_name: str,
+    records: Sequence[dict],
+    accepted_items: Sequence[dict],
+    all_diags: Sequence[dict],
+    min_good_frames: int,
+    config: dict,
+) -> dict:
+    accepted_sorted = sorted(accepted_items, key=lambda item: item["quality_score"], reverse=True)
+    t_full = robust_aggregate_homographies_weighted(
+        [item["homography"] for item in accepted_sorted],
+        [max(item["quality_score"], 1e-6) for item in accepted_sorted],
+    )
+
+    refine_result = _maybe_refine_transform(
+        t_full=t_full,
+        accepted_records=[item["record"] for item in accepted_sorted],
+        config=config,
+    )
+    t_opt_full = np.asarray(refine_result["T_opt"], dtype=np.float64)
+
+    eval_records = select_representative_frames(
+        frame_records=records,
+        max_frames=int(config.get("rectification_estimation_frames", 12)),
+        min_structure_score=config.get("rectification_min_structure_score", None),
+    )
+    if not eval_records:
+        eval_records = [item["record"] for item in accepted_sorted[: max(6, min(12, len(accepted_sorted)))]]  # type: ignore[index]
+
+    frame_batch = prepare_frame_batch(
+        frame_records=eval_records,
+        input_dynamic_range=str(config["input_dynamic_range"]),
+        radiometric_mode=str(config["radiometric_mode"]),
+        alignment_scale=float(config.get("rectification_alignment_scale", 0.25)),
+        alignment_max_dim=int(config.get("rectification_alignment_max_dim", 640)),
+    )
+    reference_frame = frame_batch[0]
+    t_opt_align = scale_transform_to_alignment(t_opt_full, reference_frame["scale_adapters"])
+    evaluation = evaluate_transform_on_frames(t_opt_align, frame_batch, config)
+
+    legacy_pass = determine_pass_from_summary(
+        evaluation,
+        min_improved_ratio=float(config.get("rectification_min_improved_ratio", 0.6)),
+        max_severe_outliers=int(config.get("rectification_max_severe_outliers", 0)),
+    )
+
+    rgb_shape_full = reference_frame["rgb_full"].shape
+    band_shape_full = reference_frame["band_full"].shape
+    rgb_meta = reference_frame.get("rgb_meta", {})
+    band_meta = reference_frame.get("band_meta", {})
+    naive_h0 = build_naive_h0(rgb_shape_full, band_shape_full)
+    metadata_h0 = build_metadata_assisted_h0(rgb_meta, band_meta, rgb_shape_full, band_shape_full)
+    use_metadata = bool(config.get("rectification_use_metadata_h0", True))
+    h0_source = "metadata_assisted" if use_metadata and metadata_has_alignment_prior(rgb_meta, band_meta) else "naive_fallback"
+    h0 = metadata_h0 if use_metadata else naive_h0
+    stability_grid = int(config.get("rectification_stability_grid", 5))
+    accepted_weights = [max(item["quality_score"], 1e-6) for item in accepted_sorted]
+    homography_stability = homography_stability_diagnostics(
+        [item["homography"] for item in accepted_sorted],
+        accepted_weights,
+        aggregate_homography=t_full,
+        source_shape=band_shape_full,
+        grid_size=stability_grid,
+    )
+    for item, stability_item in zip(accepted_sorted, homography_stability.get("per_homography", [])):
+        item["diag"].update(
+            {
+                "aggregation_weight": float(stability_item.get("aggregation_weight", 0.0)),
+                "robust_keep": bool(stability_item.get("robust_keep", False)),
+                "param_distance_to_median": float(stability_item.get("param_distance_to_median", 0.0)),
+                "disp_vs_aggregate_grid_mean_px": float(stability_item.get("disp_vs_aggregate_grid_mean_px", 0.0)),
+                "disp_vs_aggregate_grid_median_px": float(stability_item.get("disp_vs_aggregate_grid_median_px", 0.0)),
+                "disp_vs_aggregate_grid_max_px": float(stability_item.get("disp_vs_aggregate_grid_max_px", 0.0)),
+            }
+        )
+    h0_vs_topt = homography_pair_displacement_summary(
+        h0,
+        t_opt_full,
+        source_shape=band_shape_full,
+        grid_size=stability_grid,
+    )
+    h0_vs_aggregate = homography_pair_displacement_summary(
+        h0,
+        t_full,
+        source_shape=band_shape_full,
+        grid_size=stability_grid,
+    )
+    match_summary = _summarize_match_attempts(all_diags)
+    qa_info = determine_qa_status_from_summary(
+        evaluation,
+        legacy_pass=bool(legacy_pass),
+        band_name=band_name,
+        h0_source=h0_source,
+        match_summary=match_summary,
+        homography_stability=homography_stability,
+        config=config,
+        min_improved_ratio=float(config.get("rectification_min_improved_ratio", 0.6)),
+        max_severe_outliers=int(config.get("rectification_max_severe_outliers", 0)),
+    )
+
+    stability_warn_px = float(config.get("rectification_stability_warn_mean_px", 25.0))
+    max_reject_ratio = float(config.get("rectification_stability_max_reject_ratio", 0.25))
+    median_disp = _summary_value(
+        homography_stability.get("disp_vs_aggregate_grid_mean_px", {}),
+        "median",
+        float("inf"),
+    )
+    robust_reject_ratio = float(homography_stability.get("robust_reject_ratio", 1.0))
+    accepted_enough = len(accepted_items) >= int(min_good_frames)
+    stability_ok = median_disp <= stability_warn_px and robust_reject_ratio <= max_reject_ratio
+    qa_ok = str(qa_info["qa_status"]) in {"pass", "pass_with_warning"}
+    stop_criteria = {
+        "accepted_enough": bool(accepted_enough),
+        "stability_ok": bool(stability_ok),
+        "qa_ok": bool(qa_ok),
+        "should_stop": bool(accepted_enough and stability_ok and qa_ok),
+        "median_disp_to_aggregate_mean_px": float(median_disp),
+        "median_disp_to_aggregate_mean_rel": _summary_value(
+            homography_stability.get("disp_vs_aggregate_grid_mean_rel", {}),
+            "median",
+            float("inf"),
+        ),
+        "stability_warn_mean_px": float(stability_warn_px),
+        "robust_reject_ratio": float(robust_reject_ratio),
+        "max_robust_reject_ratio": float(max_reject_ratio),
+        "qa_status": qa_info["qa_status"],
+        "qa_warning_codes": qa_info["qa_warning_codes"],
+        "qa_decision_inputs": qa_info["decision_inputs"],
+        "warning_path_reason": qa_info["warning_path_reason"],
+    }
+
+    return {
+        "accepted_sorted": accepted_sorted,
+        "t_full": np.asarray(t_full, dtype=np.float64),
+        "refine_result": refine_result,
+        "t_opt_full": t_opt_full,
+        "eval_records": eval_records,
+        "evaluation": evaluation,
+        "band_pass": bool(qa_info["qa_pass"]),
+        "legacy_pass": bool(legacy_pass),
+        "rgb_shape_full": rgb_shape_full,
+        "band_shape_full": band_shape_full,
+        "naive_h0": naive_h0,
+        "h0": h0,
+        "h0_source": h0_source,
+        "homography_stability": homography_stability,
+        "h0_vs_topt": h0_vs_topt,
+        "h0_vs_aggregate": h0_vs_aggregate,
+        "match_summary": match_summary,
+        "qa_info": qa_info,
+        "stop_criteria": stop_criteria,
+    }
 
 
 def _run_matching_for_record(matcher, record: dict, config: dict) -> dict:
@@ -259,24 +478,31 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
         total_frames=n_total,
         requested=int(config.get("minima_min_good_frames", 0)),
     )
-    candidate_schedule = build_candidate_pool_schedule(
-        total_frames=n_total,
-        base_frames=int(config.get("rectification_estimation_frames", 12)),
-        initial_ratio=float(config.get("minima_initial_candidate_ratio", 0.15)),
-        ratio_step=float(config.get("minima_candidate_ratio_step", 0.15)),
-        max_ratio=float(config.get("minima_max_candidate_ratio", 0.50)),
-        include_all=bool(config.get("minima_use_all_if_needed", True)),
-    )
+    full_if_frames_le = int(config.get("minima_full_if_frames_le", 300))
+    if full_if_frames_le > 0 and n_total <= full_if_frames_le:
+        candidate_schedule = [int(n_total)]
+        candidate_policy = "all_small_dataset"
+    else:
+        candidate_schedule = build_candidate_pool_schedule(
+            total_frames=n_total,
+            base_frames=int(config.get("rectification_estimation_frames", 12)),
+            initial_ratio=float(config.get("minima_initial_candidate_ratio", 0.15)),
+            ratio_step=float(config.get("minima_candidate_ratio_step", 0.15)),
+            max_ratio=float(config.get("minima_max_candidate_ratio", 0.50)),
+            include_all=bool(config.get("minima_use_all_if_needed", True)),
+        )
+        candidate_policy = "adaptive"
 
     attempted_names = set()
     accepted_items: List[dict] = []
     rejected_items: List[dict] = []
     all_diags: List[dict] = []
     stage_diags: List[dict] = []
+    selected_diagnostics: dict | None = None
 
     print(
         f"[rectification:{band_name}] start MINIMA estimation: total_frames={n_total}, "
-        f"min_good_frames={min_good_frames}, schedule={candidate_schedule}",
+        f"min_good_frames={min_good_frames}, policy={candidate_policy}, schedule={candidate_schedule}",
         flush=True,
     )
     for count in candidate_schedule:
@@ -290,6 +516,7 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
             "candidate_count": int(count),
             "new_records": len(new_records),
             "accepted_before": len(accepted_items),
+            "candidate_policy": candidate_policy,
         }
         print(
             f"[rectification:{band_name}] candidate_count={count}, "
@@ -304,12 +531,21 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
                 flush=True,
             )
             result = _run_matching_for_record(matcher, record, config)
-            all_diags.append(result["diag"])
+            diag = result["diag"]
+            diag.update(
+                {
+                    "candidate_stage": int(count),
+                    "candidate_stage_index": int(idx),
+                    "homography": normalize_homography_matrix(result["homography"]).tolist(),
+                    "aggregation_weight": 0.0,
+                    "robust_keep": False,
+                }
+            )
+            all_diags.append(diag)
             if result["accepted"]:
                 accepted_items.append(result)
             else:
                 rejected_items.append(result)
-            diag = result["diag"]
             print(
                 f"[rectification:{band_name}] result accepted={diag['accepted']} "
                 f"raw={diag['num_matches_raw']} conf={diag['num_matches_after_conf']} "
@@ -320,14 +556,63 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
             )
         stage_info["accepted_after"] = len(accepted_items)
         stage_info["attempted_total"] = len(attempted_names)
-        stage_diags.append(stage_info)
+        stage_info["stop_decision"] = "continue_insufficient_accepted"
         if len(accepted_items) >= min_good_frames:
-            break
+            selected_diagnostics = _build_candidate_diagnostics(
+                band_name=band_name,
+                records=records,
+                accepted_items=accepted_items,
+                all_diags=all_diags,
+                min_good_frames=min_good_frames,
+                config=config,
+            )
+            stop_criteria = selected_diagnostics["stop_criteria"]
+            stage_info["stop_criteria"] = stop_criteria
+            stage_info["qa_status"] = stop_criteria["qa_status"]
+            stage_info["qa_warning_codes"] = stop_criteria["qa_warning_codes"]
+            stage_info["delta_edge_f1"] = float(selected_diagnostics["evaluation"].get("delta_edge_f1", 0.0))
+            stage_info["delta_grad_ncc"] = float(selected_diagnostics["evaluation"].get("delta_grad_ncc", 0.0))
+            stage_info["homography_stability"] = {
+                "robust_keep_count": int(selected_diagnostics["homography_stability"].get("robust_keep_count", 0)),
+                "robust_reject_count": int(selected_diagnostics["homography_stability"].get("robust_reject_count", 0)),
+                "robust_reject_ratio": float(selected_diagnostics["homography_stability"].get("robust_reject_ratio", 1.0)),
+                "disp_vs_aggregate_grid_mean_px": selected_diagnostics["homography_stability"].get("disp_vs_aggregate_grid_mean_px", {}),
+            }
+            if bool(stop_criteria["should_stop"]):
+                stage_info["stop_decision"] = "stop_accepted_stable_qa"
+                stage_diags.append(stage_info)
+                print(
+                    f"[rectification:{band_name}] stop at candidate_count={count}: "
+                    f"qa_status={stop_criteria['qa_status']} "
+                    f"median_disp={stop_criteria['median_disp_to_aggregate_mean_px']:.3f}px "
+                    f"reject_ratio={stop_criteria['robust_reject_ratio']:.3f}",
+                    flush=True,
+                )
+                break
+            stage_info["stop_decision"] = "expand_unstable_or_qa"
+            print(
+                f"[rectification:{band_name}] expanding candidates: "
+                f"qa_status={stop_criteria['qa_status']} "
+                f"accepted_enough={stop_criteria['accepted_enough']} "
+                f"stability_ok={stop_criteria['stability_ok']} "
+                f"qa_ok={stop_criteria['qa_ok']}",
+                flush=True,
+            )
+        stage_diags.append(stage_info)
 
     if len(accepted_items) < min_good_frames:
         raise RuntimeError(
             f"[{band_name}] MINIMA matching produced insufficient high-quality frames: "
             f"accepted={len(accepted_items)} < min_good_frames={min_good_frames}, attempted={len(attempted_names)}, total={n_total}"
+        )
+    if selected_diagnostics is None:
+        selected_diagnostics = _build_candidate_diagnostics(
+            band_name=band_name,
+            records=records,
+            accepted_items=accepted_items,
+            all_diags=all_diags,
+            min_good_frames=min_good_frames,
+            config=config,
         )
     print(
         f"[rectification:{band_name}] accepted {len(accepted_items)} high-quality frames "
@@ -335,76 +620,63 @@ def _estimate_for_band(prepared_root: Path, band_name: str, config: dict, matche
         flush=True,
     )
 
-    accepted_sorted = sorted(accepted_items, key=lambda item: item["quality_score"], reverse=True)
-    t_full = robust_aggregate_homographies_weighted(
-        [item["homography"] for item in accepted_sorted],
-        [max(item["quality_score"], 1e-6) for item in accepted_sorted],
-    )
-
-    refine_result = _maybe_refine_transform(
-        t_full=t_full,
-        accepted_records=[item["record"] for item in accepted_sorted],
-        config=config,
-    )
-    t_opt_full = np.asarray(refine_result["T_opt"], dtype=np.float64)
-
-    eval_records = select_representative_frames(
-        frame_records=records,
-        max_frames=int(config.get("rectification_estimation_frames", 12)),
-        min_structure_score=config.get("rectification_min_structure_score", None),
-    )
-    if not eval_records:
-        eval_records = [item["record"] for item in accepted_sorted[: max(6, min(12, len(accepted_sorted)))]]
-
-    frame_batch = prepare_frame_batch(
-        frame_records=eval_records,
-        input_dynamic_range=str(config["input_dynamic_range"]),
-        radiometric_mode=str(config["radiometric_mode"]),
-        alignment_scale=float(config.get("rectification_alignment_scale", 0.25)),
-        alignment_max_dim=int(config.get("rectification_alignment_max_dim", 640)),
-    )
-    reference_frame = frame_batch[0]
-    t_opt_align = scale_transform_to_alignment(t_opt_full, reference_frame["scale_adapters"])
-    evaluation = evaluate_transform_on_frames(t_opt_align, frame_batch, config)
-
-    band_pass = determine_pass_from_summary(
-        evaluation,
-        min_improved_ratio=float(config.get("rectification_min_improved_ratio", 0.6)),
-        max_severe_outliers=int(config.get("rectification_max_severe_outliers", 0)),
-    )
+    accepted_sorted = selected_diagnostics["accepted_sorted"]
+    t_full = selected_diagnostics["t_full"]
+    refine_result = selected_diagnostics["refine_result"]
+    t_opt_full = selected_diagnostics["t_opt_full"]
+    eval_records = selected_diagnostics["eval_records"]
+    evaluation = selected_diagnostics["evaluation"]
+    band_pass = selected_diagnostics["band_pass"]
+    h0_source = selected_diagnostics["h0_source"]
+    h0 = selected_diagnostics["h0"]
+    naive_h0 = selected_diagnostics["naive_h0"]
+    homography_stability = selected_diagnostics["homography_stability"]
+    h0_vs_topt = selected_diagnostics["h0_vs_topt"]
+    h0_vs_aggregate = selected_diagnostics["h0_vs_aggregate"]
+    match_summary = selected_diagnostics["match_summary"]
+    qa_info = selected_diagnostics["qa_info"]
+    stop_criteria = selected_diagnostics["stop_criteria"]
     print(
         f"[rectification:{band_name}] QA pass={bool(band_pass)} "
+        f"legacy_pass={qa_info['legacy_pass']} "
+        f"qa_status={qa_info['qa_status']} "
         f"delta_edge={evaluation.get('delta_edge_f1', 0.0):.4f} "
-        f"delta_grad={evaluation.get('delta_grad_ncc', 0.0):.4f}",
+        f"delta_grad={evaluation.get('delta_grad_ncc', 0.0):.4f} "
+        f"stop_decision={stop_criteria['should_stop']}",
         flush=True,
     )
-
-    rgb_shape_full = reference_frame["rgb_full"].shape
-    band_shape_full = reference_frame["band_full"].shape
-    rgb_meta = reference_frame.get("rgb_meta", {})
-    band_meta = reference_frame.get("band_meta", {})
-    naive_h0 = build_naive_h0(rgb_shape_full, band_shape_full)
-    metadata_h0 = build_metadata_assisted_h0(rgb_meta, band_meta, rgb_shape_full, band_shape_full)
-    use_metadata = bool(config.get("rectification_use_metadata_h0", True))
-    h0_source = "metadata_assisted" if use_metadata and metadata_has_alignment_prior(rgb_meta, band_meta) else "naive_fallback"
-    h0 = metadata_h0 if use_metadata else naive_h0
 
     payload = {
         "num_candidate_frames": int(n_total),
         "num_attempted_frames": int(len(attempted_names)),
         "num_accepted_frames": int(len(accepted_items)),
+        "candidate_policy": candidate_policy,
+        "final_stop_criteria": stop_criteria,
         "selected_frame_ids": [item["record"]["frame_id"] for item in accepted_sorted],
         "selected_image_names": [item["image_name"] for item in eval_records],
+        "qa_representative_frame_ids": evaluation.get("representative_frame_ids", []),
+        "qa_representative_image_names": evaluation.get("representative_image_names", []),
         "h0_source": h0_source,
         "H0": np.asarray(h0, dtype=np.float64).tolist(),
         "naive_H0": np.asarray(naive_h0, dtype=np.float64).tolist(),
         "theta_opt": refine_result["theta_opt"],
+        "T_aggregate": np.asarray(t_full, dtype=np.float64).tolist(),
         "T_opt": t_opt_full.tolist(),
         "optimizer": refine_result["optimizer"],
         "matcher_backend": str(config.get("rectification_backend", "minima")),
         "minima_method": str(config.get("minima_method", "roma")),
         "scores": {k: v for k, v in evaluation.items() if k != "per_frame"},
         "per_frame": evaluation["per_frame"],
+        "match_summary": match_summary,
+        "homography_stability": homography_stability,
+        "H0_vs_Topt_displacement": h0_vs_topt,
+        "H0_vs_Taggregate_displacement": h0_vs_aggregate,
+        "qa_status": qa_info["qa_status"],
+        "qa_warning_codes": qa_info["qa_warning_codes"],
+        "legacy_pass": qa_info["legacy_pass"],
+        "qa_decision_inputs": qa_info["decision_inputs"],
+        "warning_path_reason": qa_info["warning_path_reason"],
+        "qa_notes": qa_info["notes"],
         "match_attempts": all_diags,
         "adaptive_schedule": stage_diags,
         "accepted_ratio": float(len(accepted_items)) / float(max(len(attempted_names), 1)),
@@ -435,6 +707,15 @@ def estimate_band_homographies(
     rectification_debug_use_legacy_ecc: bool = False,
     rectification_min_improved_ratio: float = 0.6,
     rectification_max_severe_outliers: int = 0,
+    rectification_high_modality_bands: str = "NIR",
+    rectification_warning_min_accepted_ratio: float = 0.80,
+    rectification_warning_min_delta_edge_f1: float = -0.05,
+    rectification_warning_min_grad_improved_ratio: float = 0.60,
+    rectification_warning_max_severe_outlier_ratio: float = 0.10,
+    rectification_warning_max_severe_outlier_count: int = 1,
+    rectification_stability_grid: int = 5,
+    rectification_stability_warn_mean_px: float = 25.0,
+    rectification_stability_max_reject_ratio: float = 0.25,
     rectification_backend: str = "minima",
     minima_method: str = "roma",
     minima_root: str = r"G:\2DSOTA\MINIMA",
@@ -459,6 +740,7 @@ def estimate_band_homographies(
     minima_candidate_ratio_step: float = 0.15,
     minima_max_candidate_ratio: float = 0.50,
     minima_use_all_if_needed: bool = True,
+    minima_full_if_frames_le: int = 300,
     rectification_enable_residual_refine: bool = False,
 ) -> Dict[str, object]:
     prepared_root = prepared_root.resolve()
@@ -495,6 +777,15 @@ def estimate_band_homographies(
         "rectification_debug_use_legacy_ecc": bool(rectification_debug_use_legacy_ecc),
         "rectification_min_improved_ratio": float(rectification_min_improved_ratio),
         "rectification_max_severe_outliers": int(rectification_max_severe_outliers),
+        "rectification_high_modality_bands": str(rectification_high_modality_bands),
+        "rectification_warning_min_accepted_ratio": float(rectification_warning_min_accepted_ratio),
+        "rectification_warning_min_delta_edge_f1": float(rectification_warning_min_delta_edge_f1),
+        "rectification_warning_min_grad_improved_ratio": float(rectification_warning_min_grad_improved_ratio),
+        "rectification_warning_max_severe_outlier_ratio": float(rectification_warning_max_severe_outlier_ratio),
+        "rectification_warning_max_severe_outlier_count": int(rectification_warning_max_severe_outlier_count),
+        "rectification_stability_grid": int(rectification_stability_grid),
+        "rectification_stability_warn_mean_px": float(rectification_stability_warn_mean_px),
+        "rectification_stability_max_reject_ratio": float(rectification_stability_max_reject_ratio),
         "rectification_backend": backend,
         "minima_method": str(minima_method).strip().lower(),
         "minima_root": str(Path(minima_root).resolve()),
@@ -519,12 +810,13 @@ def estimate_band_homographies(
         "minima_candidate_ratio_step": float(minima_candidate_ratio_step),
         "minima_max_candidate_ratio": float(minima_max_candidate_ratio),
         "minima_use_all_if_needed": bool(minima_use_all_if_needed),
+        "minima_full_if_frames_le": int(minima_full_if_frames_le),
         "rectification_enable_residual_refine": bool(rectification_enable_residual_refine),
     }
     band_list = _parse_bands(bands)
 
     payload = {
-        "version": 3,
+        "version": 6,
         "rectification_method": "minima_assisted_global_homography",
         "transform_mode": rectification_global_mode,
         "target_plane_root": str((prepared_root / "RGB").resolve()),
@@ -548,6 +840,17 @@ def estimate_band_homographies(
 
     for band_name in band_list:
         payload["bands"][band_name] = _estimate_for_band(prepared_root, band_name, config, matcher=matcher)
+
+    status_counts: Dict[str, int] = {}
+    for band_payload in payload["bands"].values():
+        status = str(band_payload.get("qa_status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+    for status in ("pass", "pass_with_warning", "fail"):
+        status_counts.setdefault(status, 0)
+    payload["qa_status_counts"] = status_counts
+    payload["num_pass"] = int(status_counts.get("pass", 0))
+    payload["num_pass_with_warning"] = int(status_counts.get("pass_with_warning", 0))
+    payload["num_fail"] = int(status_counts.get("fail", 0))
 
     write_rectification_diagnostics_json(payload, out_json)
     return payload
@@ -575,6 +878,15 @@ def main() -> None:
     ap.add_argument("--rectification_debug_use_legacy_ecc", type=str, default="false")
     ap.add_argument("--rectification_min_improved_ratio", type=float, default=0.6)
     ap.add_argument("--rectification_max_severe_outliers", type=int, default=0)
+    ap.add_argument("--rectification_high_modality_bands", default="NIR")
+    ap.add_argument("--rectification_warning_min_accepted_ratio", type=float, default=0.80)
+    ap.add_argument("--rectification_warning_min_delta_edge_f1", type=float, default=-0.05)
+    ap.add_argument("--rectification_warning_min_grad_improved_ratio", type=float, default=0.60)
+    ap.add_argument("--rectification_warning_max_severe_outlier_ratio", type=float, default=0.10)
+    ap.add_argument("--rectification_warning_max_severe_outlier_count", type=int, default=1)
+    ap.add_argument("--rectification_stability_grid", type=int, default=5)
+    ap.add_argument("--rectification_stability_warn_mean_px", type=float, default=25.0)
+    ap.add_argument("--rectification_stability_max_reject_ratio", type=float, default=0.25)
 
     ap.add_argument("--rectification_backend", default="minima", choices=["minima"])
     ap.add_argument("--minima_method", default="roma", choices=["roma", "xoftr"])
@@ -600,6 +912,7 @@ def main() -> None:
     ap.add_argument("--minima_candidate_ratio_step", type=float, default=0.15)
     ap.add_argument("--minima_max_candidate_ratio", type=float, default=0.50)
     ap.add_argument("--minima_use_all_if_needed", type=str, default="true")
+    ap.add_argument("--minima_full_if_frames_le", type=int, default=300)
 
     ap.add_argument("--rectification_enable_residual_refine", type=str, default="false")
     args = ap.parse_args()
@@ -625,6 +938,15 @@ def main() -> None:
         rectification_debug_use_legacy_ecc=str(args.rectification_debug_use_legacy_ecc).strip().lower() not in ("0", "false", "no", "off"),
         rectification_min_improved_ratio=args.rectification_min_improved_ratio,
         rectification_max_severe_outliers=args.rectification_max_severe_outliers,
+        rectification_high_modality_bands=args.rectification_high_modality_bands,
+        rectification_warning_min_accepted_ratio=args.rectification_warning_min_accepted_ratio,
+        rectification_warning_min_delta_edge_f1=args.rectification_warning_min_delta_edge_f1,
+        rectification_warning_min_grad_improved_ratio=args.rectification_warning_min_grad_improved_ratio,
+        rectification_warning_max_severe_outlier_ratio=args.rectification_warning_max_severe_outlier_ratio,
+        rectification_warning_max_severe_outlier_count=args.rectification_warning_max_severe_outlier_count,
+        rectification_stability_grid=args.rectification_stability_grid,
+        rectification_stability_warn_mean_px=args.rectification_stability_warn_mean_px,
+        rectification_stability_max_reject_ratio=args.rectification_stability_max_reject_ratio,
         rectification_backend=args.rectification_backend,
         minima_method=args.minima_method,
         minima_root=args.minima_root,
@@ -649,6 +971,7 @@ def main() -> None:
         minima_candidate_ratio_step=args.minima_candidate_ratio_step,
         minima_max_candidate_ratio=args.minima_max_candidate_ratio,
         minima_use_all_if_needed=str(args.minima_use_all_if_needed).strip().lower() not in ("0", "false", "no", "off"),
+        minima_full_if_frames_le=args.minima_full_if_frames_le,
         rectification_enable_residual_refine=str(args.rectification_enable_residual_refine).strip().lower() not in ("0", "false", "no", "off"),
     )
     print(
@@ -658,6 +981,9 @@ def main() -> None:
                 "bands": {
                     band_name: {
                         "pass": payload["bands"][band_name]["pass"],
+                        "legacy_pass": payload["bands"][band_name].get("legacy_pass", None),
+                        "qa_status": payload["bands"][band_name].get("qa_status", "unknown"),
+                        "qa_warning_codes": payload["bands"][band_name].get("qa_warning_codes", []),
                         "num_attempted_frames": payload["bands"][band_name]["num_attempted_frames"],
                         "num_accepted_frames": payload["bands"][band_name]["num_accepted_frames"],
                         "accepted_ratio": _safe_float(payload["bands"][band_name].get("accepted_ratio", 0.0), 0.0),
@@ -665,6 +991,7 @@ def main() -> None:
                     }
                     for band_name in payload.get("bands", {}).keys()
                 },
+                "qa_status_counts": payload.get("qa_status_counts", {}),
             },
             indent=2,
             ensure_ascii=False,

@@ -263,11 +263,12 @@ def compute_structure_score(image: np.ndarray, max_dim: int = 1024) -> float:
 def select_representative_frames(frame_records, max_frames, min_structure_score=None) -> list:
     if not frame_records:
         return []
+    needs_structure_score = min_structure_score is not None
     scored_records = []
     for index, record in enumerate(frame_records):
         item = dict(record)
-        score = item.get("structure_score", None)
-        if score is None:
+        score = item.get("structure_score", None if needs_structure_score else 0.0)
+        if needs_structure_score and score is None:
             rgb_path = item.get("rgb_path", None)
             if rgb_path is None:
                 score = 0.0
@@ -638,6 +639,8 @@ def evaluate_transform_on_frames(T, frame_batch, config, baseline_mode: str = "n
         "num_frames_improved_grad": improved_grad,
         "num_frames_improved_either": improved_either,
         "severe_outlier_count": severe_outliers,
+        "representative_frame_ids": [str(item.get("frame_id", "")) for item in per_frame],
+        "representative_image_names": [str(item.get("image_name", "")) for item in per_frame],
         "per_frame": per_frame,
     }
     return summary
@@ -659,6 +662,232 @@ def determine_pass_from_summary(summary: dict,
         and improved_ratio >= float(min_improved_ratio)
         and severe_outliers <= int(max_severe_outliers)
     )
+
+
+def _summary_stat(summary: dict, key: str, default: float) -> float:
+    value = summary.get(key, default) if isinstance(summary, dict) else default
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _parse_band_set(value, default: str = "NIR") -> set[str]:
+    if value is None:
+        value = default
+    if isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = list(value)
+    return {str(item).strip().upper() for item in items if str(item).strip()}
+
+
+def determine_qa_status_from_summary(
+    summary: dict,
+    *,
+    legacy_pass: Optional[bool] = None,
+    band_name: str = "",
+    h0_source: str = "",
+    match_summary: Optional[dict] = None,
+    homography_stability: Optional[dict] = None,
+    config: Optional[dict] = None,
+    min_improved_ratio: float = 0.6,
+    max_severe_outliers: int = 0,
+) -> dict:
+    """Baseline-aware rectification QA.
+
+    The legacy hard gate remains a strict pass path. A weak H0 baseline can only
+    be downgraded to pass_with_warning when matching quality, H stability,
+    baseline-relative QA outliers, and gradient improvement are all acceptable
+    for a configured high-modality band.
+    """
+    cfg = dict(config or {})
+    match_summary = match_summary or {}
+    homography_stability = homography_stability or {}
+    if legacy_pass is None:
+        legacy_pass = determine_pass_from_summary(
+            summary,
+            min_improved_ratio=min_improved_ratio,
+            max_severe_outliers=max_severe_outliers,
+        )
+
+    h0_source_norm = str(h0_source or "").strip().lower()
+    baseline_is_weak = h0_source_norm == "naive_fallback"
+    band_upper = str(band_name or "").strip().upper()
+    high_modality_bands = _parse_band_set(cfg.get("rectification_high_modality_bands", "NIR"))
+    high_modality_gap = band_upper in high_modality_bands
+
+    delta_edge = _summary_stat(summary, "delta_edge_f1", float("nan"))
+    delta_grad = _summary_stat(summary, "delta_grad_ncc", float("nan"))
+    num_frames = int(summary.get("num_frames", 0) or 0)
+    improved_grad_ratio = float(summary.get("num_frames_improved_grad", 0) or 0) / float(max(num_frames, 1))
+    severe_outliers = int(summary.get("severe_outlier_count", 0) or 0)
+    severe_outlier_ratio = float(severe_outliers) / float(max(num_frames, 1))
+    max_severe = int(cfg.get("rectification_max_severe_outliers", max_severe_outliers))
+    min_warning_accepted_ratio = float(cfg.get("rectification_warning_min_accepted_ratio", 0.80))
+    warning_min_delta_edge = float(cfg.get("rectification_warning_min_delta_edge_f1", -0.05))
+    warning_min_grad_improved_ratio = float(cfg.get("rectification_warning_min_grad_improved_ratio", 0.60))
+    warning_max_severe_outlier_ratio = float(cfg.get("rectification_warning_max_severe_outlier_ratio", 0.10))
+    warning_max_severe_outlier_count = int(cfg.get("rectification_warning_max_severe_outlier_count", 1))
+
+    accepted_stats = match_summary.get("accepted", {}) if isinstance(match_summary, dict) else {}
+    accepted_ratio = _summary_stat(match_summary, "accepted_ratio", 0.0)
+    mean_inlier = _summary_stat(accepted_stats.get("inlier_ratio", {}), "mean", 0.0)
+    mean_reproj = _summary_stat(accepted_stats.get("reproj_error", {}), "mean", float("inf"))
+    mean_coverage = _summary_stat(accepted_stats.get("coverage", {}), "mean", 0.0)
+
+    median_disp = _summary_stat(
+        homography_stability.get("disp_vs_aggregate_grid_mean_px", {}),
+        "median",
+        float("inf"),
+    )
+    robust_reject_ratio = _summary_stat(homography_stability, "robust_reject_ratio", 1.0)
+    stability_warn_px = float(cfg.get("rectification_stability_warn_mean_px", 25.0))
+    max_reject_ratio = float(cfg.get("rectification_stability_max_reject_ratio", 0.25))
+
+    min_inlier = float(cfg.get("minima_min_inlier_ratio", 0.30))
+    max_reproj = float(cfg.get("minima_max_reproj_error", 4.0))
+    min_coverage = float(cfg.get("minima_min_coverage", 0.25))
+
+    warnings: List[str] = []
+    if baseline_is_weak:
+        warnings.append("weak_h0_baseline")
+    if high_modality_gap:
+        warnings.append("high_modality_gap")
+    if not (np.isfinite(delta_edge) and delta_edge > 0.0):
+        warnings.append("edge_not_improved_against_h0")
+    if not (np.isfinite(delta_edge) and delta_edge >= warning_min_delta_edge):
+        warnings.append("edge_below_warning_floor")
+    if not (np.isfinite(delta_grad) and delta_grad > 0.0):
+        warnings.append("grad_not_improved_against_h0")
+    if improved_grad_ratio < warning_min_grad_improved_ratio:
+        warnings.append("low_grad_improved_ratio")
+    if severe_outliers > max_severe:
+        warnings.append("baseline_relative_qa_outliers")
+    if not match_summary:
+        warnings.append("missing_match_summary")
+    if accepted_ratio < min_warning_accepted_ratio:
+        warnings.append("low_accepted_ratio")
+    if mean_inlier < min_inlier:
+        warnings.append("low_mean_inlier_ratio")
+    if mean_reproj > max_reproj:
+        warnings.append("high_mean_reproj_error")
+    if mean_coverage < min_coverage:
+        warnings.append("low_mean_coverage")
+    if not homography_stability:
+        warnings.append("missing_homography_stability")
+    if median_disp > stability_warn_px:
+        warnings.append("homography_dispersion_warning")
+    if robust_reject_ratio > max_reject_ratio:
+        warnings.append("high_robust_reject_ratio")
+
+    match_ok = (
+        bool(match_summary)
+        and accepted_ratio >= min_warning_accepted_ratio
+        and mean_inlier >= min_inlier
+        and mean_reproj <= max_reproj
+        and mean_coverage >= min_coverage
+    )
+    stability_ok = (
+        bool(homography_stability)
+        and median_disp <= stability_warn_px
+        and robust_reject_ratio <= max_reject_ratio
+    )
+    qa_outlier_ok = (
+        severe_outliers <= warning_max_severe_outlier_count
+        and severe_outlier_ratio <= warning_max_severe_outlier_ratio
+    )
+    if not qa_outlier_ok:
+        warnings.append("qa_outliers_exceed_warning_limit")
+    geometry_ok = stability_ok
+    grad_ok = np.isfinite(delta_grad) and delta_grad > 0.0
+    edge_floor_ok = np.isfinite(delta_edge) and delta_edge >= warning_min_delta_edge
+    improved_grad_ratio_ok = improved_grad_ratio >= warning_min_grad_improved_ratio
+    warning_path_ok = (
+        baseline_is_weak
+        and high_modality_gap
+        and match_ok
+        and stability_ok
+        and qa_outlier_ok
+        and grad_ok
+        and edge_floor_ok
+        and improved_grad_ratio_ok
+    )
+
+    if legacy_pass:
+        status = "pass"
+        warning_path_reason = ""
+    elif warning_path_ok:
+        status = "pass_with_warning"
+        warning_path_reason = "weak baseline + high modality gap + stable H + acceptable QA outliers + grad improvement"
+        warnings.append("legacy_hard_gate_failed")
+    else:
+        status = "fail"
+        warning_path_reason = ""
+        if baseline_is_weak and not high_modality_gap:
+            warnings.append("weak_h0_without_high_modality_policy")
+
+    return {
+        "qa_status": status,
+        "qa_pass": status in {"pass", "pass_with_warning"},
+        "qa_warning_codes": sorted(set(warnings)),
+        "legacy_pass": bool(legacy_pass),
+        "warning_path_reason": warning_path_reason,
+        "decision_inputs": {
+            "h0_source": str(h0_source or "unknown"),
+            "baseline_is_weak": bool(baseline_is_weak),
+            "high_modality_gap": bool(high_modality_gap),
+            "match_ok": bool(match_ok),
+            "geometry_ok": bool(geometry_ok),
+            "stability_ok": bool(stability_ok),
+            "qa_outlier_ok": bool(qa_outlier_ok),
+            "grad_ok": bool(grad_ok),
+            "edge_floor_ok": bool(edge_floor_ok),
+            "improved_grad_ratio_ok": bool(improved_grad_ratio_ok),
+            "warning_path_ok": bool(warning_path_ok),
+            "accepted_ratio": float(accepted_ratio),
+            "mean_inlier_ratio": float(mean_inlier),
+            "mean_reproj_error": float(mean_reproj),
+            "mean_coverage": float(mean_coverage),
+            "median_disp_to_aggregate_mean_px": float(median_disp),
+            "median_disp_to_aggregate_mean_rel": _summary_stat(
+                homography_stability.get("disp_vs_aggregate_grid_mean_rel", {}),
+                "median",
+                float("inf"),
+            ),
+            "robust_reject_ratio": float(robust_reject_ratio),
+            "severe_outlier_count": int(severe_outliers),
+            "severe_outlier_ratio": float(severe_outlier_ratio),
+            "delta_edge_f1": float(delta_edge),
+            "delta_grad_ncc": float(delta_grad),
+            "improved_grad_ratio": float(improved_grad_ratio),
+            "warning_min_delta_edge_f1": float(warning_min_delta_edge),
+            "warning_min_grad_improved_ratio": float(warning_min_grad_improved_ratio),
+            "warning_max_severe_outlier_ratio": float(warning_max_severe_outlier_ratio),
+            "warning_max_severe_outlier_count": int(warning_max_severe_outlier_count),
+            "min_warning_accepted_ratio": float(min_warning_accepted_ratio),
+            "stability_warn_mean_px": float(stability_warn_px),
+            "max_robust_reject_ratio": float(max_reject_ratio),
+        },
+        "notes": {
+            "policy": "baseline_aware_v2",
+            "pass_bool_compatibility": "pass follows qa_status; legacy_pass preserves the old edge+grad hard gate.",
+            "h0_source": str(h0_source or "unknown"),
+            "warning_path_reason": warning_path_reason,
+            "baseline_is_weak": bool(baseline_is_weak),
+            "high_modality_gap": bool(high_modality_gap),
+            "high_modality_bands": sorted(high_modality_bands),
+            "min_warning_accepted_ratio": float(min_warning_accepted_ratio),
+            "warning_min_delta_edge_f1": float(warning_min_delta_edge),
+            "warning_min_grad_improved_ratio": float(warning_min_grad_improved_ratio),
+            "warning_max_severe_outlier_ratio": float(warning_max_severe_outlier_ratio),
+            "warning_max_severe_outlier_count": int(warning_max_severe_outlier_count),
+            "stability_warn_mean_px": float(stability_warn_px),
+            "max_robust_reject_ratio": float(max_reject_ratio),
+        },
+    }
 
 
 def _to_uint8(image: np.ndarray) -> np.ndarray:
