@@ -26,6 +26,7 @@ from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
+from utils.joint_multispectral_utils import load_rgb_checkpoint_geometry_only
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -321,6 +322,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         "iterations": int(opt.iterations),
         "checkpoint": str(checkpoint) if checkpoint else "",
         "stage2_mode": str(getattr(args, "stage2_mode", "")),
+        "restore_geometry_only": bool(getattr(args, "restore_geometry_only", False)),
         "modality_kind": str(getattr(args, "modality_kind", "")),
         "target_band": str(getattr(args, "target_band", "")),
         "use_validity_mask": bool(getattr(args, "use_validity_mask", False)),
@@ -430,10 +432,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         except Exception:
             print("[WARN] SparseSupport enabled but initialization failed; disabling sparse support.")
-    gaussians.training_setup(opt)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+    if checkpoint and getattr(args, "start_checkpoint", None) and getattr(args, "restore_geometry_only", False):
+        geometry_only_gaussians, _, rgb_meta = load_rgb_checkpoint_geometry_only(
+            checkpoint,
+            dataset.sh_degree,
+            device=getattr(dataset, "data_device", "cuda"),
+            optimizer_type=opt.optimizer_type,
+        )
+        first_iter = int(rgb_meta.get("checkpoint_rgb_iter", 0))
+        gaussians.active_sh_degree = geometry_only_gaussians.active_sh_degree
+        gaussians._xyz = geometry_only_gaussians._xyz
+        gaussians._features_dc = geometry_only_gaussians._features_dc
+        gaussians._features_rest = geometry_only_gaussians._features_rest
+        gaussians._scaling = geometry_only_gaussians._scaling
+        gaussians._rotation = geometry_only_gaussians._rotation
+        gaussians._opacity = geometry_only_gaussians._opacity
+        gaussians.max_radii2D = geometry_only_gaussians.max_radii2D
+        gaussians.spatial_lr_scale = geometry_only_gaussians.spatial_lr_scale
+        gaussians.training_setup(opt)
+        print(
+            "[INFO] StartCheckpointRestore: "
+            f"mode=geometry_only optimizer_state_restored=0 checkpoint_iter={first_iter}"
+        )
+    else:
+        gaussians.training_setup(opt)
+        if checkpoint:
+            (model_params, first_iter) = torch.load(checkpoint)
+            gaussians.restore(model_params, opt)
+            print(
+                "[INFO] StartCheckpointRestore: "
+                f"mode=full optimizer_state_restored=1 checkpoint_iter={first_iter}"
+            )
     if getattr(args, "ss_prune_before_thermal", False) and checkpoint:
         if not getattr(args, "ss_enable", False):
             print("[WARN] ss_prune_before_thermal set but ss_enable=False; skipping prune.")
@@ -899,6 +928,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--restore_geometry_only", type=_str2bool, nargs="?", const=True, default=False)
 
     # Sparse Support (disabled by default): gates densification using sparse COLMAP support / init point cloud.
     parser.add_argument("--ss_enable", type=_str2bool, nargs="?", const=True, default=False)

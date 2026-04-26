@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple
 import numpy as np
 from PIL import Image
 
+from utils.validity_mask_utils import load_validity_mask_image, load_validity_mask_or_ones, resolve_validity_mask_policy
+
 
 def _load_rgb(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
@@ -17,12 +19,7 @@ def _load_gray(path: Path) -> np.ndarray:
 
 
 def _load_mask(path: Path, target_hw: Tuple[int, int]) -> np.ndarray:
-    h, w = target_hw
-    m = Image.open(path).convert("L")
-    if m.size != (w, h):
-        m = m.resize((w, h), resample=Image.Resampling.NEAREST)
-    arr = np.asarray(m, dtype=np.float32) / 255.0
-    return arr > 0.5
+    return load_validity_mask_image(path, target_hw)
 
 
 def _camera_test_names(model_root: Path, n_test: int) -> List[str]:
@@ -131,14 +128,17 @@ def _prepare_band_data(method_root: Path, band: str, iteration: int):
         source_path = cfg.split(m2, 1)[1].split('"', 1)[0]
     if not source_path:
         raise RuntimeError(f"Cannot parse source_path from {model / 'cfg_args'}")
-    mask_dir = Path(source_path) / "validity_masks"
+    cfg_path = model / "cfg_args"
+    _, mask_dir, use_validity_mask = resolve_validity_mask_policy(cfg_path)
     return {
         "model": model,
         "renders": renders,
         "gts": gts,
         "files": files,
         "names": names,
+        "cfg_path": cfg_path,
         "mask_dir": mask_dir,
+        "use_validity_mask": use_validity_mask,
     }
 
 
@@ -179,7 +179,7 @@ def evaluate(methods: Dict[str, Path], iteration: int, bands: List[str], indices
                 nm = prep[m]["names"][i]
                 render = _load_rgb(prep[m]["renders"] / f)
                 gt = _load_rgb(prep[m]["gts"] / f)
-                mask = _load_mask(prep[m]["mask_dir"] / f"{Path(nm).stem}.png", render.shape[:2])
+                mask, _, _ = load_validity_mask_or_ones(prep[m]["cfg_path"], nm, render.shape[:2])
                 common_mask = mask if common_mask is None else (common_mask & mask)
                 cache[m] = (render, gt)
             for m in methods:
@@ -205,7 +205,7 @@ def evaluate(methods: Dict[str, Path], iteration: int, bands: List[str], indices
                 nm = pb["names"][i]
                 gt = _load_rgb(pb["gts"] / f)[..., 0]
                 pr = _load_rgb(pb["renders"] / f)[..., 0]
-                mk = _load_mask(pb["mask_dir"] / f"{Path(nm).stem}.png", gt.shape[:2])
+                mk, _, _ = load_validity_mask_or_ones(pb["cfg_path"], nm, gt.shape[:2])
                 gt_channels.append(gt)
                 pr_channels.append(pr)
                 masks.append(mk)
@@ -235,7 +235,7 @@ def evaluate(methods: Dict[str, Path], iteration: int, bands: List[str], indices
                 masks = []
                 for b in bands:
                     nm = pb[b]["names"][i]
-                    mk = _load_mask(pb[b]["mask_dir"] / f"{Path(nm).stem}.png", g.shape[:2])
+                    mk, _, _ = load_validity_mask_or_ones(pb[b]["cfg_path"], nm, g.shape[:2])
                     masks.append(mk)
                 method_joint = masks[0] & masks[1] & masks[2] & masks[3]
 

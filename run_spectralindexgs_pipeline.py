@@ -480,6 +480,7 @@ def _train_band(repo_root: Path, rectified_root: Path, out_root: Path, args, ban
         "--images", "images",
         "-m", str(model_dir),
         "--start_checkpoint", str(rgb_ckpt),
+        "--restore_geometry_only", "true" if args.restore_geometry_only else "false",
         "-r", str(args.band_res),
         "--iterations", str(args.band_iter),
         "--checkpoint_iterations", str(args.band_iter),
@@ -625,6 +626,7 @@ def main() -> None:
     ap.add_argument("--input_dynamic_range", default="uint16", choices=["uint8", "uint16", "float"])
     ap.add_argument("--band_feature_lr", type=float, default=0.001)
     ap.add_argument("--band_opacity_lr", type=float, default=None)
+    ap.add_argument("--restore_geometry_only", type=str, default="false")
     ap.add_argument("--freeze_opacity", type=str, default="true")
     ap.add_argument("--require_rectified_band_scene", type=str, default="true")
     ap.add_argument("--use_validity_mask", type=str, default="true")
@@ -669,6 +671,7 @@ def main() -> None:
     args = ap.parse_args()
 
     args.freeze_opacity = _str2bool(args.freeze_opacity)
+    args.restore_geometry_only = _str2bool(args.restore_geometry_only)
     args.require_rectified_band_scene = _str2bool(args.require_rectified_band_scene)
     args.use_validity_mask = _str2bool(args.use_validity_mask)
     args.rectification_use_metadata_h0 = _str2bool(args.rectification_use_metadata_h0)

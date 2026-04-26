@@ -15,6 +15,12 @@ import torch
 
 from utils.image_utils import psnr as torch_psnr
 from utils.loss_utils import ssim as torch_ssim
+from utils.validity_mask_utils import (
+    load_pair_keys_for_image_names,
+    load_validity_mask_image,
+    load_validity_mask_or_ones,
+    resolve_validity_mask_policy,
+)
 from lpipsPyTorch.modules.lpips import LPIPS
 
 try:
@@ -61,16 +67,6 @@ def _find_ours_dir(model_path: Path, split: str, iteration: int) -> Tuple[int, P
     return cands[-1]
 
 
-def _parse_source_path_from_cfg(cfg_path: Path) -> Path:
-    txt = cfg_path.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r"source_path='([^']+)'", txt)
-    if not m:
-        m = re.search(r'source_path="([^"]+)"', txt)
-    if not m:
-        raise ValueError(f"Cannot parse source_path from {cfg_path}")
-    return Path(m.group(1)).resolve()
-
-
 def _load_camera_img_names(model_path: Path, n_views: int) -> List[str]:
     pj = model_path / "cameras.json"
     if not pj.exists():
@@ -89,12 +85,7 @@ def _load_rgb01(path: Path) -> np.ndarray:
 
 
 def _load_mask(mask_path: Path, target_hw: Tuple[int, int]) -> np.ndarray:
-    h, w = target_hw
-    m = Image.open(mask_path).convert("L")
-    if m.size != (w, h):
-        m = m.resize((w, h), resample=Image.Resampling.NEAREST)
-    arr = np.asarray(m, dtype=np.float32) / 255.0
-    return (arr > 0.5).astype(np.bool_)
+    return load_validity_mask_image(mask_path, target_hw).astype(np.bool_)
 
 
 def _mean_median(xs: List[float]) -> Dict[str, float]:
@@ -194,7 +185,10 @@ class BandModelArtifacts:
     renders_dir: Path
     gt_dir: Path
     image_names: List[str]
+    pair_keys: List[str]
+    cfg_path: Path
     mask_dir: Path
+    use_validity_mask: bool
     files: List[str]
 
 
@@ -210,11 +204,11 @@ def _prepare_band_artifacts(run_root: Path, band: str, iteration: int) -> BandMo
     files = sorted([f for f in os.listdir(renders_dir) if f.lower().endswith(".png")])
     if files != sorted([f for f in os.listdir(gt_dir) if f.lower().endswith(".png")]):
         raise RuntimeError(f"render/gt file mismatch in {ours}")
-    image_names = _load_camera_img_names(model_path, len(files))
     cfg = model_path / "cfg_args"
-    src = _parse_source_path_from_cfg(cfg)
-    mask_dir = src / "validity_masks"
-    if not mask_dir.exists():
+    image_names = _load_camera_img_names(model_path, len(files))
+    pair_keys = load_pair_keys_for_image_names(cfg, image_names)
+    _, mask_dir, use_validity_mask = resolve_validity_mask_policy(cfg)
+    if use_validity_mask and not mask_dir.exists():
         raise FileNotFoundError(f"Missing validity_masks: {mask_dir}")
     return BandModelArtifacts(
         model_path=model_path,
@@ -222,12 +216,15 @@ def _prepare_band_artifacts(run_root: Path, band: str, iteration: int) -> BandMo
         renders_dir=renders_dir,
         gt_dir=gt_dir,
         image_names=image_names,
+        pair_keys=pair_keys,
+        cfg_path=cfg,
         mask_dir=mask_dir,
+        use_validity_mask=use_validity_mask,
         files=files,
     )
 
 
-def _prepare_index_proxy_artifacts(run_root: Path, index_name: str, iteration: int) -> Tuple[Path, Path, List[str]]:
+def _prepare_index_proxy_artifacts(run_root: Path, index_name: str, iteration: int) -> Tuple[Path, Path, List[str], List[str]]:
     model_path = run_root / "Products" / f"{index_name.lower()}_gray"
     if not model_path.exists():
         raise FileNotFoundError(f"Missing product model: {model_path}")
@@ -237,7 +234,8 @@ def _prepare_index_proxy_artifacts(run_root: Path, index_name: str, iteration: i
         raise FileNotFoundError(f"Missing proxy renders: {renders_dir}; run render.py on product model first")
     files = sorted([f for f in os.listdir(renders_dir) if f.lower().endswith(".png")])
     image_names = _load_camera_img_names(model_path, len(files))
-    return renders_dir, model_path, image_names
+    pair_keys = load_pair_keys_for_image_names(model_path / "cfg_args", image_names)
+    return renders_dir, model_path, image_names, pair_keys
 
 
 def evaluate_common_mask(
@@ -260,14 +258,14 @@ def evaluate_common_mask(
     ref_method = method_names[0]
     ref_band = bands[0]
     ref_files = band_models[ref_method][ref_band].files
-    ref_img_names = band_models[ref_method][ref_band].image_names
+    ref_pair_keys = band_models[ref_method][ref_band].pair_keys
     for m in method_names:
         for b in bands:
             art = band_models[m][b]
             if art.files != ref_files:
                 raise RuntimeError(f"File list mismatch for method={m}, band={b}")
-            if art.image_names != ref_img_names:
-                raise RuntimeError(f"image_name sequence mismatch for method={m}, band={b}")
+            if art.pair_keys != ref_pair_keys:
+                raise RuntimeError(f"pair_key sequence mismatch for method={m}, band={b}")
 
     lpips_model = LPIPS(net_type="vgg", version="0.1").to(device).eval()
 
@@ -309,12 +307,8 @@ def evaluate_common_mask(
             for m in method_names:
                 art = band_models[m][b]
                 img_name = art.image_names[i]
-                mask_path = art.mask_dir / f"{Path(img_name).stem}.png"
-                if not mask_path.exists():
-                    raise FileNotFoundError(f"Missing mask for method={m}, band={b}, image={img_name}: {mask_path}")
-                # target shape from render
                 render = _load_rgb01(art.renders_dir / fn)
-                mask = _load_mask(mask_path, render.shape[:2])
+                mask, _, _ = load_validity_mask_or_ones(art.cfg_path, img_name, render.shape[:2])
                 masks[m] = mask
                 per_method_cov[m].append(float(mask.mean()))
 
@@ -357,9 +351,8 @@ def evaluate_common_mask(
             for b in bands:
                 art = band_models[m][b]
                 img_name = art.image_names[i]
-                mask_path = art.mask_dir / f"{Path(img_name).stem}.png"
                 render = _load_rgb01(art.renders_dir / fn)
-                mask = _load_mask(mask_path, render.shape[:2])
+                mask, _, _ = load_validity_mask_or_ones(art.cfg_path, img_name, render.shape[:2])
                 mj = mask if mj is None else np.logical_and(mj, mask)
             method_joint_masks[m] = mj
             per_method_joint_cov[m].append(float(mj.mean()))
@@ -424,12 +417,12 @@ def evaluate_common_mask(
 
         # sanity check proxy files and names match reference
         for m in method_names:
-            pdir, _, pnames = proxy_artifacts[m]
+            pdir, _, pnames, ppairs = proxy_artifacts[m]
             pfiles = sorted([f for f in os.listdir(pdir) if f.lower().endswith(".png")])
             if pfiles != ref_files:
                 raise RuntimeError(f"Proxy file list mismatch for method={m}, index={idx_key}")
-            if pnames != ref_img_names:
-                raise RuntimeError(f"Proxy image_name mismatch for method={m}, index={idx_key}")
+            if ppairs != ref_pair_keys:
+                raise RuntimeError(f"Proxy pair_key mismatch for method={m}, index={idx_key}")
 
         per_method_rmse_idx: Dict[str, List[float]] = {m: [] for m in method_names}
         per_method_spr_idx: Dict[str, List[float]] = {m: [] for m in method_names}
@@ -460,9 +453,8 @@ def evaluate_common_mask(
                 for b in req_bands:
                     art = band_models[m][b]
                     img_name = art.image_names[i]
-                    mask_path = art.mask_dir / f"{Path(img_name).stem}.png"
                     render_shape = _load_rgb01(art.renders_dir / fn).shape[:2]
-                    msk = _load_mask(mask_path, render_shape)
+                    msk, _, _ = load_validity_mask_or_ones(art.cfg_path, img_name, render_shape)
                     mm = msk if mm is None else np.logical_and(mm, msk)
                 method_masks[m] = mm
                 per_method_cov_idx[m].append(float(mm.mean()))
