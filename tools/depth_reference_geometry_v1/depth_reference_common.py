@@ -331,6 +331,68 @@ def render_support_count_for_view(
     return np.asarray(counts, dtype=np.int32)
 
 
+@njit(cache=True)
+def _project_point_splat_depth_numba(
+    points_cam: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+    depth_tolerance_m: float,
+    splat_radius_px: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    depth = np.full((height, width), np.nan, dtype=np.float64)
+    counts = np.zeros((height, width), dtype=np.int32)
+    radius = max(0, int(splat_radius_px))
+    for idx in range(points_cam.shape[0]):
+        x = points_cam[idx, 0]
+        y = points_cam[idx, 1]
+        z = points_cam[idx, 2]
+        if z <= 1e-8:
+            continue
+        center_x = int(math.floor(fx * (x / z) + cx + 0.5))
+        center_y = int(math.floor(fy * (y / z) + cy + 0.5))
+        if center_x + radius < 0 or center_x - radius >= width or center_y + radius < 0 or center_y - radius >= height:
+            continue
+        for yy in range(center_y - radius, center_y + radius + 1):
+            if yy < 0 or yy >= height:
+                continue
+            for xx in range(center_x - radius, center_x + radius + 1):
+                if xx < 0 or xx >= width:
+                    continue
+                current = depth[yy, xx]
+                if np.isnan(current) or z < current - depth_tolerance_m:
+                    depth[yy, xx] = z
+                    counts[yy, xx] = 1
+                elif abs(z - current) <= depth_tolerance_m:
+                    counts[yy, xx] += 1
+    return depth, counts
+
+
+def render_point_splat_depth_for_view(
+    points_world: np.ndarray,
+    view: Dict[str, Any],
+    *,
+    depth_tolerance_m: float,
+    splat_radius_px: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    points_cam = transform_world_to_camera(points_world, np.asarray(view["camera_to_world"], dtype=np.float64))
+    depth, counts = _project_point_splat_depth_numba(
+        points_cam=points_cam,
+        fx=float(view["fx"]),
+        fy=float(view["fy"]),
+        cx=float(view["cx"]),
+        cy=float(view["cy"]),
+        width=int(view["width"]),
+        height=int(view["height"]),
+        depth_tolerance_m=float(depth_tolerance_m),
+        splat_radius_px=int(splat_radius_px),
+    )
+    return np.asarray(depth, dtype=np.float64), np.asarray(counts, dtype=np.int32)
+
+
 def backproject_depth_to_world(depth: np.ndarray, view: Dict[str, Any]) -> np.ndarray:
     h, w = depth.shape
     ys, xs = np.nonzero(np.isfinite(depth) & (depth > 0))

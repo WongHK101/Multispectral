@@ -33,6 +33,10 @@ Use two explicit modes:
   are allowed.
 - `scene_normalized`: thresholds are derived from a frozen scene diagonal or
   depth scale and must be reported as normalized scene units, not meters.
+- `relative_depth`: thresholds are ratios on `(D_model - D_ref) / D_ref`.
+  This is the preferred cross-scene paper table mode when metric scale is not
+  verified, because it normalizes the tolerance by the probe-view reference
+  depth instead of using a fixed scene-unit distance.
 
 ## COLMAP / GPU Policy
 
@@ -77,6 +81,10 @@ different COLMAP binary.
 - `DepthAgreementRate@delta`: higher is better, enabled with
   `--enable_agreement_metrics`.
 - `AbsDepthError_Mean`, `AbsDepthError_Median`, `SignedDepthBias_Mean`.
+
+For `evaluate_depth_reference.py --error_mode relative_depth`, the same metric
+names are reported, but `delta` is a dimensionless ratio. For example,
+`delta=0.05` means a 5% relative depth tolerance.
 
 ## Smoke Test Path
 

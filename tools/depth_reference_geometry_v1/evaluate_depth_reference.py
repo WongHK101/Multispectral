@@ -48,6 +48,15 @@ def _load_runtime_flags(out_dir: Path) -> Dict[str, Any]:
     return {}
 
 
+def _parse_thresholds(text: str) -> List[float]:
+    values = [float(x.strip()) for x in str(text).split(",") if str(x).strip()]
+    if not values:
+        raise ValueError("At least one threshold is required")
+    if any(v <= 0 for v in values):
+        raise ValueError(f"Thresholds must be positive, got {values!r}")
+    return values
+
+
 def _argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a rendered model depth bundle against a training-only reference depth bundle")
     parser.add_argument("--reference_manifest", required=True)
@@ -58,6 +67,26 @@ def _argparser() -> argparse.ArgumentParser:
         "--enable_agreement_metrics",
         action="store_true",
         help="Also compute symmetric depth-agreement statistics; default OFF for backward compatibility.",
+    )
+    parser.add_argument(
+        "--error_mode",
+        default="absolute_depth",
+        choices=("absolute_depth", "relative_depth"),
+        help=(
+            "absolute_depth compares D_model - D_ref in the manifest's distance unit. "
+            "relative_depth compares (D_model - D_ref) / D_ref and treats thresholds as ratios."
+        ),
+    )
+    parser.add_argument(
+        "--thresholds",
+        default=None,
+        help="Optional comma-separated threshold override. For relative_depth, values are ratios such as 0.01 for 1%.",
+    )
+    parser.add_argument(
+        "--relative_depth_min",
+        type=float,
+        default=1e-6,
+        help="Minimum positive reference depth required for relative_depth evaluation.",
     )
     return parser
 
@@ -77,13 +106,20 @@ def main() -> None:
     runtime_flags = _load_runtime_flags(out_dir)
     enable_agreement_metrics = bool(args.enable_agreement_metrics or runtime_flags.get("enable_agreement_metrics", False))
 
-    thresholds_m = [float(x) for x in ref_manifest["thresholds_m"]]
+    error_mode = str(args.error_mode)
+    thresholds_m = _parse_thresholds(args.thresholds) if args.thresholds else [float(x) for x in ref_manifest["thresholds_m"]]
     distance_unit = str(ref_manifest.get("distance_unit", "meters"))
     scale_mode = str(ref_manifest.get("scale_mode", "metric_verified"))
+    if error_mode == "relative_depth":
+        distance_unit = "relative_depth_ratio"
+        scale_mode = "relative_depth"
     adapter_semantics = str(adapter_manifest["depth_semantics"])
     validity_rule = adapter_manifest["validity_rule"]
     depth_min = float(validity_rule.get("depth_min", 1e-6))
     opacity_threshold = float(validity_rule.get("opacity_threshold", 0.5))
+    relative_depth_min = float(args.relative_depth_min)
+    if relative_depth_min <= 0.0:
+        raise ValueError(f"--relative_depth_min must be positive, got {relative_depth_min}")
 
     ref_by_name = {str(v["image_name"]): v for v in ref_manifest["views"]}
     model_by_name = {str(v["image_name"]): v for v in model_manifest["views"]}
@@ -106,6 +142,7 @@ def main() -> None:
     abs_errors: List[np.ndarray] = []
     signed_errors: List[np.ndarray] = []
     per_view_rows: List[List[Any]] = []
+    ignored_reference_due_to_relative_depth_min = 0
 
     for image_name in sorted(ref_by_name):
         ref_view = ref_by_name[image_name]
@@ -126,14 +163,26 @@ def main() -> None:
             raise ValueError(f"Opacity shape mismatch for {image_name}: ref {ref_depth.shape} vs opacity {model_opacity.shape}")
 
         eval_mask = ref_valid
+        if error_mode == "relative_depth":
+            ref_depth_positive = np.isfinite(ref_depth) & (ref_depth > relative_depth_min)
+            ignored_reference_due_to_relative_depth_min += int(np.count_nonzero(eval_mask & (~ref_depth_positive)))
+            eval_mask = eval_mask & ref_depth_positive
         valid_joint = eval_mask & model_valid
         total_ref_valid += int(np.count_nonzero(eval_mask))
         total_model_valid_on_ref += int(np.count_nonzero(valid_joint))
         missing_mask = eval_mask & (~model_valid)
         total_missing += int(np.count_nonzero(missing_mask))
 
+        signed_metric = np.full(ref_depth.shape, np.nan, dtype=np.float64)
+        if error_mode == "absolute_depth":
+            signed_metric[valid_joint] = model_depth[valid_joint] - ref_depth[valid_joint]
+        elif error_mode == "relative_depth":
+            signed_metric[valid_joint] = (model_depth[valid_joint] - ref_depth[valid_joint]) / ref_depth[valid_joint]
+        else:
+            raise ValueError(f"Unsupported error_mode: {error_mode!r}")
+
         if np.any(valid_joint):
-            signed = model_depth[valid_joint] - ref_depth[valid_joint]
+            signed = signed_metric[valid_joint]
             signed_errors.append(np.asarray(signed, dtype=np.float64))
             abs_errors.append(np.asarray(np.abs(signed), dtype=np.float64))
         else:
@@ -147,18 +196,18 @@ def main() -> None:
         ]
 
         for delta in thresholds_m:
-            intrusion = valid_joint & (model_depth < (ref_depth - delta))
-            too_deep = valid_joint & (model_depth > (ref_depth + delta))
+            intrusion = valid_joint & (signed_metric < -delta)
+            too_deep = valid_joint & (signed_metric > delta)
             intrusion_count = int(np.count_nonzero(intrusion))
             too_deep_count = int(np.count_nonzero(too_deep))
             if enable_agreement_metrics:
-                agreement = valid_joint & (np.abs(model_depth - ref_depth) <= delta)
+                agreement = valid_joint & (np.abs(signed_metric) <= delta)
                 agreement_count = int(np.count_nonzero(agreement))
                 agreement_counts[delta] += agreement_count
             intrusion_counts[delta] += intrusion_count
             too_deep_counts[delta] += too_deep_count
             if intrusion_count > 0:
-                intrusion_sum[delta] += float(np.sum(ref_depth[intrusion] - model_depth[intrusion]))
+                intrusion_sum[delta] += float(np.sum(-signed_metric[intrusion]))
             row.extend([intrusion_count, too_deep_count])
             if enable_agreement_metrics:
                 row.append(agreement_count)
@@ -222,14 +271,19 @@ def main() -> None:
         "depth_semantics": adapter_semantics,
         "distance_unit": distance_unit,
         "scale_mode": scale_mode,
+        "error_mode": error_mode,
+        "threshold_unit": "relative_depth_ratio" if error_mode == "relative_depth" else distance_unit,
         "validity_rule": validity_rule,
         "evaluation_options": {
             "enable_agreement_metrics": enable_agreement_metrics,
+            "relative_depth_min": relative_depth_min if error_mode == "relative_depth" else None,
+            "thresholds_source": "override" if args.thresholds else "reference_manifest",
         },
         "counts": {
             "reference_valid_pixels": int(total_ref_valid),
             "model_valid_on_reference_pixels": int(total_model_valid_on_ref),
             "missing_pixels": int(total_missing),
+            "ignored_reference_pixels_due_to_relative_depth_min": int(ignored_reference_due_to_relative_depth_min),
         },
         "secondary_metrics": {
             "ModelValidOnReferenceRate": float(total_model_valid_on_ref) / float(total_ref_valid),
@@ -241,6 +295,8 @@ def main() -> None:
         "threshold_metrics": [
             {
                 "threshold_m": float(delta),
+                "threshold": float(delta),
+                "threshold_unit": "relative_depth_ratio" if error_mode == "relative_depth" else distance_unit,
                 "FrontIntrusionRate": float(intrusion_counts[delta]) / float(total_ref_valid),
                 "FrontIntrusionMagnitude": float(intrusion_sum[delta] / intrusion_counts[delta]) if intrusion_counts[delta] > 0 else 0.0,
                 "TooDeepRate": float(too_deep_counts[delta]) / float(total_ref_valid),
