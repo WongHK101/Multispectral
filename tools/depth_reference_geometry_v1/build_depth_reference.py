@@ -20,6 +20,7 @@ from depth_reference_common import (
     parse_thresholds_m,
     relative_or_abs,
     render_mesh_depth_for_view,
+    render_point_splat_depth_for_view,
     render_support_count_for_view,
     run_colmap,
     save_json,
@@ -167,6 +168,24 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--support_depth_tolerance_m", type=float, default=0.10)
     parser.add_argument("--patch_match_max_image_size", type=int, default=2000)
     parser.add_argument(
+        "--patch_match_depth_min",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional global PatchMatchStereo.depth_min. If omitted and the strict manifest "
+            "contains patch_match_depth_range, that value is used."
+        ),
+    )
+    parser.add_argument(
+        "--patch_match_depth_max",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional global PatchMatchStereo.depth_max. If omitted and the strict manifest "
+            "contains patch_match_depth_range, that value is used."
+        ),
+    )
+    parser.add_argument(
         "--patch_match_gpu_index",
         default="0",
         help=(
@@ -184,10 +203,40 @@ def _build_argparser() -> argparse.ArgumentParser:
             "in that case the retry fails explicitly."
         ),
     )
+    parser.add_argument(
+        "--patch_match_geom_consistency",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to ask COLMAP PatchMatchStereo for geometric consistency depth maps.",
+    )
+    parser.add_argument(
+        "--stereo_fusion_input_type",
+        default="geometric",
+        choices=("geometric", "photometric"),
+        help="COLMAP stereo_fusion input_type. Official transforms without a sparse model may require photometric.",
+    )
+    parser.add_argument("--stereo_fusion_max_image_size", type=int, default=-1)
+    parser.add_argument("--stereo_fusion_min_num_pixels", type=int, default=5)
+    parser.add_argument("--stereo_fusion_max_reproj_error", type=float, default=2.0)
+    parser.add_argument("--stereo_fusion_max_depth_error", type=float, default=0.01)
+    parser.add_argument("--stereo_fusion_max_normal_error", type=float, default=10.0)
     parser.add_argument("--force_patch_match", action="store_true")
     parser.add_argument("--force_fusion", action="store_true")
     parser.add_argument("--force_mesh", action="store_true")
     parser.add_argument("--force_views", action="store_true")
+    parser.add_argument(
+        "--mesh_backend_preference",
+        default="auto",
+        choices=("auto", "delaunay", "poisson"),
+        help="Reference mesh backend preference. auto tries Delaunay then Poisson fallback.",
+    )
+    parser.add_argument(
+        "--reference_depth_backend",
+        default="mesh",
+        choices=("mesh", "point_splat"),
+        help="How to render held-out reference depths after dense fusion.",
+    )
+    parser.add_argument("--reference_point_splat_radius_px", type=int, default=1)
     return parser
 
 
@@ -299,13 +348,25 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
         "--PatchMatchStereo.max_image_size",
         str(int(args.patch_match_max_image_size)),
         "--PatchMatchStereo.geom_consistency",
-        "true",
+        "true" if bool(args.patch_match_geom_consistency) else "false",
     ]
+    depth_min = float(getattr(args, "patch_match_depth_min", 0.0) or 0.0)
+    depth_max = float(getattr(args, "patch_match_depth_max", 0.0) or 0.0)
+    if depth_min > 0.0 and depth_max > depth_min:
+        base_cmd += [
+            "--PatchMatchStereo.depth_min",
+            f"{depth_min:.17g}",
+            "--PatchMatchStereo.depth_max",
+            f"{depth_max:.17g}",
+        ]
     gpu_index = str(args.patch_match_gpu_index).strip()
     gpu_cmd = base_cmd + ["--PatchMatchStereo.gpu_index", gpu_index]
     audit: Dict[str, Any] = {
         "colmap_cmd": str(args.colmap_cmd),
         "patch_match_gpu_index": gpu_index,
+        "patch_match_depth_min": depth_min,
+        "patch_match_depth_max": depth_max,
+        "patch_match_geom_consistency": bool(args.patch_match_geom_consistency),
         "patch_match_gpu_first": True,
         "patch_match_cpu_fallback_enabled": bool(args.patch_match_allow_cpu_fallback),
         "patch_match_attempts": [],
@@ -369,6 +430,11 @@ def main() -> None:
     scene_name = str(strict["scene_name"])
     artifacts = strict["artifacts"]
     lists = strict["lists"]
+    depth_range = strict.get("patch_match_depth_range") or {}
+    if float(args.patch_match_depth_min) <= 0.0 and float(depth_range.get("depth_min", 0.0) or 0.0) > 0.0:
+        args.patch_match_depth_min = float(depth_range["depth_min"])
+    if float(args.patch_match_depth_max) <= 0.0 and float(depth_range.get("depth_max", 0.0) or 0.0) > 0.0:
+        args.patch_match_depth_max = float(depth_range["depth_max"])
     workspace_root = Path(artifacts["train_union_source_root"]).resolve()
     prepared_workspace = _prepare_flat_colmap_workspace(workspace_root, out_dir / "_colmap_workspace_flat")
     strict_thermal_root = Path(artifacts["strict_thermal_root"]).resolve()
@@ -390,6 +456,16 @@ def main() -> None:
         "patch_match_max_image_size": int(args.patch_match_max_image_size),
         "patch_match_gpu_index": str(args.patch_match_gpu_index),
         "patch_match_allow_cpu_fallback": bool(args.patch_match_allow_cpu_fallback),
+        "patch_match_geom_consistency": bool(args.patch_match_geom_consistency),
+        "stereo_fusion_input_type": str(args.stereo_fusion_input_type),
+        "stereo_fusion_max_image_size": int(args.stereo_fusion_max_image_size),
+        "stereo_fusion_min_num_pixels": int(args.stereo_fusion_min_num_pixels),
+        "stereo_fusion_max_reproj_error": float(args.stereo_fusion_max_reproj_error),
+        "stereo_fusion_max_depth_error": float(args.stereo_fusion_max_depth_error),
+        "stereo_fusion_max_normal_error": float(args.stereo_fusion_max_normal_error),
+        "mesh_backend_preference": str(args.mesh_backend_preference),
+        "reference_depth_backend": str(args.reference_depth_backend),
+        "reference_point_splat_radius_px": int(args.reference_point_splat_radius_px),
     }
 
     if args.force_patch_match or (not _has_dense_outputs(prepared_workspace)):
@@ -408,37 +484,42 @@ def main() -> None:
                 "--workspace_format",
                 "COLMAP",
                 "--input_type",
-                "geometric",
+                str(args.stereo_fusion_input_type),
                 "--output_path",
                 str(fused_ply),
+                "--StereoFusion.max_image_size",
+                str(int(args.stereo_fusion_max_image_size)),
+                "--StereoFusion.min_num_pixels",
+                str(int(args.stereo_fusion_min_num_pixels)),
+                "--StereoFusion.max_reproj_error",
+                f"{float(args.stereo_fusion_max_reproj_error):.17g}",
+                "--StereoFusion.max_depth_error",
+                f"{float(args.stereo_fusion_max_depth_error):.17g}",
+                "--StereoFusion.max_normal_error",
+                f"{float(args.stereo_fusion_max_normal_error):.17g}",
             ],
             cwd=prepared_workspace,
         )
     if (not fused_ply.exists()) or fused_ply.stat().st_size <= 0:
         raise RuntimeError(f"COLMAP stereo_fusion did not produce a valid fused point cloud at {fused_ply}")
+    fused_points = load_ply_points_xyz(fused_ply)
+    reference_runtime_audit["fused_point_count"] = int(fused_points.shape[0])
+    if fused_points.shape[0] <= 0:
+        save_json(out_dir / "reference_runtime_audit_empty_fusion.json", reference_runtime_audit)
+        raise RuntimeError(
+            f"COLMAP stereo_fusion produced an empty fused point cloud at {fused_ply}. "
+            "Try --stereo_fusion_input_type photometric and/or --no-patch_match_geom_consistency."
+        )
     _ensure_file_link_or_copy(prepared_workspace / "fused.ply", fused_ply)
     fused_vis = Path(str(fused_ply) + ".vis")
     if fused_vis.exists():
         _ensure_file_link_or_copy(prepared_workspace / "fused.ply.vis", fused_vis)
 
-    if args.force_mesh or (not delaunay_mesh.exists() and not poisson_mesh.exists()):
-        try:
-            run_colmap(
-                args.colmap_cmd,
-                [
-                    "delaunay_mesher",
-                    "--input_path",
-                    str(prepared_workspace),
-                    "--input_type",
-                    "dense",
-                    "--output_path",
-                    str(delaunay_mesh),
-                ],
-                cwd=prepared_workspace,
-            )
-            mesh_path = delaunay_mesh
-            mesh_backend = "delaunay_mesher"
-        except Exception:
+    mesh_path: Path | None = None
+    if str(args.reference_depth_backend) == "point_splat":
+        mesh_backend = "dense_fused_point_splat"
+    elif args.force_mesh or (not delaunay_mesh.exists() and not poisson_mesh.exists()):
+        if str(args.mesh_backend_preference) == "poisson":
             run_colmap(
                 args.colmap_cmd,
                 [
@@ -452,6 +533,39 @@ def main() -> None:
             )
             mesh_path = poisson_mesh
             mesh_backend = "poisson_mesher"
+        else:
+            try:
+                run_colmap(
+                    args.colmap_cmd,
+                    [
+                        "delaunay_mesher",
+                        "--input_path",
+                        str(prepared_workspace),
+                        "--input_type",
+                        "dense",
+                        "--output_path",
+                        str(delaunay_mesh),
+                    ],
+                    cwd=prepared_workspace,
+                )
+                mesh_path = delaunay_mesh
+                mesh_backend = "delaunay_mesher"
+            except Exception:
+                if str(args.mesh_backend_preference) == "delaunay":
+                    raise
+                run_colmap(
+                    args.colmap_cmd,
+                    [
+                        "poisson_mesher",
+                        "--input_path",
+                        str(fused_ply),
+                        "--output_path",
+                        str(poisson_mesh),
+                    ],
+                    cwd=workspace_root,
+                )
+                mesh_path = poisson_mesh
+                mesh_backend = "poisson_mesher"
     elif delaunay_mesh.exists():
         mesh_path = delaunay_mesh
         mesh_backend = "delaunay_mesher"
@@ -501,7 +615,11 @@ def main() -> None:
     else:
         camera_manifest = load_json(camera_manifest_path)
 
-    vertices_world, faces = load_ply_mesh(mesh_path)
+    vertices_world = faces = None
+    if str(args.reference_depth_backend) == "mesh":
+        if mesh_path is None:
+            raise FileNotFoundError("Mesh reference backend selected, but no mesh was produced")
+        vertices_world, faces = load_ply_mesh(mesh_path)
     bbox_min = np.asarray(roi["bbox_min"], dtype=np.float64)
     bbox_max = np.asarray(roi["bbox_max"], dtype=np.float64)
     thresholds_m = parse_thresholds_m(args.thresholds_m)
@@ -510,13 +628,21 @@ def main() -> None:
     views_dir.mkdir(parents=True, exist_ok=True)
     manifest_views: List[Dict[str, Any]] = []
     for view in camera_manifest["views"]:
-        depth = render_mesh_depth_for_view(vertices_world, faces, view)
-        support_count = render_support_count_for_view(
-            fused_points,
-            view,
-            depth_tolerance_m=float(args.support_depth_tolerance_m),
-            support_radius_px=int(args.support_radius_px),
-        )
+        if str(args.reference_depth_backend) == "mesh":
+            depth = render_mesh_depth_for_view(vertices_world, faces, view)
+            support_count = render_support_count_for_view(
+                fused_points,
+                view,
+                depth_tolerance_m=float(args.support_depth_tolerance_m),
+                support_radius_px=int(args.support_radius_px),
+            )
+        else:
+            depth, support_count = render_point_splat_depth_for_view(
+                fused_points,
+                view,
+                depth_tolerance_m=float(args.support_depth_tolerance_m),
+                splat_radius_px=int(args.reference_point_splat_radius_px),
+            )
         finite = np.isfinite(depth) & (depth > 0.0)
         inside_roi = compute_inside_bbox_mask(depth, view, bbox_min=bbox_min, bbox_max=bbox_max) if np.any(finite) else np.zeros_like(finite, dtype=bool)
         valid_mask = finite & inside_roi & (support_count >= int(args.support_min_count))
@@ -555,10 +681,15 @@ def main() -> None:
             "camera_manifest_path": str(camera_manifest_path),
             "reference_workspace_root": str(workspace_root),
             "reference_fused_ply": str(fused_ply),
-            "reference_mesh_path": str(mesh_path),
+            "reference_mesh_path": str(mesh_path) if mesh_path is not None else None,
             "reference_mesh_backend": mesh_backend,
+            "reference_depth_backend": str(args.reference_depth_backend),
             "roi_path": str(roi_path),
-            "depth_semantics": "metric_camera_z_reference_mesh",
+            "depth_semantics": (
+                "metric_camera_z_reference_mesh"
+                if str(args.reference_depth_backend) == "mesh"
+                else "metric_camera_z_reference_dense_fused_point_splat"
+            ),
             "distance_unit": str(args.distance_unit),
             "scale_mode": str(args.scale_mode),
             "thresholds_m": thresholds_m,
@@ -584,8 +715,9 @@ def main() -> None:
             "train_union_list": str(train_union_list),
             "probe_list": str(probe_list),
             "reference_fused_ply": str(fused_ply),
-            "reference_mesh_path": str(mesh_path),
+            "reference_mesh_path": str(mesh_path) if mesh_path is not None else None,
             "reference_mesh_backend": mesh_backend,
+            "reference_depth_backend": str(args.reference_depth_backend),
             "reference_depth_manifest": str(ref_manifest_path),
             "roi_path": str(roi_path),
             "camera_manifest_path": str(camera_manifest_path),
