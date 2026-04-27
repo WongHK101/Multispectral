@@ -79,7 +79,10 @@ def main() -> None:
     rectified_root = Path(args.rectified_root).resolve()
     out_root = Path(args.out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-    payload = load_unified_checkpoint(joint_checkpoint, device=args.device)
+    # Keep the full joint checkpoint on CPU; export_band_model moves only the
+    # requested band view to GPU. This avoids duplicating all band banks on GPU
+    # for large scenes.
+    payload = load_unified_checkpoint(joint_checkpoint, device="cpu")
 
     fragments = {}
     for band in bands:

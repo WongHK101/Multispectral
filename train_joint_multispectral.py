@@ -292,8 +292,17 @@ def main() -> None:
 
         del camera_sets
         del samplers
+        del state
+        del banks
+        del optimizers
+        del gaussians
+        del geometry_ref
         torch.cuda.empty_cache()
-        payload = load_unified_checkpoint(ckpt_path, device=args.device)
+        # Keep the authoritative multi-band checkpoint on CPU during export.
+        # Loading the full joint checkpoint onto GPU duplicates all band banks
+        # and can OOM large official scenes; export_band_model only moves the
+        # active band view to GPU.
+        payload = load_unified_checkpoint(ckpt_path, device="cpu")
         export_root = out_dir
         export_fragments = {}
         for band in bands:
@@ -309,6 +318,7 @@ def main() -> None:
                 device=args.device,
             )
             export_fragments[band] = fragment
+            torch.cuda.empty_cache()
         topology_export = compute_export_topology_audit(
             {band: export_root / f"Model_{band}" for band in bands},
             iteration=int(args.export_iteration),

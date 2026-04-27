@@ -331,15 +331,8 @@ def load_band_cameras_without_scene(
     if shuffle:
         raise ValueError("shuffle=True is intentionally unsupported for audit-friendly E4b camera loading")
     scene_root = Path(scene_root)
-    if not (scene_root / "sparse").exists():
-        raise FileNotFoundError(f"Missing sparse directory in rectified band scene: {scene_root}")
-    scene_info = sceneLoadTypeCallbacks["Colmap"](
-        str(scene_root),
-        getattr(args_like, "images", "images"),
-        getattr(args_like, "depths", ""),
-        bool(getattr(args_like, "eval", True)),
-        bool(getattr(args_like, "train_test_exp", False)),
-    )
+    loader_type = _detect_scene_loader(scene_root)
+    scene_info = _load_scene_info(scene_root, args_like, loader_type)
     train_cameras = cameraList_from_camInfos(
         scene_info.train_cameras,
         1.0,
@@ -373,8 +366,39 @@ def load_band_cameras_without_scene(
         "radiometric_mode": str(getattr(args_like, "radiometric_mode", "")),
         "use_validity_mask": bool(getattr(args_like, "use_validity_mask", False)),
         "ply_path": str(scene_info.ply_path),
+        "loader_type": loader_type,
     }
     return train_cameras, test_cameras, scene_info, audit
+
+
+def _detect_scene_loader(scene_root: Path) -> str:
+    if (scene_root / "sparse").exists():
+        return "Colmap"
+    if (scene_root / "transforms_train.json").exists() and (scene_root / "transforms_test.json").exists():
+        return "Blender"
+    raise FileNotFoundError(
+        f"Scene root is neither COLMAP nor official transforms format: {scene_root}. "
+        "Expected sparse/ or transforms_train.json plus transforms_test.json."
+    )
+
+
+def _load_scene_info(scene_root: Path, args_like: Namespace, loader_type: str):
+    if loader_type == "Colmap":
+        return sceneLoadTypeCallbacks["Colmap"](
+            str(scene_root),
+            getattr(args_like, "images", "images"),
+            getattr(args_like, "depths", ""),
+            bool(getattr(args_like, "eval", True)),
+            bool(getattr(args_like, "train_test_exp", False)),
+        )
+    if loader_type == "Blender":
+        return sceneLoadTypeCallbacks["Blender"](
+            str(scene_root),
+            bool(getattr(args_like, "white_background", False)),
+            getattr(args_like, "depths", ""),
+            bool(getattr(args_like, "eval", True)),
+        )
+    raise ValueError(f"Unsupported scene loader type: {loader_type}")
 
 
 def load_band_scene_info_without_scene(
@@ -382,17 +406,10 @@ def load_band_scene_info_without_scene(
     band: str,
     args_like: Namespace,
 ) -> Tuple[object, Dict[str, object]]:
-    """Read lightweight COLMAP scene_info without constructing GPU Camera objects."""
+    """Read lightweight scene_info without constructing GPU Camera objects."""
     scene_root = Path(scene_root)
-    if not (scene_root / "sparse").exists():
-        raise FileNotFoundError(f"Missing sparse directory in rectified band scene: {scene_root}")
-    scene_info = sceneLoadTypeCallbacks["Colmap"](
-        str(scene_root),
-        getattr(args_like, "images", "images"),
-        getattr(args_like, "depths", ""),
-        bool(getattr(args_like, "eval", True)),
-        bool(getattr(args_like, "train_test_exp", False)),
-    )
+    loader_type = _detect_scene_loader(scene_root)
+    scene_info = _load_scene_info(scene_root, args_like, loader_type)
     train_names = [str(c.image_name) for c in scene_info.train_cameras]
     test_names = [str(c.image_name) for c in scene_info.test_cameras]
     audit = {
@@ -410,6 +427,7 @@ def load_band_scene_info_without_scene(
         "radiometric_mode": str(getattr(args_like, "radiometric_mode", "")),
         "use_validity_mask": bool(getattr(args_like, "use_validity_mask", False)),
         "ply_path": str(scene_info.ply_path),
+        "loader_type": loader_type,
     }
     return scene_info, audit
 
