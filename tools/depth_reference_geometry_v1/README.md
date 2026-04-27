@@ -67,6 +67,12 @@ different COLMAP binary.
 - `DEPTH_REFERENCE_PROTOCOL.md`: protocol definition from the imported package.
 - `build_depth_reference.py`: build the training-side RGB MVS reference.
 - `export_gaussian_probe_bundle.py`: export model depth/opacity bundles.
+  For geometry evaluation, prefer
+  `--depth_backend gaussian_point_splat`, which projects Gaussian centers into
+  the probe cameras and writes metric camera-z depth. The legacy default
+  `--depth_backend renderer` preserves the rasterizer depth output for backward
+  compatibility, but that output is alpha-weighted inverse-depth-like and
+  should not be used as camera-z geometry evidence.
 - `evaluate_depth_reference.py`: compute reference-depth metrics.
 - `summarize_depth_reference_methods.py`: aggregate multiple method outputs.
 - `make_smoke_reference_from_bundle.py`: integration smoke helper only.

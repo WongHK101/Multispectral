@@ -19,6 +19,8 @@ from scene import Scene
 from utils.general_utils import safe_state
 from utils.graphics_utils import fov2focal, getWorld2View2
 
+from depth_reference_common import render_point_splat_depth_for_view
+
 
 def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +79,42 @@ def _render_depth_and_opacity(view, gaussians, pipeline, black_bg: torch.Tensor,
     return {"depth": depth, "opacity": opacity}
 
 
+def _view_to_depth_reference_dict(view) -> Dict[str, Any]:
+    return {
+        "image_name": str(view.image_name),
+        "width": int(view.image_width),
+        "height": int(view.image_height),
+        "fx": float(fov2focal(view.FoVx, view.image_width)),
+        "fy": float(fov2focal(view.FoVy, view.image_height)),
+        "cx": float(view.image_width / 2.0),
+        "cy": float(view.image_height / 2.0),
+        "camera_to_world": _camera_to_world_from_view(view),
+    }
+
+
+def _render_point_splat_depth_and_opacity(
+    view,
+    gaussians,
+    *,
+    splat_radius_px: int,
+    depth_tolerance: float,
+    min_opacity: float,
+) -> Dict[str, np.ndarray]:
+    points_world = gaussians.get_xyz.detach().float().cpu().numpy().astype(np.float64, copy=False)
+    opacity_values = gaussians.get_opacity.detach().float().cpu().numpy().reshape(-1)
+    if min_opacity > 0.0:
+        keep = np.isfinite(opacity_values) & (opacity_values >= float(min_opacity))
+        points_world = points_world[keep]
+    depth, support_count = render_point_splat_depth_for_view(
+        points_world,
+        _view_to_depth_reference_dict(view),
+        depth_tolerance_m=float(depth_tolerance),
+        splat_radius_px=int(splat_radius_px),
+    )
+    opacity = np.asarray(support_count > 0, dtype=np.float64)
+    return {"depth": depth, "opacity": opacity, "support_count": support_count}
+
+
 def _infer_scene_name(dataset) -> str:
     src = Path(dataset.source_path)
     if src.name.lower() in {"thermal_ud", "rgb_ud", "thermal", "rgb", "images"} and src.parent.name:
@@ -95,6 +133,10 @@ def export_probe_bundle(
     max_views: int | None,
     filter_image_list: Path | None,
     scene_name_override: str,
+    depth_backend: str,
+    point_splat_radius_px: int,
+    point_splat_depth_tolerance: float,
+    point_splat_min_opacity: float,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
@@ -124,20 +166,33 @@ def export_probe_bundle(
         split_dir = out_dir / "views"
         split_dir.mkdir(parents=True, exist_ok=True)
         for idx, view in enumerate(views):
-            arrays = _render_depth_and_opacity(
-                view=view,
-                gaussians=gaussians,
-                pipeline=pipeline,
-                black_bg=black_bg,
-                white_override=white_override,
-            )
+            if depth_backend == "renderer":
+                arrays = _render_depth_and_opacity(
+                    view=view,
+                    gaussians=gaussians,
+                    pipeline=pipeline,
+                    black_bg=black_bg,
+                    white_override=white_override,
+                )
+            elif depth_backend == "gaussian_point_splat":
+                arrays = _render_point_splat_depth_and_opacity(
+                    view=view,
+                    gaussians=gaussians,
+                    splat_radius_px=int(point_splat_radius_px),
+                    depth_tolerance=float(point_splat_depth_tolerance),
+                    min_opacity=float(point_splat_min_opacity),
+                )
+            else:
+                raise ValueError(f"Unsupported depth_backend: {depth_backend}")
             view_rel = Path("views") / f"{idx:05d}.npz"
             view_path = out_dir / view_rel
-            np.savez_compressed(
-                view_path,
-                depth=np.asarray(arrays["depth"], dtype=np.float64),
-                opacity=np.asarray(arrays["opacity"], dtype=np.float64),
-            )
+            payload = {
+                "depth": np.asarray(arrays["depth"], dtype=np.float64),
+                "opacity": np.asarray(arrays["opacity"], dtype=np.float64),
+            }
+            if "support_count" in arrays:
+                payload["support_count"] = np.asarray(arrays["support_count"], dtype=np.int32)
+            np.savez_compressed(view_path, **payload)
             manifest_views.append(
                 {
                     "view_id": f"{idx:05d}",
@@ -160,9 +215,18 @@ def export_probe_bundle(
         "model_path": str(Path(dataset.model_path).resolve()),
         "source_path": str(Path(dataset.source_path).resolve()),
         "iteration": int(scene.loaded_iter),
-        # The rasterizer returns inverse depth rather than metric camera-z depth.
-        "depth_semantics": "inverse_camera_z_from_renderer",
+        "depth_backend": str(depth_backend),
+        "depth_semantics": (
+            "inverse_camera_z_from_renderer"
+            if depth_backend == "renderer"
+            else "metric_camera_z_from_point_splat_centers"
+        ),
         "opacity_semantics": "black_bg_plus_white_override_color_render",
+        "point_splat_options": {
+            "splat_radius_px": int(point_splat_radius_px),
+            "depth_tolerance": float(point_splat_depth_tolerance),
+            "min_opacity": float(point_splat_min_opacity),
+        } if depth_backend == "gaussian_point_splat" else None,
         "render_resolution": {
             "resolution_arg": int(dataset.resolution),
         },
@@ -189,6 +253,19 @@ def build_argparser() -> tuple[argparse.ArgumentParser, ModelParams, PipelinePar
         help="Optional newline-delimited image_name list used to keep a deterministic subset of test cameras.",
     )
     parser.add_argument("--scene_name_override", default="")
+    parser.add_argument(
+        "--depth_backend",
+        default="renderer",
+        choices=("renderer", "gaussian_point_splat"),
+        help=(
+            "renderer preserves the legacy rasterizer depth output. "
+            "gaussian_point_splat exports metric camera-z by projecting Gaussian centers, "
+            "which is the intended geometry-evaluation adapter."
+        ),
+    )
+    parser.add_argument("--point_splat_radius_px", type=int, default=1)
+    parser.add_argument("--point_splat_depth_tolerance", type=float, default=0.10)
+    parser.add_argument("--point_splat_min_opacity", type=float, default=0.0)
     parser.add_argument("--quiet", action="store_true")
     return parser, model, pipeline
 
@@ -210,6 +287,10 @@ def main() -> None:
         max_views=args.max_views,
         filter_image_list=Path(args.filter_image_list).resolve() if str(args.filter_image_list).strip() else None,
         scene_name_override=str(args.scene_name_override),
+        depth_backend=str(args.depth_backend),
+        point_splat_radius_px=int(args.point_splat_radius_px),
+        point_splat_depth_tolerance=float(args.point_splat_depth_tolerance),
+        point_splat_min_opacity=float(args.point_splat_min_opacity),
     )
     print(f"PROBE_BUNDLE_SAVED {manifest_path}")
 

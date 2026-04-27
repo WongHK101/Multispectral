@@ -16,7 +16,10 @@ def _format_threshold(value: float) -> str:
 
 def _raw_depth_to_metric_camera_z(raw_depth: np.ndarray, depth_semantics: str) -> np.ndarray:
     raw_depth = np.asarray(raw_depth, dtype=np.float64)
-    if depth_semantics == "metric_camera_z_from_renderer":
+    if depth_semantics in {
+        "metric_camera_z_from_renderer",
+        "metric_camera_z_from_point_splat_centers",
+    }:
         return raw_depth
     if depth_semantics == "inverse_camera_z_from_renderer":
         metric = np.full(raw_depth.shape, np.nan, dtype=np.float64)
