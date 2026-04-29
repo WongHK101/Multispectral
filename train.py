@@ -457,7 +457,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     else:
         gaussians.training_setup(opt)
         if checkpoint:
-            (model_params, first_iter) = torch.load(checkpoint)
+            try:
+                (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+            except TypeError:
+                (model_params, first_iter) = torch.load(checkpoint)
             gaussians.restore(model_params, opt)
             print(
                 "[INFO] StartCheckpointRestore: "

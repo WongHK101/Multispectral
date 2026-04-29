@@ -90,9 +90,9 @@ class CameraSampler:
 
 
 def _load_rgb_features_for_bank_init(rgb_checkpoint, device):
-    import torch
+    from utils.joint_multispectral_utils import torch_load_trusted
 
-    model_params, _ = torch.load(str(rgb_checkpoint), map_location=device)
+    model_params, _ = torch_load_trusted(rgb_checkpoint, map_location=device)
     return {
         "features_dc": model_params[2].detach().clone().to(device),
         "features_rest": model_params[3].detach().clone().to(device),
@@ -142,6 +142,7 @@ def main() -> None:
         make_band_dataset_args,
         make_band_optimizers,
         project_active_bank_to_tied_scalar,
+        resolve_band_scene_root,
         save_unified_checkpoint,
         set_active_bank,
     )
@@ -196,7 +197,7 @@ def main() -> None:
     camera_audit = {}
     samplers = {}
     for band_idx, band in enumerate(bands):
-        scene_root = rectified_root / f"{band}_rectified"
+        scene_root = resolve_band_scene_root(rectified_root, band)
         args_like = make_band_dataset_args(
             scene_root=scene_root,
             band=band,
@@ -306,11 +307,12 @@ def main() -> None:
         export_root = out_dir
         export_fragments = {}
         for band in bands:
+            scene_root = resolve_band_scene_root(rectified_root, band)
             fragment = export_band_model(
                 joint_payload=payload,
                 band=band,
                 out_model_dir=export_root / f"Model_{band}",
-                scene_root=rectified_root / f"{band}_rectified",
+                scene_root=scene_root,
                 iteration=int(args.export_iteration),
                 resolution=int(args.band_res),
                 input_dynamic_range=args.input_dynamic_range,

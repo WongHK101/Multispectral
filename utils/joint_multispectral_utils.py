@@ -67,6 +67,20 @@ def _as_tensor_payload(x: torch.Tensor) -> torch.Tensor:
     return x.detach().clone().cpu()
 
 
+def torch_load_trusted(path: str | Path, map_location=None):
+    """Load a checkpoint produced by this repo across PyTorch versions.
+
+    PyTorch 2.6 changed ``torch.load`` to default to ``weights_only=True``.
+    GaussianModel checkpoints store small non-tensor metadata, so trusted local
+    checkpoints must be loaded with ``weights_only=False`` when the argument is
+    available. Older PyTorch versions do not accept the keyword.
+    """
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(str(path), map_location=map_location)
+
+
 def load_rgb_checkpoint_geometry_only(
     rgb_checkpoint: str | Path,
     sh_degree: int,
@@ -82,7 +96,7 @@ def load_rgb_checkpoint_geometry_only(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Missing RGB checkpoint: {ckpt_path}")
 
-    payload = torch.load(str(ckpt_path), map_location=device)
+    payload = torch_load_trusted(ckpt_path, map_location=device)
     if not (isinstance(payload, (tuple, list)) and len(payload) == 2):
         raise ValueError(f"Expected checkpoint payload (model_params, iteration), got {type(payload)}")
     model_params, checkpoint_iter = payload
@@ -321,6 +335,25 @@ def make_band_dataset_args(
     )
 
 
+def resolve_band_scene_root(rectified_root: str | Path, band: str) -> Path:
+    """Return the existing per-band scene root for raw or official inputs.
+
+    Raw rectified scenes use ``<band>_rectified``. Official aligned scenes use
+    ``<band>_aligned``. The first existing directory is used; if neither exists
+    the raw-style path is returned so the downstream error message remains
+    explicit.
+    """
+    root = Path(rectified_root)
+    candidates = [
+        root / f"{band}_rectified",
+        root / f"{band}_aligned",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def load_band_cameras_without_scene(
     scene_root: str | Path,
     band: str,
@@ -506,7 +539,7 @@ def load_unified_checkpoint(path: str | Path, device: str = "cuda") -> Dict[str,
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Missing joint checkpoint: {path}")
-    payload = torch.load(str(path), map_location=device)
+    payload = torch_load_trusted(path, map_location=device)
     if int(payload.get("schema_version", -1)) != 1:
         raise ValueError(f"Unsupported joint checkpoint schema_version={payload.get('schema_version')}")
     if str(payload.get("method", "")) != "E4b_geometry_locked_joint_multispectral_banks":

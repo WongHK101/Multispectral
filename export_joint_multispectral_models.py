@@ -69,6 +69,7 @@ def main() -> None:
         compute_export_topology_audit,
         export_band_model,
         load_unified_checkpoint,
+        resolve_band_scene_root,
     )
 
     bands = _parse_bands(args.bands)
@@ -86,11 +87,12 @@ def main() -> None:
 
     fragments = {}
     for band in bands:
+        scene_root = resolve_band_scene_root(rectified_root, band)
         fragments[band] = export_band_model(
             joint_payload=payload,
             band=band,
             out_model_dir=out_root / f"Model_{band}",
-            scene_root=rectified_root / f"{band}_rectified",
+            scene_root=scene_root,
             iteration=int(args.iteration),
             resolution=int(args.band_res),
             input_dynamic_range=args.input_dynamic_range,
@@ -107,10 +109,11 @@ def main() -> None:
     if bool(args.render_smoke):
         all_ok = True
         for band in bands:
+            scene_root = resolve_band_scene_root(rectified_root, band)
             ok, output_tail = _run_render_smoke(
                 args.python_executable,
                 out_root / f"Model_{band}",
-                rectified_root / f"{band}_rectified",
+                scene_root,
                 int(args.band_res),
             )
             smoke["by_band"][band] = {"passed": bool(ok), "output_tail": output_tail}
