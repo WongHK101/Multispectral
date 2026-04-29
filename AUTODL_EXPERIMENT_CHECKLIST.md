@@ -15,6 +15,40 @@ explicitly marked as historical/debug-only.
   matching. If a GPU-enabled stage fails for a method-independent engineering
   reason, retry only after logging the error and preserving the failed run root.
 
+## Blackwell Environment Notes
+
+AutoDL is not identical to the previous RTX 4090 shared server environment.
+Paper-facing reruns should record these differences explicitly.
+
+Observed AutoDL baseline on 2026-04-29:
+
+| Item | AutoDL RTX PRO 6000 Blackwell |
+|---|---|
+| GPU | NVIDIA RTX PRO 6000 Blackwell Server Edition |
+| GPU memory | 97,887 MiB |
+| Driver / `nvidia-smi` CUDA | Driver 580.82.09 / CUDA 13.0 |
+| Python env | `/root/autodl-tmp/envs/spectralindexgs_bw` |
+| Python executable | `/root/autodl-tmp/envs/spectralindexgs_bw/bin/python` |
+| Python / PyTorch | Python 3.10.20 / PyTorch 2.8.0+cu128 |
+| PyTorch CUDA runtime | 12.8 |
+| CUDA arch | `sm_120` / compute capability 12.0 |
+| CUDA extensions | `diff-gaussian-rasterization` and `simple-knn` rebuilt for `TORCH_CUDA_ARCH_LIST=12.0` |
+| `nvcc` | `/usr/local/cuda-12.8/bin/nvcc`, not on PATH by default |
+| `colmap` | Not on PATH as of the last check; raw E3/E4 needs COLMAP installed or an explicit executable path before launch |
+
+Blackwell-specific compatibility notes:
+
+- Use the explicit Python executable above; the env currently does not expose a
+  usable `bin/activate` workflow.
+- If CUDA extensions are rebuilt, export/use `TORCH_CUDA_ARCH_LIST=12.0`.
+- PyTorch 2.6+ defaults `torch.load(..., weights_only=True)`. This repo uses
+  trusted local 3DGS checkpoints with non-tensor metadata, so trusted checkpoint
+  loading must explicitly use `weights_only=False` when supported.
+- Official aligned E4b inputs use `*_aligned` directories, while raw rectified
+  inputs use `*_rectified`; both path conventions must remain supported.
+- Raw-scene experiments cannot start until COLMAP is installed/found and GPU
+  SIFT/matching has passed a smoke check.
+
 ## Scene Set
 
 ### Raw UAV Scenes
