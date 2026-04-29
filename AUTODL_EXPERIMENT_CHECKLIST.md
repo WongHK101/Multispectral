@@ -34,7 +34,7 @@ Observed AutoDL baseline on 2026-04-29:
 | CUDA arch | `sm_120` / compute capability 12.0 |
 | CUDA extensions | `diff-gaussian-rasterization` and `simple-knn` rebuilt for `TORCH_CUDA_ARCH_LIST=12.0` |
 | `nvcc` | `/usr/local/cuda-12.8/bin/nvcc`, not on PATH by default |
-| `colmap` | Not on PATH as of the last check; raw E3/E4 needs COLMAP installed or an explicit executable path before launch |
+| `colmap` | GPU build installed at `/root/autodl-tmp/opt/colmap-cuda-3.9.1/bin/colmap`; the apt `/usr/bin/colmap` is CPU-only and should not be used for paper-facing raw E3/E4 runs |
 
 Blackwell-specific compatibility notes:
 
@@ -46,8 +46,11 @@ Blackwell-specific compatibility notes:
   loading must explicitly use `weights_only=False` when supported.
 - Official aligned E4b inputs use `*_aligned` directories, while raw rectified
   inputs use `*_rectified`; both path conventions must remain supported.
-- Raw-scene experiments cannot start until COLMAP is installed/found and GPU
-  SIFT/matching has passed a smoke check.
+- Raw-scene experiments should pass
+  `--colmap_executable /root/autodl-tmp/opt/colmap-cuda-3.9.1/bin/colmap`
+  so SIFT extraction and matching use the CUDA-enabled COLMAP build by default.
+  The AutoDL GPU COLMAP smoke passed feature extraction and exhaustive matching
+  on 2026-04-29.
 
 ## Scene Set
 
