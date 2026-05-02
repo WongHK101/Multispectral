@@ -38,6 +38,22 @@ def _capture_key(path: Path, channel: str) -> str | None:
     return f"{m.group('stem')}_{m.group('frame')}"
 
 
+def _flat_channel_files(input_root: Path, channel: str) -> List[Path]:
+    files = [p for p in input_root.iterdir() if p.is_file()]
+    if channel == "D":
+        return sorted([p for p in files if RGB_FRAME_RE.match(p.name)])
+    m = re.fullmatch(r"MS_(G|R|RE|NIR)", channel, flags=re.IGNORECASE)
+    if not m:
+        return []
+    band = m.group(1).upper()
+    out = []
+    for p in files:
+        pm = MS_FRAME_RE.match(p.name)
+        if pm and pm.group("band").upper() == band:
+            out.append(p)
+    return sorted(out)
+
+
 def _link_or_copy(src: Path, dst: Path, mode: str) -> str:
     if dst.exists() or dst.is_symlink():
         dst.unlink()
@@ -158,16 +174,27 @@ def prepare_input(
     output_index: Dict[str, Dict[str, Path]] = {}
     for channel in channels:
         src_dir = input_root / channel
-        if not src_dir.is_dir():
-            raise FileNotFoundError(f"Missing channel directory: {src_dir}")
+        input_layout = "channel_directory"
+        if src_dir.is_dir():
+            files = sorted([p for p in src_dir.iterdir() if p.is_file()])
+            input_dir_for_audit = src_dir
+        else:
+            files = _flat_channel_files(input_root, channel)
+            input_dir_for_audit = input_root
+            input_layout = "flat_raw_root"
+            if not files:
+                raise FileNotFoundError(
+                    f"Missing channel directory and no flat-layout files found for "
+                    f"channel={channel}: {src_dir}"
+                )
         dst_dir = output_root / channel
         dst_dir.mkdir(parents=True, exist_ok=True)
         source_index[channel] = {}
         output_index[channel] = {}
 
-        files = sorted([p for p in src_dir.iterdir() if p.is_file()])
         ch_info = {
-            "input_dir": str(src_dir),
+            "input_dir": str(input_dir_for_audit),
+            "input_layout": input_layout,
             "output_dir": str(dst_dir),
             "num_input_files": len(files),
             "num_converted_tiff": 0,
@@ -192,11 +219,17 @@ def prepare_input(
                 ch_info["output_files"].append(dst.name)
             else:
                 dst = dst_dir / src.name
-                action = _link_or_copy(src, dst, link_mode)
+                materialize_mode = link_mode
+                if channel == "D" and gps_copy_from_band is not None:
+                    # D outputs are edited by exiftool when GPS is migrated, so they
+                    # must be independent files rather than hardlinks to raw data.
+                    materialize_mode = "copy"
+                action = _link_or_copy(src, dst, materialize_mode)
                 summary["records"].append({
                     "src": str(src),
                     "dst": str(dst),
                     "action": action,
+                    "requested_link_mode": link_mode,
                 })
                 ch_info["num_linked_or_copied"] += 1
                 total_linked += 1

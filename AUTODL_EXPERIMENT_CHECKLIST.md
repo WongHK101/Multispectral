@@ -322,15 +322,25 @@ Practical usable experiment space on a 550 GB work disk is therefore roughly
 
 ## Execution Order
 
-1. Create a batch manifest with all scene/method/run-root mappings.
-2. Run one official aligned E3/E4/MMS mini-batch to verify path conventions on
-   AutoDL.
-3. Run the raw scenes with GPU COLMAP enabled for E3 and E4.
-4. Run official aligned E3/E4/MMS.
-5. Run retained-subset self_m3m MMS/E3/E4 comparison.
-6. Run representative ablations.
-7. Run depth-reference evaluation.
-8. Run cost aggregation and quality/index/depth summary aggregation.
+The active batch plan is now defined in
+`AUTODL_BATCH_PLAN_20260430.md`. The immediate sequence is:
+
+1. Finish E3 raw7.
+2. Run E3 official aligned 7.
+3. Run E3 depth-reference evaluation for all 14 scenes.
+4. Run E4b-zero for all 14 scenes, reusing E3 prepared/rectified scenes and the
+   E3 RGB checkpoint. After each E4b-zero scene finishes, immediately run that
+   scene's E4 depth-reference evaluation using the already frozen scene-level
+   reference from the E3 depth phase.
+
+E4b-zero must not rerun raw COLMAP, MINIMA/RoMA rectification, or RGB Stage-1
+training when the corresponding E3 artifacts already exist and pass audit.
+This reuse is part of the method definition, but cost tables must keep both
+incremental E4 cost and end-to-end shared-front-end cost.
+
+MMSplat, retained-subset comparison, and representative ablations remain
+planned follow-up batches after the E3/E4 main lines and depth summaries are
+closed.
 
 Each phase should be manually launched, inspected, summarized, and cleaned by
 CODEX when instructed by the user. Do not rely on app automation or unattended

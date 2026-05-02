@@ -91,7 +91,39 @@ def _argparser() -> argparse.ArgumentParser:
         default=1e-6,
         help="Minimum positive reference depth required for relative_depth evaluation.",
     )
+    parser.add_argument(
+        "--camera_intrinsic_tolerance",
+        type=float,
+        default=1e-4,
+        help="Fail if a matched model/reference view differs by more than this in fx/fy/cx/cy.",
+    )
+    parser.add_argument(
+        "--camera_pose_tolerance",
+        type=float,
+        default=1e-5,
+        help="Fail if a matched model/reference view differs by more than this in camera_to_world.",
+    )
     return parser
+
+
+def _max_abs_camera_delta(ref_view: Dict[str, Any], model_view: Dict[str, Any]) -> Dict[str, float]:
+    intrinsic_delta = 0.0
+    for key in ("fx", "fy", "cx", "cy"):
+        intrinsic_delta = max(intrinsic_delta, abs(float(ref_view[key]) - float(model_view[key])))
+    ref_pose = np.asarray(ref_view["camera_to_world"], dtype=np.float64)
+    model_pose = np.asarray(model_view["camera_to_world"], dtype=np.float64)
+    if ref_pose.shape != model_pose.shape:
+        pose_delta = float("inf")
+    else:
+        pose_delta = float(np.max(np.abs(ref_pose - model_pose)))
+    width_delta = abs(int(ref_view["width"]) - int(model_view["width"]))
+    height_delta = abs(int(ref_view["height"]) - int(model_view["height"]))
+    return {
+        "intrinsic": intrinsic_delta,
+        "pose": pose_delta,
+        "width": float(width_delta),
+        "height": float(height_delta),
+    }
 
 
 def main() -> None:
@@ -134,6 +166,33 @@ def main() -> None:
     if extra_in_model:
         sample = ", ".join(extra_in_model[:8])
         raise ValueError(f"Model bundle has extra views not in reference: {sample}")
+
+    max_intrinsic_delta = 0.0
+    max_pose_delta = 0.0
+    for image_name in sorted(ref_by_name):
+        ref_view = ref_by_name[image_name]
+        model_view = model_by_name[image_name]
+        delta = _max_abs_camera_delta(ref_view, model_view)
+        max_intrinsic_delta = max(max_intrinsic_delta, delta["intrinsic"])
+        max_pose_delta = max(max_pose_delta, delta["pose"])
+        if int(delta["width"]) != 0 or int(delta["height"]) != 0:
+            raise ValueError(
+                f"Camera resolution mismatch for {image_name}: "
+                f"ref=({ref_view['width']},{ref_view['height']}) "
+                f"model=({model_view['width']},{model_view['height']})"
+            )
+        if delta["intrinsic"] > float(args.camera_intrinsic_tolerance):
+            raise ValueError(
+                f"Camera intrinsic mismatch for {image_name}: "
+                f"max_abs_delta={delta['intrinsic']:.12g} "
+                f"> tolerance={float(args.camera_intrinsic_tolerance):.12g}"
+            )
+        if delta["pose"] > float(args.camera_pose_tolerance):
+            raise ValueError(
+                f"Camera pose mismatch for {image_name}: "
+                f"max_abs_delta={delta['pose']:.12g} "
+                f"> tolerance={float(args.camera_pose_tolerance):.12g}"
+            )
 
     total_ref_valid = 0
     total_model_valid_on_ref = 0
@@ -281,6 +340,10 @@ def main() -> None:
             "enable_agreement_metrics": enable_agreement_metrics,
             "relative_depth_min": relative_depth_min if error_mode == "relative_depth" else None,
             "thresholds_source": "override" if args.thresholds else "reference_manifest",
+            "camera_intrinsic_tolerance": float(args.camera_intrinsic_tolerance),
+            "camera_pose_tolerance": float(args.camera_pose_tolerance),
+            "max_camera_intrinsic_abs_delta": float(max_intrinsic_delta),
+            "max_camera_pose_abs_delta": float(max_pose_delta),
         },
         "counts": {
             "reference_valid_pixels": int(total_ref_valid),

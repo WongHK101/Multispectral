@@ -6,3 +6,9 @@ WORKLOG.md
 review_artifacts/
 visual_check/
 third_party_src/
+experiment_metric_records/
+autodl_metric_records/
+autodl_metrics/
+tmp_remote_scripts/
+tmp_*.sh
+check_minima_autodl.py
