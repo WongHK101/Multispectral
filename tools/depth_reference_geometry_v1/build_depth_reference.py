@@ -134,6 +134,15 @@ def _looks_like_gpu_failure(output: str) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _append_colmap_option(cmd: List[str], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool):
+        cmd.extend([str(key), "true" if value else "false"])
+        return
+    cmd.extend([str(key), str(value)])
+
+
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build training-only reference depth artifacts for held-out geometry evaluation")
     parser.add_argument("--strict_protocol_manifest", required=True)
@@ -167,6 +176,20 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--support_radius_px", type=int, default=1)
     parser.add_argument("--support_depth_tolerance_m", type=float, default=0.10)
     parser.add_argument("--patch_match_max_image_size", type=int, default=2000)
+    parser.add_argument(
+        "--patch_match_auto_source_count",
+        type=int,
+        default=None,
+        help="Optional rewrite of COLMAP stereo/patch-match.cfg __auto__ source count before PatchMatch.",
+    )
+    parser.add_argument("--patch_match_window_radius", type=int, default=None)
+    parser.add_argument("--patch_match_num_iterations", type=int, default=None)
+    parser.add_argument("--patch_match_filter", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--patch_match_min_triangulation_angle", type=float, default=None)
+    parser.add_argument("--patch_match_filter_min_triangulation_angle", type=float, default=None)
+    parser.add_argument("--patch_match_filter_min_num_consistent", type=int, default=None)
+    parser.add_argument("--patch_match_filter_min_ncc", type=float, default=None)
+    parser.add_argument("--patch_match_filter_geom_consistency_max_cost", type=float, default=None)
     parser.add_argument(
         "--patch_match_depth_min",
         type=float,
@@ -220,6 +243,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--stereo_fusion_max_reproj_error", type=float, default=2.0)
     parser.add_argument("--stereo_fusion_max_depth_error", type=float, default=0.01)
     parser.add_argument("--stereo_fusion_max_normal_error", type=float, default=10.0)
+    parser.add_argument("--poisson_depth", type=int, default=None)
+    parser.add_argument("--poisson_trim", type=float, default=None)
+    parser.add_argument("--poisson_point_weight", type=float, default=None)
     parser.add_argument("--force_patch_match", action="store_true")
     parser.add_argument("--force_fusion", action="store_true")
     parser.add_argument("--force_mesh", action="store_true")
@@ -330,6 +356,31 @@ def _prepare_flat_colmap_workspace(source_workspace_root: Path, prepared_root: P
     return prepared_root
 
 
+def _rewrite_patch_match_auto_source_count(prepared_workspace: Path, source_count: int | None) -> bool:
+    if source_count is None:
+        return False
+    if source_count <= 0:
+        raise ValueError(f"patch_match_auto_source_count must be positive, got {source_count}")
+    cfg_path = prepared_workspace / "stereo" / "patch-match.cfg"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Cannot rewrite missing patch-match config: {cfg_path}")
+    text = cfg_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    rewritten: List[str] = []
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("__auto__,"):
+            rewritten.append(f"__auto__, {int(source_count)}")
+            changed = True
+        else:
+            rewritten.append(line)
+    if not changed:
+        raise RuntimeError(f"No __auto__ source-count line found in {cfg_path}")
+    cfg_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    return True
+
+
 def _has_dense_outputs(prepared_workspace: Path) -> bool:
     depth_maps = prepared_workspace / "stereo" / "depth_maps"
     if not depth_maps.exists():
@@ -350,6 +401,30 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
         "--PatchMatchStereo.geom_consistency",
         "true" if bool(args.patch_match_geom_consistency) else "false",
     ]
+    _append_colmap_option(base_cmd, "--PatchMatchStereo.filter", getattr(args, "patch_match_filter", None))
+    _append_colmap_option(base_cmd, "--PatchMatchStereo.window_radius", getattr(args, "patch_match_window_radius", None))
+    _append_colmap_option(base_cmd, "--PatchMatchStereo.num_iterations", getattr(args, "patch_match_num_iterations", None))
+    _append_colmap_option(
+        base_cmd,
+        "--PatchMatchStereo.min_triangulation_angle",
+        getattr(args, "patch_match_min_triangulation_angle", None),
+    )
+    _append_colmap_option(
+        base_cmd,
+        "--PatchMatchStereo.filter_min_triangulation_angle",
+        getattr(args, "patch_match_filter_min_triangulation_angle", None),
+    )
+    _append_colmap_option(
+        base_cmd,
+        "--PatchMatchStereo.filter_min_num_consistent",
+        getattr(args, "patch_match_filter_min_num_consistent", None),
+    )
+    _append_colmap_option(base_cmd, "--PatchMatchStereo.filter_min_ncc", getattr(args, "patch_match_filter_min_ncc", None))
+    _append_colmap_option(
+        base_cmd,
+        "--PatchMatchStereo.filter_geom_consistency_max_cost",
+        getattr(args, "patch_match_filter_geom_consistency_max_cost", None),
+    )
     depth_min = float(getattr(args, "patch_match_depth_min", 0.0) or 0.0)
     depth_max = float(getattr(args, "patch_match_depth_max", 0.0) or 0.0)
     if depth_min > 0.0 and depth_max > depth_min:
@@ -366,6 +441,14 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
         "patch_match_gpu_index": gpu_index,
         "patch_match_depth_min": depth_min,
         "patch_match_depth_max": depth_max,
+        "patch_match_filter": getattr(args, "patch_match_filter", None),
+        "patch_match_window_radius": getattr(args, "patch_match_window_radius", None),
+        "patch_match_num_iterations": getattr(args, "patch_match_num_iterations", None),
+        "patch_match_min_triangulation_angle": getattr(args, "patch_match_min_triangulation_angle", None),
+        "patch_match_filter_min_triangulation_angle": getattr(args, "patch_match_filter_min_triangulation_angle", None),
+        "patch_match_filter_min_num_consistent": getattr(args, "patch_match_filter_min_num_consistent", None),
+        "patch_match_filter_min_ncc": getattr(args, "patch_match_filter_min_ncc", None),
+        "patch_match_filter_geom_consistency_max_cost": getattr(args, "patch_match_filter_geom_consistency_max_cost", None),
         "patch_match_geom_consistency": bool(args.patch_match_geom_consistency),
         "patch_match_gpu_first": True,
         "patch_match_cpu_fallback_enabled": bool(args.patch_match_allow_cpu_fallback),
@@ -437,6 +520,10 @@ def main() -> None:
         args.patch_match_depth_max = float(depth_range["depth_max"])
     workspace_root = Path(artifacts["train_union_source_root"]).resolve()
     prepared_workspace = _prepare_flat_colmap_workspace(workspace_root, out_dir / "_colmap_workspace_flat")
+    patch_match_cfg_rewritten = _rewrite_patch_match_auto_source_count(
+        prepared_workspace,
+        getattr(args, "patch_match_auto_source_count", None),
+    )
     strict_thermal_root = Path(artifacts["strict_thermal_root"]).resolve()
     train_union_list = Path(lists["train_union"]).resolve()
     probe_list = Path(lists["probe_test"]).resolve()
@@ -454,6 +541,16 @@ def main() -> None:
         "colmap_cmd": str(args.colmap_cmd),
         "colmap_cmd_resolved": _resolve_executable(str(args.colmap_cmd)),
         "patch_match_max_image_size": int(args.patch_match_max_image_size),
+        "patch_match_auto_source_count": getattr(args, "patch_match_auto_source_count", None),
+        "patch_match_auto_source_count_rewritten": bool(patch_match_cfg_rewritten),
+        "patch_match_filter": getattr(args, "patch_match_filter", None),
+        "patch_match_window_radius": getattr(args, "patch_match_window_radius", None),
+        "patch_match_num_iterations": getattr(args, "patch_match_num_iterations", None),
+        "patch_match_min_triangulation_angle": getattr(args, "patch_match_min_triangulation_angle", None),
+        "patch_match_filter_min_triangulation_angle": getattr(args, "patch_match_filter_min_triangulation_angle", None),
+        "patch_match_filter_min_num_consistent": getattr(args, "patch_match_filter_min_num_consistent", None),
+        "patch_match_filter_min_ncc": getattr(args, "patch_match_filter_min_ncc", None),
+        "patch_match_filter_geom_consistency_max_cost": getattr(args, "patch_match_filter_geom_consistency_max_cost", None),
         "patch_match_gpu_index": str(args.patch_match_gpu_index),
         "patch_match_allow_cpu_fallback": bool(args.patch_match_allow_cpu_fallback),
         "patch_match_geom_consistency": bool(args.patch_match_geom_consistency),
@@ -464,6 +561,9 @@ def main() -> None:
         "stereo_fusion_max_depth_error": float(args.stereo_fusion_max_depth_error),
         "stereo_fusion_max_normal_error": float(args.stereo_fusion_max_normal_error),
         "mesh_backend_preference": str(args.mesh_backend_preference),
+        "poisson_depth": getattr(args, "poisson_depth", None),
+        "poisson_trim": getattr(args, "poisson_trim", None),
+        "poisson_point_weight": getattr(args, "poisson_point_weight", None),
         "reference_depth_backend": str(args.reference_depth_backend),
         "reference_point_splat_radius_px": int(args.reference_point_splat_radius_px),
     }
@@ -520,15 +620,19 @@ def main() -> None:
         mesh_backend = "dense_fused_point_splat"
     elif args.force_mesh or (not delaunay_mesh.exists() and not poisson_mesh.exists()):
         if str(args.mesh_backend_preference) == "poisson":
+            poisson_cmd = [
+                "poisson_mesher",
+                "--input_path",
+                str(fused_ply),
+                "--output_path",
+                str(poisson_mesh),
+            ]
+            _append_colmap_option(poisson_cmd, "--PoissonMeshing.depth", getattr(args, "poisson_depth", None))
+            _append_colmap_option(poisson_cmd, "--PoissonMeshing.trim", getattr(args, "poisson_trim", None))
+            _append_colmap_option(poisson_cmd, "--PoissonMeshing.point_weight", getattr(args, "poisson_point_weight", None))
             run_colmap(
                 args.colmap_cmd,
-                [
-                    "poisson_mesher",
-                    "--input_path",
-                    str(fused_ply),
-                    "--output_path",
-                    str(poisson_mesh),
-                ],
+                poisson_cmd,
                 cwd=workspace_root,
             )
             mesh_path = poisson_mesh
@@ -553,15 +657,19 @@ def main() -> None:
             except Exception:
                 if str(args.mesh_backend_preference) == "delaunay":
                     raise
+                poisson_cmd = [
+                    "poisson_mesher",
+                    "--input_path",
+                    str(fused_ply),
+                    "--output_path",
+                    str(poisson_mesh),
+                ]
+                _append_colmap_option(poisson_cmd, "--PoissonMeshing.depth", getattr(args, "poisson_depth", None))
+                _append_colmap_option(poisson_cmd, "--PoissonMeshing.trim", getattr(args, "poisson_trim", None))
+                _append_colmap_option(poisson_cmd, "--PoissonMeshing.point_weight", getattr(args, "poisson_point_weight", None))
                 run_colmap(
                     args.colmap_cmd,
-                    [
-                        "poisson_mesher",
-                        "--input_path",
-                        str(fused_ply),
-                        "--output_path",
-                        str(poisson_mesh),
-                    ],
+                    poisson_cmd,
                     cwd=workspace_root,
                 )
                 mesh_path = poisson_mesh
@@ -671,6 +779,31 @@ def main() -> None:
             }
         )
 
+    reference_construction_overrides = {
+        "patch_match_max_image_size": int(args.patch_match_max_image_size),
+        "patch_match_auto_source_count": getattr(args, "patch_match_auto_source_count", None),
+        "patch_match_auto_source_count_rewritten": bool(patch_match_cfg_rewritten),
+        "patch_match_filter": getattr(args, "patch_match_filter", None),
+        "patch_match_window_radius": getattr(args, "patch_match_window_radius", None),
+        "patch_match_num_iterations": getattr(args, "patch_match_num_iterations", None),
+        "patch_match_geom_consistency": bool(args.patch_match_geom_consistency),
+        "patch_match_min_triangulation_angle": getattr(args, "patch_match_min_triangulation_angle", None),
+        "patch_match_filter_min_triangulation_angle": getattr(args, "patch_match_filter_min_triangulation_angle", None),
+        "patch_match_filter_min_num_consistent": getattr(args, "patch_match_filter_min_num_consistent", None),
+        "patch_match_filter_min_ncc": getattr(args, "patch_match_filter_min_ncc", None),
+        "patch_match_filter_geom_consistency_max_cost": getattr(args, "patch_match_filter_geom_consistency_max_cost", None),
+        "stereo_fusion_input_type": str(args.stereo_fusion_input_type),
+        "stereo_fusion_max_image_size": int(args.stereo_fusion_max_image_size),
+        "stereo_fusion_min_num_pixels": int(args.stereo_fusion_min_num_pixels),
+        "stereo_fusion_max_reproj_error": float(args.stereo_fusion_max_reproj_error),
+        "stereo_fusion_max_depth_error": float(args.stereo_fusion_max_depth_error),
+        "stereo_fusion_max_normal_error": float(args.stereo_fusion_max_normal_error),
+        "mesh_backend_preference": str(args.mesh_backend_preference),
+        "poisson_depth": getattr(args, "poisson_depth", None),
+        "poisson_trim": getattr(args, "poisson_trim", None),
+        "poisson_point_weight": getattr(args, "poisson_point_weight", None),
+    }
+
     ref_manifest_path = out_dir / "reference_depth_manifest.json"
     save_json(
         ref_manifest_path,
@@ -693,6 +826,7 @@ def main() -> None:
             "distance_unit": str(args.distance_unit),
             "scale_mode": str(args.scale_mode),
             "thresholds_m": thresholds_m,
+            "reference_construction_overrides": reference_construction_overrides,
             "support_rule": {
                 "type": "training_dense_projected_support_count",
                 "min_support_count": int(args.support_min_count),
@@ -725,6 +859,7 @@ def main() -> None:
             "distance_unit": str(args.distance_unit),
             "scale_mode": str(args.scale_mode),
             "runtime_audit": reference_runtime_audit,
+            "reference_construction_overrides": reference_construction_overrides,
             "support_rule": {
                 "min_support_count": int(args.support_min_count),
                 "support_radius_px": int(args.support_radius_px),

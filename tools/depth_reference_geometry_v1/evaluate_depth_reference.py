@@ -83,7 +83,7 @@ def _argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--thresholds",
         default=None,
-        help="Optional comma-separated threshold override. For relative_depth, values are ratios such as 0.01 for 1%.",
+        help="Optional comma-separated threshold override. For relative_depth, values are ratios such as 0.01 for 1%%.",
     )
     parser.add_argument(
         "--relative_depth_min",

@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -16,10 +17,17 @@ if str(REPO_ROOT) not in sys.path:
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel, render
 from scene import Scene
+from scene.cameras import Camera
 from utils.general_utils import safe_state
-from utils.graphics_utils import fov2focal, getWorld2View2
+from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2
 
-from depth_reference_common import render_point_splat_depth_for_view
+from depth_reference_common import (
+    apply_world_transform_to_camera_to_world,
+    estimate_strict_to_native_world_transform,
+    load_json,
+    load_native_camera_entries,
+    render_point_splat_depth_for_view,
+)
 
 
 def _save_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -47,6 +55,44 @@ def _tensor_hwc_to_numpy_hw(tensor: torch.Tensor) -> np.ndarray:
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D tensor after conversion, got shape {arr.shape}")
     return np.asarray(arr, dtype=np.float64)
+
+
+def _camera_from_manifest_view(
+    *,
+    manifest_view: Dict[str, Any],
+    camera_to_world: np.ndarray,
+    image_root: Path,
+    uid: int,
+    data_device: str,
+) -> Camera:
+    image_name = str(manifest_view["image_name"])
+    image_path = image_root / image_name
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image for manifest view not found: {image_path}")
+    width = int(manifest_view["width"])
+    height = int(manifest_view["height"])
+    fx = float(manifest_view["fx"])
+    fy = float(manifest_view["fy"])
+    w2c = np.linalg.inv(np.asarray(camera_to_world, dtype=np.float64))
+    rot = w2c[:3, :3].T
+    trans = w2c[:3, 3]
+    return Camera(
+        resolution=(width, height),
+        colmap_id=int(uid),
+        R=rot,
+        T=trans,
+        FoVx=float(focal2fov(fx, width)),
+        FoVy=float(focal2fov(fy, height)),
+        depth_params=None,
+        image=Image.open(image_path),
+        invdepthmap=None,
+        image_name=image_name,
+        uid=int(uid),
+        data_device=data_device,
+        train_test_exp=False,
+        is_test_dataset=False,
+        is_test_view=True,
+    )
 
 
 def _render_depth_and_opacity(view, gaussians, pipeline, black_bg: torch.Tensor, white_override: torch.Tensor) -> Dict[str, np.ndarray]:
@@ -137,35 +183,111 @@ def export_probe_bundle(
     point_splat_radius_px: int,
     point_splat_depth_tolerance: float,
     point_splat_min_opacity: float,
+    camera_frame_mode: str,
+    probe_camera_manifest_path: Path | None,
+    native_cameras_json_path: Path | None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        views = scene.getTestCameras()
-        requested_images: List[str] | None = None
-        if filter_image_list is not None:
-            requested_images = [
-                line.strip()
-                for line in filter_image_list.read_text(encoding="utf-8-sig").splitlines()
-                if line.strip()
-            ]
-            requested_set = set(requested_images)
-            by_name = {str(view.image_name): view for view in views}
-            missing = [name for name in requested_images if name not in by_name]
-            if missing:
-                sample = ", ".join(missing[:8])
-                raise ValueError(f"Requested probe images are not in test cameras: {sample}")
-            views = [by_name[name] for name in requested_images]
-        if max_views is not None:
-            views = views[: int(max_views)]
         black_bg = torch.zeros(3, dtype=torch.float32, device="cuda")
         white_override = torch.ones((gaussians.get_xyz.shape[0], 3), dtype=torch.float32, device="cuda")
 
         manifest_views: List[Dict[str, Any]] = []
         split_dir = out_dir / "views"
         split_dir.mkdir(parents=True, exist_ok=True)
-        for idx, view in enumerate(views):
+
+        requested_images: List[str] | None = None
+        strict_to_native_alignment: Dict[str, Any] | None = None
+        render_items: List[tuple[int, Any, Dict[str, Any]]] = []
+
+        if camera_frame_mode == "scene_test":
+            views = scene.getTestCameras()
+            if filter_image_list is not None:
+                requested_images = [
+                    line.strip()
+                    for line in filter_image_list.read_text(encoding="utf-8-sig").splitlines()
+                    if line.strip()
+                ]
+                by_name = {str(view.image_name): view for view in views}
+                missing = [name for name in requested_images if name not in by_name]
+                if missing:
+                    sample = ", ".join(missing[:8])
+                    raise ValueError(f"Requested probe images are not in test cameras: {sample}")
+                views = [by_name[name] for name in requested_images]
+            if max_views is not None:
+                views = views[: int(max_views)]
+            for idx, view in enumerate(views):
+                render_items.append(
+                    (
+                        idx,
+                        view,
+                        {
+                            "view_id": f"{idx:05d}",
+                            "image_name": str(view.image_name),
+                            "width": int(view.image_width),
+                            "height": int(view.image_height),
+                            "fx": float(fov2focal(view.FoVx, view.image_width)),
+                            "fy": float(fov2focal(view.FoVy, view.image_height)),
+                            "cx": float(view.image_width / 2.0),
+                            "cy": float(view.image_height / 2.0),
+                            "camera_to_world": _camera_to_world_from_view(view),
+                        },
+                    )
+                )
+        elif camera_frame_mode == "probe_manifest_native_align":
+            if filter_image_list is not None:
+                raise ValueError("--filter_image_list is only supported with --camera_frame_mode scene_test")
+            if probe_camera_manifest_path is None:
+                raise ValueError("probe_camera_manifest_path is required when camera_frame_mode=probe_manifest_native_align")
+            if native_cameras_json_path is None:
+                raise ValueError("native_cameras_json_path is required when camera_frame_mode=probe_manifest_native_align")
+            probe_manifest = load_json(probe_camera_manifest_path)
+            probe_views = list(probe_manifest["views"])
+            if max_views is not None:
+                probe_views = probe_views[: int(max_views)]
+            native_cameras_by_stem = load_native_camera_entries(native_cameras_json_path)
+            strict_to_native_alignment = estimate_strict_to_native_world_transform(
+                strict_views=probe_manifest["views"],
+                native_cameras_by_stem=native_cameras_by_stem,
+            )
+            strict_to_native = np.asarray(strict_to_native_alignment["strict_to_native_transform"], dtype=np.float64)
+            image_root = Path(dataset.source_path) / str(dataset.images)
+            for idx, strict_view in enumerate(probe_views):
+                native_c2w = apply_world_transform_to_camera_to_world(
+                    np.asarray(strict_view["camera_to_world"], dtype=np.float64),
+                    strict_to_native,
+                )
+                render_view = _camera_from_manifest_view(
+                    manifest_view=strict_view,
+                    camera_to_world=native_c2w,
+                    image_root=image_root,
+                    uid=idx,
+                    data_device=dataset.data_device,
+                )
+                render_items.append(
+                    (
+                        idx,
+                        render_view,
+                        {
+                            "view_id": str(strict_view["view_id"]),
+                            "image_name": str(strict_view["image_name"]),
+                            "width": int(strict_view["width"]),
+                            "height": int(strict_view["height"]),
+                            "fx": float(strict_view["fx"]),
+                            "fy": float(strict_view["fy"]),
+                            "cx": float(strict_view["cx"]),
+                            "cy": float(strict_view["cy"]),
+                            "camera_to_world": strict_view["camera_to_world"],
+                            "native_camera_to_world": native_c2w.tolist(),
+                        },
+                    )
+                )
+        else:
+            raise ValueError(f"Unsupported camera_frame_mode: {camera_frame_mode!r}")
+
+        for idx, view, view_record in render_items:
             if depth_backend == "renderer":
                 arrays = _render_depth_and_opacity(
                     view=view,
@@ -193,20 +315,8 @@ def export_probe_bundle(
             if "support_count" in arrays:
                 payload["support_count"] = np.asarray(arrays["support_count"], dtype=np.int32)
             np.savez_compressed(view_path, **payload)
-            manifest_views.append(
-                {
-                    "view_id": f"{idx:05d}",
-                    "image_name": str(view.image_name),
-                    "width": int(view.image_width),
-                    "height": int(view.image_height),
-                    "fx": float(fov2focal(view.FoVx, view.image_width)),
-                    "fy": float(fov2focal(view.FoVy, view.image_height)),
-                    "cx": float(view.image_width / 2.0),
-                    "cy": float(view.image_height / 2.0),
-                    "camera_to_world": _camera_to_world_from_view(view),
-                    "npz_file": str(view_rel).replace("\\", "/"),
-                }
-            )
+            view_record["npz_file"] = str(view_rel).replace("\\", "/")
+            manifest_views.append(view_record)
 
     split_manifest = {
         "bundle_type": "gaussian_probe_split_bundle_v1",
@@ -227,6 +337,10 @@ def export_probe_bundle(
             "depth_tolerance": float(point_splat_depth_tolerance),
             "min_opacity": float(point_splat_min_opacity),
         } if depth_backend == "gaussian_point_splat" else None,
+        "camera_frame_mode": str(camera_frame_mode),
+        "probe_camera_manifest": str(probe_camera_manifest_path.resolve()) if probe_camera_manifest_path is not None else "",
+        "native_cameras_json": str(native_cameras_json_path.resolve()) if native_cameras_json_path is not None else "",
+        "strict_to_native_alignment": strict_to_native_alignment,
         "render_resolution": {
             "resolution_arg": int(dataset.resolution),
         },
@@ -266,6 +380,17 @@ def build_argparser() -> tuple[argparse.ArgumentParser, ModelParams, PipelinePar
     parser.add_argument("--point_splat_radius_px", type=int, default=1)
     parser.add_argument("--point_splat_depth_tolerance", type=float, default=0.10)
     parser.add_argument("--point_splat_min_opacity", type=float, default=0.0)
+    parser.add_argument(
+        "--camera_frame_mode",
+        default="scene_test",
+        choices=("scene_test", "probe_manifest_native_align"),
+        help=(
+            "scene_test preserves legacy behavior. probe_manifest_native_align renders strict probe "
+            "views after rigidly aligning their camera frame into the model's native cameras.json frame."
+        ),
+    )
+    parser.add_argument("--probe_camera_manifest", default="")
+    parser.add_argument("--native_cameras_json", default="")
     parser.add_argument("--quiet", action="store_true")
     return parser, model, pipeline
 
@@ -291,6 +416,13 @@ def main() -> None:
         point_splat_radius_px=int(args.point_splat_radius_px),
         point_splat_depth_tolerance=float(args.point_splat_depth_tolerance),
         point_splat_min_opacity=float(args.point_splat_min_opacity),
+        camera_frame_mode=str(args.camera_frame_mode),
+        probe_camera_manifest_path=Path(args.probe_camera_manifest).resolve()
+        if str(args.probe_camera_manifest).strip()
+        else None,
+        native_cameras_json_path=Path(args.native_cameras_json).resolve()
+        if str(args.native_cameras_json).strip()
+        else None,
     )
     print(f"PROBE_BUNDLE_SAVED {manifest_path}")
 

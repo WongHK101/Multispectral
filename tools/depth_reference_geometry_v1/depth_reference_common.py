@@ -142,6 +142,116 @@ def build_probe_view_manifest(
     }
 
 
+def image_stem_key(name: str) -> str:
+    return Path(str(name)).stem.lower()
+
+
+def load_native_camera_entries(cameras_json_path: Path) -> Dict[str, Dict[str, Any]]:
+    payload = load_json(cameras_json_path)
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected cameras.json to contain a list, got {type(payload)!r}: {cameras_json_path}")
+    entries: Dict[str, Dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        raw_name = str(item.get("img_name", ""))
+        if not raw_name:
+            continue
+        key = image_stem_key(raw_name)
+        if key not in entries:
+            entries[key] = item
+    if not entries:
+        raise ValueError(f"No camera entries with img_name found in {cameras_json_path}")
+    return entries
+
+
+def _rotation_delta_deg(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
+    rel = np.asarray(rot_a, dtype=np.float64) @ np.asarray(rot_b, dtype=np.float64).T
+    cos_angle = max(-1.0, min(1.0, (float(np.trace(rel)) - 1.0) / 2.0))
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _estimate_rigid_transform(src_points: np.ndarray, dst_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if src_points.shape != dst_points.shape or src_points.ndim != 2 or src_points.shape[1] != 3:
+        raise ValueError(f"Expected matched Nx3 point sets, got {src_points.shape} and {dst_points.shape}")
+    src_mean = np.mean(src_points, axis=0)
+    dst_mean = np.mean(dst_points, axis=0)
+    src_centered = src_points - src_mean
+    dst_centered = dst_points - dst_mean
+    cov = src_centered.T @ dst_centered
+    u, _, vt = np.linalg.svd(cov)
+    rot = vt.T @ u.T
+    if np.linalg.det(rot) < 0:
+        vt[-1, :] *= -1.0
+        rot = vt.T @ u.T
+    trans = dst_mean - rot @ src_mean
+    return rot.astype(np.float64), trans.astype(np.float64)
+
+
+def estimate_strict_to_native_world_transform(
+    strict_views: Sequence[Dict[str, Any]],
+    native_cameras_by_stem: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    strict_centers: List[np.ndarray] = []
+    native_centers: List[np.ndarray] = []
+    strict_rotations: List[np.ndarray] = []
+    native_rotations: List[np.ndarray] = []
+    common_names: List[str] = []
+
+    for view in strict_views:
+        image_name = str(view["image_name"])
+        native_entry = native_cameras_by_stem.get(image_stem_key(image_name))
+        if native_entry is None:
+            continue
+        strict_c2w = np.asarray(view["camera_to_world"], dtype=np.float64)
+        strict_centers.append(strict_c2w[:3, 3])
+        strict_rotations.append(strict_c2w[:3, :3])
+        native_centers.append(np.asarray(native_entry["position"], dtype=np.float64))
+        native_rotations.append(np.asarray(native_entry["rotation"], dtype=np.float64))
+        common_names.append(image_name)
+
+    if len(common_names) < 3:
+        raise ValueError(f"Need at least 3 common cameras to estimate rigid transform, got {len(common_names)}")
+
+    strict_centers_arr = np.asarray(strict_centers, dtype=np.float64)
+    native_centers_arr = np.asarray(native_centers, dtype=np.float64)
+    rot, trans = _estimate_rigid_transform(strict_centers_arr, native_centers_arr)
+
+    transformed_centers = (rot @ strict_centers_arr.T).T + trans[None, :]
+    center_residuals = transformed_centers - native_centers_arr
+    center_errors = np.linalg.norm(center_residuals, axis=1)
+
+    rotation_errors: List[float] = []
+    for strict_rot, native_rot in zip(strict_rotations, native_rotations):
+        predicted_rot = rot @ strict_rot
+        rotation_errors.append(_rotation_delta_deg(predicted_rot, native_rot))
+
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rot
+    transform[:3, 3] = trans
+    return {
+        "common_count": int(len(common_names)),
+        "common_image_names": list(common_names),
+        "strict_to_native_transform": transform.tolist(),
+        "translation_mean_xyz": np.mean(center_residuals, axis=0).tolist(),
+        "translation_std_xyz": np.std(center_residuals, axis=0).tolist(),
+        "translation_error_mean": float(np.mean(center_errors)),
+        "translation_error_max": float(np.max(center_errors)),
+        "rotation_error_mean_deg": float(np.mean(rotation_errors)),
+        "rotation_error_max_deg": float(np.max(rotation_errors)),
+    }
+
+
+def apply_world_transform_to_camera_to_world(camera_to_world: np.ndarray, world_transform: np.ndarray) -> np.ndarray:
+    c2w = np.asarray(camera_to_world, dtype=np.float64)
+    transform = np.asarray(world_transform, dtype=np.float64)
+    if c2w.shape != (4, 4):
+        raise ValueError(f"camera_to_world must be 4x4, got {c2w.shape}")
+    if transform.shape != (4, 4):
+        raise ValueError(f"world_transform must be 4x4, got {transform.shape}")
+    return transform @ c2w
+
+
 def load_ply_points_xyz(path: Path) -> np.ndarray:
     ply = PlyData.read(str(path))
     vertices = ply["vertex"]
