@@ -49,7 +49,13 @@ def _parse_rgb_triplet(text: str, default: Sequence[float] | None = None) -> np.
 
 def _raw_depth_to_metric_camera_z(raw_depth: np.ndarray, depth_semantics: str) -> np.ndarray:
     raw_depth = np.asarray(raw_depth, dtype=np.float64)
-    if depth_semantics == "metric_camera_z_from_renderer":
+    if depth_semantics in {
+        "metric_camera_z_from_renderer",
+        "metric_camera_z_from_point_splat_centers",
+        "metric_camera_z_reference_mesh",
+        "metric_camera_z_reference_dense_fused_point_splat",
+        "metric_camera_z_reference_sparse_point_splat",
+    }:
         return raw_depth
     if depth_semantics == "inverse_camera_z_from_renderer":
         metric = np.full(raw_depth.shape, np.nan, dtype=np.float64)
