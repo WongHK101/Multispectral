@@ -65,6 +65,19 @@ def _raw_depth_to_metric_camera_z(raw_depth: np.ndarray, depth_semantics: str) -
     raise ValueError(f"Unsupported depth semantics: {depth_semantics!r}")
 
 
+def _reference_depth_title(reference_manifest: Dict[str, Any]) -> str:
+    backend = str(reference_manifest.get("reference_depth_backend", "")).lower()
+    semantics = str(reference_manifest.get("depth_semantics", "")).lower()
+    mesh_backend = str(reference_manifest.get("reference_mesh_backend", "")).lower()
+    if "mesh" in backend or "mesh" in semantics or ("mesh" in mesh_backend and "point_splat" not in mesh_backend):
+        return "Reference\nMesh Depth"
+    if "point_splat" in backend or "point_splat" in semantics or "point_splat" in mesh_backend:
+        if "sparse" in semantics or "sparse" in mesh_backend:
+            return "Reference\nSparse Point-Splat Depth"
+        return "Reference\nPoint-Splat Depth"
+    return "Reference\nDepth"
+
+
 def _make_model_valid_mask(metric_depth: np.ndarray, opacity: np.ndarray, depth_min: float, opacity_threshold: float) -> np.ndarray:
     return (
         np.isfinite(metric_depth)
@@ -298,6 +311,7 @@ def _render_single_strip(
     depth_min_vis: float,
     depth_max_vis: float,
     cmap_name: str,
+    reference_title: str,
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(12, 4), squeeze=False)
     ax_gt, ax_depth, ax_class = axes[0]
@@ -306,7 +320,7 @@ def _render_single_strip(
     ax_gt.axis("off")
 
     ax_depth.imshow(depth_rgb)
-    ax_depth.set_title("Reference Mesh Depth")
+    ax_depth.set_title(reference_title)
     ax_depth.axis("off")
 
     ax_class.imshow(class_rgb)
@@ -344,6 +358,7 @@ def _render_contact_sheet(
     depth_min_vis: float,
     depth_max_vis: float,
     cmap_name: str,
+    reference_title: str,
 ) -> None:
     row_count = len(rows_payload)
     fig, axes = plt.subplots(row_count, 3, figsize=(12, 4 * row_count), squeeze=False)
@@ -353,7 +368,7 @@ def _render_contact_sheet(
         axes[row_idx, 0].axis("off")
 
         axes[row_idx, 1].imshow(payload["depth_rgb"])
-        axes[row_idx, 1].set_title("Reference Mesh Depth")
+        axes[row_idx, 1].set_title(reference_title)
         axes[row_idx, 1].axis("off")
 
         axes[row_idx, 2].imshow(payload["class_rgb"])
@@ -389,6 +404,7 @@ def main() -> None:
     reference_manifest = _load_json(reference_manifest_path)
     model_manifest = _load_json(model_manifest_path)
     adapter_manifest = _load_json(adapter_manifest_path)
+    reference_title = _reference_depth_title(reference_manifest)
 
     gt_root = _resolve_gt_root(reference_manifest, override_root=str(args.gt_images_root), override_images_dir=str(args.gt_images_dir_name))
     selected_views = _select_views(
@@ -426,6 +442,7 @@ def main() -> None:
             "invalid_depth_rgb": [float(x) for x in invalid_depth_rgb],
             "show_depth_colorbar": bool(args.show_depth_colorbar),
             "resize_gt_to_view": bool(args.resize_gt_to_view),
+            "reference_title": reference_title,
         },
         "selected_views": [],
     }
@@ -483,6 +500,7 @@ def main() -> None:
             depth_min_vis=depth_min_vis,
             depth_max_vis=depth_max_vis,
             cmap_name=str(args.depth_cmap),
+            reference_title=reference_title,
         )
 
         rows_payload.append(
@@ -530,6 +548,7 @@ def main() -> None:
         depth_min_vis=depth_min_vis,
         depth_max_vis=depth_max_vis,
         cmap_name=str(args.depth_cmap),
+        reference_title=reference_title,
     )
 
     _write_csv(

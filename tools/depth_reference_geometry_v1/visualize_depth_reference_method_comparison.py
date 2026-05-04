@@ -20,6 +20,7 @@ from visualize_depth_reference_views import (
     _make_model_valid_mask,
     _parse_rgb_triplet,
     _raw_depth_to_metric_camera_z,
+    _reference_depth_title,
     _resolve_gt_root,
     _resize_rgb_image,
     _sanitize_stem,
@@ -49,7 +50,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--show_depth_colorbar", action="store_true")
     ap.add_argument("--resize_gt_to_view", action="store_true")
     ap.add_argument("--gt_title", default="GT")
-    ap.add_argument("--reference_title", default="Reference\nMesh Depth")
+    ap.add_argument("--reference_title", default="")
     ap.add_argument("--method_panel_layout", choices=["error_only", "depth_and_error"], default="error_only")
     ap.add_argument("--dpi", type=int, default=180)
     ap.add_argument(
@@ -260,6 +261,7 @@ def main() -> None:
     reference_manifest = _load_json(reference_manifest_path)
     method_specs = _parse_method_specs(args.method)
     scene_name = str(args.scene_name) if str(args.scene_name) else str(reference_manifest.get("scene_name", "Scene"))
+    reference_title = str(args.reference_title) if str(args.reference_title) else _reference_depth_title(reference_manifest)
     gt_root = _resolve_gt_root(reference_manifest, override_root=str(args.gt_images_root), override_images_dir=str(args.gt_images_dir_name))
     selected_views = _choose_views(reference_manifest=reference_manifest, args=args)
     invalid_depth_rgb = _parse_rgb_triplet(str(args.invalid_depth_rgb), default=(0.0, 0.0, 0.0))
@@ -301,7 +303,7 @@ def main() -> None:
         },
         "column_titles": {
             "gt_title": str(args.gt_title),
-            "reference_title": str(args.reference_title),
+            "reference_title": reference_title,
         },
         "selected_views": [],
         "methods": [
@@ -414,7 +416,7 @@ def main() -> None:
             depth_max_vis=depth_max_vis,
             cmap_name=str(args.depth_cmap),
             gt_title=str(args.gt_title),
-            reference_title=str(args.reference_title),
+            reference_title=reference_title,
         )
 
         rows_payload.append(
@@ -449,7 +451,7 @@ def main() -> None:
         depth_max_vis=depth_max_vis,
         cmap_name=str(args.depth_cmap),
         gt_title=str(args.gt_title),
-        reference_title=str(args.reference_title),
+        reference_title=reference_title,
     )
 
     _write_csv(
