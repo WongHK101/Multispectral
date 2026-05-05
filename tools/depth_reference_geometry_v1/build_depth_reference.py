@@ -138,7 +138,9 @@ def _append_colmap_option(cmd: List[str], key: str, value: Any) -> None:
     if value is None:
         return
     if isinstance(value, bool):
-        cmd.extend([str(key), "true" if value else "false"])
+        # COLMAP 3.9.1 accepts numeric booleans reliably; textual
+        # true/false can be parsed as 0 for some PatchMatch options.
+        cmd.extend([str(key), "1" if value else "0"])
         return
     cmd.extend([str(key), str(value)])
 
@@ -399,7 +401,7 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
         "--PatchMatchStereo.max_image_size",
         str(int(args.patch_match_max_image_size)),
         "--PatchMatchStereo.geom_consistency",
-        "true" if bool(args.patch_match_geom_consistency) else "false",
+        "1" if bool(args.patch_match_geom_consistency) else "0",
     ]
     _append_colmap_option(base_cmd, "--PatchMatchStereo.filter", getattr(args, "patch_match_filter", None))
     _append_colmap_option(base_cmd, "--PatchMatchStereo.window_radius", getattr(args, "patch_match_window_radius", None))

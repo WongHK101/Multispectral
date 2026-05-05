@@ -18,9 +18,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scene.dataset_readers import readColmapSceneInfo
-from utils.graphics_utils import fov2focal, getWorld2View2
-
 
 def save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,6 +53,8 @@ def compute_scaled_resolution(orig_w: int, orig_h: int, resolution_arg: int) -> 
 
 
 def _camera_to_world_from_caminfo(cam_info) -> np.ndarray:
+    from utils.graphics_utils import getWorld2View2
+
     w2c = getWorld2View2(cam_info.R, cam_info.T, np.array([0.0, 0.0, 0.0], dtype=np.float64), 1.0).astype(np.float64)
     return np.linalg.inv(w2c)
 
@@ -76,6 +75,9 @@ def build_probe_view_manifest(
 
     # The repo reader prints per-camera progress; suppress it so long dense runs can
     # safely continue even when stdout is redirected or detached.
+    from scene.dataset_readers import readColmapSceneInfo
+    from utils.graphics_utils import fov2focal
+
     with contextlib.redirect_stdout(io.StringIO()):
         try:
             scene_info = readColmapSceneInfo(
