@@ -27,6 +27,7 @@ from depth_reference_common import (
     load_json,
     load_native_camera_entries,
     render_point_splat_depth_for_view,
+    transform_native_points_to_strict_reference_units,
 )
 
 
@@ -161,6 +162,30 @@ def _render_point_splat_depth_and_opacity(
     return {"depth": depth, "opacity": opacity, "support_count": support_count}
 
 
+def _render_point_splat_depth_and_opacity_from_points(
+    *,
+    manifest_view: Dict[str, Any],
+    points_world: np.ndarray,
+    opacity_values: np.ndarray,
+    splat_radius_px: int,
+    depth_tolerance: float,
+    min_opacity: float,
+) -> Dict[str, np.ndarray]:
+    points = np.asarray(points_world, dtype=np.float64)
+    opacity = np.asarray(opacity_values, dtype=np.float64).reshape(-1)
+    keep = np.isfinite(points).all(axis=1)
+    if min_opacity > 0.0:
+        keep &= np.isfinite(opacity) & (opacity >= float(min_opacity))
+    depth, support_count = render_point_splat_depth_for_view(
+        points[keep],
+        manifest_view,
+        depth_tolerance_m=float(depth_tolerance),
+        splat_radius_px=int(splat_radius_px),
+    )
+    opacity_mask = np.asarray(support_count > 0, dtype=np.float64)
+    return {"depth": depth, "opacity": opacity_mask, "support_count": support_count}
+
+
 def _infer_scene_name(dataset) -> str:
     src = Path(dataset.source_path)
     if src.name.lower() in {"thermal_ud", "rgb_ud", "thermal", "rgb", "images"} and src.parent.name:
@@ -184,6 +209,7 @@ def export_probe_bundle(
     point_splat_depth_tolerance: float,
     point_splat_min_opacity: float,
     camera_frame_mode: str,
+    world_alignment_mode: str,
     probe_camera_manifest_path: Path | None,
     native_cameras_json_path: Path | None,
 ) -> Path:
@@ -200,7 +226,9 @@ def export_probe_bundle(
 
         requested_images: List[str] | None = None
         strict_to_native_alignment: Dict[str, Any] | None = None
-        render_items: List[tuple[int, Any, Dict[str, Any]]] = []
+        render_items: List[tuple[int, Any, Dict[str, Any], Dict[str, Any] | None]] = []
+        strict_reference_points_for_splat: np.ndarray | None = None
+        opacity_values_for_splat: np.ndarray | None = None
 
         if camera_frame_mode == "scene_test":
             views = scene.getTestCameras()
@@ -234,6 +262,7 @@ def export_probe_bundle(
                             "cy": float(view.image_height / 2.0),
                             "camera_to_world": _camera_to_world_from_view(view),
                         },
+                        None,
                     )
                 )
         elif camera_frame_mode == "probe_manifest_native_align":
@@ -251,21 +280,38 @@ def export_probe_bundle(
             strict_to_native_alignment = estimate_strict_to_native_world_transform(
                 strict_views=probe_manifest["views"],
                 native_cameras_by_stem=native_cameras_by_stem,
+                alignment_mode=str(world_alignment_mode),
             )
-            strict_to_native = np.asarray(strict_to_native_alignment["strict_to_native_transform"], dtype=np.float64)
+            if str(world_alignment_mode) == "similarity":
+                if depth_backend != "gaussian_point_splat":
+                    raise ValueError(
+                        "--world_alignment_mode similarity is only supported with --depth_backend gaussian_point_splat. "
+                        "Renderer depth needs a separate scale-aware adapter."
+                    )
+                strict_reference_points_for_splat = transform_native_points_to_strict_reference_units(
+                    gaussians.get_xyz.detach().float().cpu().numpy().astype(np.float64, copy=False),
+                    strict_to_native_alignment,
+                )
+                opacity_values_for_splat = gaussians.get_opacity.detach().float().cpu().numpy().reshape(-1)
+            else:
+                strict_to_native = np.asarray(strict_to_native_alignment["strict_to_native_transform"], dtype=np.float64)
             image_root = Path(dataset.source_path) / str(dataset.images)
             for idx, strict_view in enumerate(probe_views):
-                native_c2w = apply_world_transform_to_camera_to_world(
-                    np.asarray(strict_view["camera_to_world"], dtype=np.float64),
-                    strict_to_native,
-                )
-                render_view = _camera_from_manifest_view(
-                    manifest_view=strict_view,
-                    camera_to_world=native_c2w,
-                    image_root=image_root,
-                    uid=idx,
-                    data_device=dataset.data_device,
-                )
+                if str(world_alignment_mode) == "similarity":
+                    native_c2w = np.asarray(strict_view["camera_to_world"], dtype=np.float64)
+                    render_view = None
+                else:
+                    native_c2w = apply_world_transform_to_camera_to_world(
+                        np.asarray(strict_view["camera_to_world"], dtype=np.float64),
+                        strict_to_native,
+                    )
+                    render_view = _camera_from_manifest_view(
+                        manifest_view=strict_view,
+                        camera_to_world=native_c2w,
+                        image_root=image_root,
+                        uid=idx,
+                        data_device=dataset.data_device,
+                    )
                 render_items.append(
                     (
                         idx,
@@ -282,13 +328,16 @@ def export_probe_bundle(
                             "camera_to_world": strict_view["camera_to_world"],
                             "native_camera_to_world": native_c2w.tolist(),
                         },
+                        strict_view if str(world_alignment_mode) == "similarity" else None,
                     )
                 )
         else:
             raise ValueError(f"Unsupported camera_frame_mode: {camera_frame_mode!r}")
 
-        for idx, view, view_record in render_items:
+        for idx, view, view_record, strict_render_view in render_items:
             if depth_backend == "renderer":
+                if view is None:
+                    raise ValueError("Renderer backend requires a native Camera view")
                 arrays = _render_depth_and_opacity(
                     view=view,
                     gaussians=gaussians,
@@ -297,13 +346,27 @@ def export_probe_bundle(
                     white_override=white_override,
                 )
             elif depth_backend == "gaussian_point_splat":
-                arrays = _render_point_splat_depth_and_opacity(
-                    view=view,
-                    gaussians=gaussians,
-                    splat_radius_px=int(point_splat_radius_px),
-                    depth_tolerance=float(point_splat_depth_tolerance),
-                    min_opacity=float(point_splat_min_opacity),
-                )
+                if strict_render_view is not None:
+                    if strict_reference_points_for_splat is None or opacity_values_for_splat is None:
+                        raise RuntimeError("Similarity point-splat points were not prepared")
+                    arrays = _render_point_splat_depth_and_opacity_from_points(
+                        manifest_view=strict_render_view,
+                        points_world=strict_reference_points_for_splat,
+                        opacity_values=opacity_values_for_splat,
+                        splat_radius_px=int(point_splat_radius_px),
+                        depth_tolerance=float(point_splat_depth_tolerance),
+                        min_opacity=float(point_splat_min_opacity),
+                    )
+                else:
+                    if view is None:
+                        raise ValueError("Rigid point-splat backend requires a native Camera view")
+                    arrays = _render_point_splat_depth_and_opacity(
+                        view=view,
+                        gaussians=gaussians,
+                        splat_radius_px=int(point_splat_radius_px),
+                        depth_tolerance=float(point_splat_depth_tolerance),
+                        min_opacity=float(point_splat_min_opacity),
+                    )
             else:
                 raise ValueError(f"Unsupported depth_backend: {depth_backend}")
             view_rel = Path("views") / f"{idx:05d}.npz"
@@ -331,13 +394,18 @@ def export_probe_bundle(
             if depth_backend == "renderer"
             else "metric_camera_z_from_point_splat_centers"
         ),
-        "opacity_semantics": "black_bg_plus_white_override_color_render",
+        "opacity_semantics": (
+            "black_bg_plus_white_override_color_render"
+            if depth_backend == "renderer"
+            else "support_count_positive"
+        ),
         "point_splat_options": {
             "splat_radius_px": int(point_splat_radius_px),
             "depth_tolerance": float(point_splat_depth_tolerance),
             "min_opacity": float(point_splat_min_opacity),
         } if depth_backend == "gaussian_point_splat" else None,
         "camera_frame_mode": str(camera_frame_mode),
+        "world_alignment_mode": str(world_alignment_mode),
         "probe_camera_manifest": str(probe_camera_manifest_path.resolve()) if probe_camera_manifest_path is not None else "",
         "native_cameras_json": str(native_cameras_json_path.resolve()) if native_cameras_json_path is not None else "",
         "strict_to_native_alignment": strict_to_native_alignment,
@@ -389,6 +457,16 @@ def build_argparser() -> tuple[argparse.ArgumentParser, ModelParams, PipelinePar
             "views after rigidly aligning their camera frame into the model's native cameras.json frame."
         ),
     )
+    parser.add_argument(
+        "--world_alignment_mode",
+        default="rigid",
+        choices=("rigid", "similarity"),
+        help=(
+            "World transform used by probe_manifest_native_align. rigid preserves legacy behavior. "
+            "similarity estimates scale+rotation+translation and exports point-splat depths in reference units; "
+            "use this for no-GPS scenes reconstructed in independent SfM coordinate frames."
+        ),
+    )
     parser.add_argument("--probe_camera_manifest", default="")
     parser.add_argument("--native_cameras_json", default="")
     parser.add_argument("--quiet", action="store_true")
@@ -417,6 +495,7 @@ def main() -> None:
         point_splat_depth_tolerance=float(args.point_splat_depth_tolerance),
         point_splat_min_opacity=float(args.point_splat_min_opacity),
         camera_frame_mode=str(args.camera_frame_mode),
+        world_alignment_mode=str(args.world_alignment_mode),
         probe_camera_manifest_path=Path(args.probe_camera_manifest).resolve()
         if str(args.probe_camera_manifest).strip()
         else None,

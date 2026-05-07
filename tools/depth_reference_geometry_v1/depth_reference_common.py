@@ -377,9 +377,32 @@ def _estimate_rigid_transform(src_points: np.ndarray, dst_points: np.ndarray) ->
     return rot.astype(np.float64), trans.astype(np.float64)
 
 
+def _estimate_similarity_transform(src_points: np.ndarray, dst_points: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+    if src_points.shape != dst_points.shape or src_points.ndim != 2 or src_points.shape[1] != 3:
+        raise ValueError(f"Expected matched Nx3 point sets, got {src_points.shape} and {dst_points.shape}")
+    src_mean = np.mean(src_points, axis=0)
+    dst_mean = np.mean(dst_points, axis=0)
+    src_centered = src_points - src_mean
+    dst_centered = dst_points - dst_mean
+    cov = (dst_centered.T @ src_centered) / float(src_points.shape[0])
+    u, singular_values, vt = np.linalg.svd(cov)
+    sign = np.eye(3, dtype=np.float64)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        sign[-1, -1] = -1.0
+    rot = u @ sign @ vt
+    src_var = float(np.sum(src_centered * src_centered) / float(src_points.shape[0]))
+    if src_var <= 0.0:
+        raise ValueError("Cannot estimate similarity transform from degenerate source centers")
+    scale = float(np.trace(np.diag(singular_values) @ sign) / src_var)
+    trans = dst_mean - scale * rot @ src_mean
+    return scale, rot.astype(np.float64), trans.astype(np.float64)
+
+
 def estimate_strict_to_native_world_transform(
     strict_views: Sequence[Dict[str, Any]],
     native_cameras_by_stem: Dict[str, Dict[str, Any]],
+    *,
+    alignment_mode: str = "rigid",
 ) -> Dict[str, Any]:
     strict_centers: List[np.ndarray] = []
     native_centers: List[np.ndarray] = []
@@ -404,9 +427,15 @@ def estimate_strict_to_native_world_transform(
 
     strict_centers_arr = np.asarray(strict_centers, dtype=np.float64)
     native_centers_arr = np.asarray(native_centers, dtype=np.float64)
-    rot, trans = _estimate_rigid_transform(strict_centers_arr, native_centers_arr)
+    if alignment_mode == "rigid":
+        scale = 1.0
+        rot, trans = _estimate_rigid_transform(strict_centers_arr, native_centers_arr)
+    elif alignment_mode == "similarity":
+        scale, rot, trans = _estimate_similarity_transform(strict_centers_arr, native_centers_arr)
+    else:
+        raise ValueError(f"Unsupported alignment_mode: {alignment_mode!r}")
 
-    transformed_centers = (rot @ strict_centers_arr.T).T + trans[None, :]
+    transformed_centers = scale * (rot @ strict_centers_arr.T).T + trans[None, :]
     center_residuals = transformed_centers - native_centers_arr
     center_errors = np.linalg.norm(center_residuals, axis=1)
 
@@ -416,12 +445,14 @@ def estimate_strict_to_native_world_transform(
         rotation_errors.append(_rotation_delta_deg(predicted_rot, native_rot))
 
     transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rot
+    transform[:3, :3] = scale * rot
     transform[:3, 3] = trans
     return {
+        "alignment_mode": str(alignment_mode),
         "common_count": int(len(common_names)),
         "common_image_names": list(common_names),
         "strict_to_native_transform": transform.tolist(),
+        "similarity_scale_strict_to_native": float(scale),
         "translation_mean_xyz": np.mean(center_residuals, axis=0).tolist(),
         "translation_std_xyz": np.std(center_residuals, axis=0).tolist(),
         "translation_error_mean": float(np.mean(center_errors)),
@@ -429,6 +460,18 @@ def estimate_strict_to_native_world_transform(
         "rotation_error_mean_deg": float(np.mean(rotation_errors)),
         "rotation_error_max_deg": float(np.max(rotation_errors)),
     }
+
+
+def transform_native_points_to_strict_reference_units(points: np.ndarray, strict_to_native_alignment: Dict[str, Any]) -> np.ndarray:
+    transform = np.asarray(strict_to_native_alignment["strict_to_native_transform"], dtype=np.float64)
+    if transform.shape != (4, 4):
+        raise ValueError(f"strict_to_native_transform must be 4x4, got {transform.shape}")
+    linear = transform[:3, :3]
+    trans = transform[:3, 3]
+    return ((np.linalg.inv(linear) @ (np.asarray(points, dtype=np.float64) - trans[None, :]).T).T).astype(
+        np.float64,
+        copy=False,
+    )
 
 
 def apply_world_transform_to_camera_to_world(camera_to_world: np.ndarray, world_transform: np.ndarray) -> np.ndarray:
