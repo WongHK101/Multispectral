@@ -4,11 +4,14 @@ import argparse
 import os
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
+from plyfile import PlyData, PlyElement
 
 from depth_reference_common import (
     build_probe_view_manifest,
@@ -145,8 +148,62 @@ def _append_colmap_option(cmd: List[str], key: str, value: Any) -> None:
     cmd.extend([str(key), str(value)])
 
 
+def _argv_has_option(option_name: str) -> bool:
+    prefix = str(option_name) + "="
+    no_option_name = "--no-" + str(option_name)[2:] if str(option_name).startswith("--") else ""
+    return any(arg == option_name or arg.startswith(prefix) or (no_option_name and arg == no_option_name) for arg in sys.argv[1:])
+
+
+def _apply_reference_preset(args: argparse.Namespace) -> None:
+    preset = str(getattr(args, "reference_preset", "none"))
+    if preset == "none":
+        return
+    if preset != "self_m3m_dense_mvs_20260507":
+        raise ValueError(f"Unknown reference preset: {preset}")
+
+    preset_values: Dict[str, Any] = {
+        "patch_match_max_image_size": 1200,
+        "patch_match_geom_consistency": True,
+        "patch_match_write_consistency_graph": 1,
+        "patch_match_filter": 1,
+        "patch_match_filter_min_ncc": 0.0,
+        "patch_match_filter_min_triangulation_angle": 0.01,
+        "patch_match_filter_min_num_consistent": 1,
+        "patch_match_filter_geom_consistency_max_cost": 3.0,
+        "stereo_fusion_input_type": "geometric",
+        "stereo_fusion_min_num_pixels": 4,
+        "stereo_fusion_max_reproj_error": 2.0,
+        "stereo_fusion_max_depth_error": 0.020,
+        "stereo_fusion_max_normal_error": 20.0,
+        "mesh_backend_preference": "poisson",
+        "poisson_depth": 10,
+        "poisson_trim": 6.0,
+        "poisson_point_weight": 4.0,
+        "roi_source": "sparse_sfm_quantile_aabb",
+        "bbox_lower_quantile": 0.005,
+        "bbox_upper_quantile": 0.995,
+        "bbox_padding_ratio": 0.20,
+        "crop_fused_to_roi_before_mesh": True,
+        "cropped_fused_name": "reference_fused_geometric_roi_crop.ply",
+        "poisson_mesh_name": "reference_mesh_poisson_self_m3m_m4_d0020_n20_roi_d10_trim6_pw4.ply",
+    }
+    option_by_attr = {
+        "crop_fused_to_roi_before_mesh": "--crop_fused_to_roi_before_mesh",
+    }
+    for attr, value in preset_values.items():
+        option = option_by_attr.get(attr, "--" + attr)
+        if not _argv_has_option(option):
+            setattr(args, attr, value)
+
+
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build training-only reference depth artifacts for held-out geometry evaluation")
+    parser.add_argument(
+        "--reference_preset",
+        default="none",
+        choices=("none", "self_m3m_dense_mvs_20260507"),
+        help="Named dense-reference construction preset. Explicit command-line options override preset values.",
+    )
     parser.add_argument("--strict_protocol_manifest", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument(
@@ -174,6 +231,19 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--bbox_lower_quantile", type=float, default=0.01)
     parser.add_argument("--bbox_upper_quantile", type=float, default=0.99)
     parser.add_argument("--bbox_padding_ratio", type=float, default=0.02)
+    parser.add_argument(
+        "--roi_source",
+        default="dense_fused_quantile_aabb",
+        choices=("dense_fused_quantile_aabb", "sparse_sfm_quantile_aabb"),
+        help="Point set used to derive the robust ROI. Use sparse_sfm_quantile_aabb for SELF_M3M dense mesh reference.",
+    )
+    parser.add_argument(
+        "--crop_fused_to_roi_before_mesh",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Crop the COLMAP fused point cloud to the ROI before Poisson/Delaunay meshing.",
+    )
+    parser.add_argument("--cropped_fused_name", default="reference_fused_geometric_roi_crop.ply")
     parser.add_argument("--support_min_count", type=int, default=1)
     parser.add_argument("--support_radius_px", type=int, default=1)
     parser.add_argument("--support_depth_tolerance_m", type=float, default=0.10)
@@ -187,6 +257,17 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--patch_match_window_radius", type=int, default=None)
     parser.add_argument("--patch_match_num_iterations", type=int, default=None)
     parser.add_argument("--patch_match_filter", type=int, choices=(0, 1), default=None)
+    parser.add_argument(
+        "--patch_match_write_consistency_graph",
+        type=int,
+        choices=(0, 1),
+        default=None,
+        help=(
+            "Explicit COLMAP PatchMatchStereo.write_consistency_graph. "
+            "COLMAP 3.9.1 defaults this to 0, but stereo_fusion requires "
+            "consistency graphs to fuse dense points."
+        ),
+    )
     parser.add_argument("--patch_match_min_triangulation_angle", type=float, default=None)
     parser.add_argument("--patch_match_filter_min_triangulation_angle", type=float, default=None)
     parser.add_argument("--patch_match_filter_min_num_consistent", type=int, default=None)
@@ -248,6 +329,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--poisson_depth", type=int, default=None)
     parser.add_argument("--poisson_trim", type=float, default=None)
     parser.add_argument("--poisson_point_weight", type=float, default=None)
+    parser.add_argument("--poisson_mesh_name", default="reference_mesh_poisson.ply")
     parser.add_argument("--force_patch_match", action="store_true")
     parser.add_argument("--force_fusion", action="store_true")
     parser.add_argument("--force_mesh", action="store_true")
@@ -319,15 +401,114 @@ def _ensure_file_link_or_copy(link_path: Path, target_path: Path) -> None:
     shutil.copy2(target_path, link_path)
 
 
+def _replace_file_link_or_copy(link_path: Path, target_path: Path) -> None:
+    if link_path.exists() or link_path.is_symlink():
+        _remove_tree_or_link(link_path)
+    _ensure_file_link_or_copy(link_path, target_path)
+
+
+def _point_cloud_stats(points: np.ndarray) -> Dict[str, Any]:
+    pts = np.asarray(points, dtype=np.float64)
+    stats: Dict[str, Any] = {"count": int(pts.shape[0])}
+    if pts.size == 0:
+        return stats
+    finite = np.all(np.isfinite(pts), axis=1)
+    stats["finite_count"] = int(np.count_nonzero(finite))
+    if not np.any(finite):
+        return stats
+    finite_pts = pts[finite]
+    stats.update(
+        {
+            "bbox_min": np.min(finite_pts, axis=0).tolist(),
+            "bbox_max": np.max(finite_pts, axis=0).tolist(),
+            "q005": np.quantile(finite_pts, 0.005, axis=0).tolist(),
+            "q995": np.quantile(finite_pts, 0.995, axis=0).tolist(),
+        }
+    )
+    return stats
+
+
+def _load_colmap_sparse_points_xyz(model_dir: Path) -> np.ndarray:
+    bin_path = model_dir / "points3D.bin"
+    txt_path = model_dir / "points3D.txt"
+    if bin_path.exists():
+        points = []
+        with open(bin_path, "rb") as fid:
+            num_points = struct.unpack("<Q", fid.read(8))[0]
+            for _ in range(num_points):
+                # point3D_id, xyz, rgb, error, track_length, track elements.
+                fid.read(8)
+                xyz = struct.unpack("<ddd", fid.read(24))
+                fid.read(3)
+                fid.read(8)
+                track_len = struct.unpack("<Q", fid.read(8))[0]
+                fid.read(8 * track_len)
+                points.append(xyz)
+        return np.asarray(points, dtype=np.float64)
+    if txt_path.exists():
+        points = []
+        with open(txt_path, "r", encoding="utf-8", errors="replace") as fid:
+            for line in fid:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split()
+                if len(fields) < 4:
+                    continue
+                points.append((float(fields[1]), float(fields[2]), float(fields[3])))
+        return np.asarray(points, dtype=np.float64)
+    raise FileNotFoundError(f"No COLMAP points3D.bin/txt found under {model_dir}")
+
+
+def _crop_ply_vertices_by_bbox(input_path: Path, output_path: Path, bbox_min: np.ndarray, bbox_max: np.ndarray) -> Dict[str, Any]:
+    ply = PlyData.read(str(input_path))
+    vertices = ply["vertex"].data
+    if not {"x", "y", "z"}.issubset(set(vertices.dtype.names or ())):
+        raise ValueError(f"{input_path} vertex element must contain x/y/z")
+    xyz = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T.astype(np.float64, copy=False)
+    finite = np.all(np.isfinite(xyz), axis=1)
+    inside = finite & np.all((xyz >= bbox_min[None, :]) & (xyz <= bbox_max[None, :]), axis=1)
+    cropped_vertices = vertices[inside]
+    if int(cropped_vertices.shape[0]) <= 0:
+        raise RuntimeError(f"ROI crop removed all fused points from {input_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    vertex_element = PlyElement.describe(cropped_vertices, "vertex")
+    comments = list(getattr(ply, "comments", []) or [])
+    comments.append("Cropped by UMGS depth-reference sparse-SfM robust ROI before meshing.")
+    PlyData([vertex_element], text=bool(ply.text), byte_order=ply.byte_order, comments=comments).write(str(output_path))
+    return {
+        "input_path": str(input_path),
+        "output_path": str(output_path),
+        "input_point_count": int(vertices.shape[0]),
+        "finite_point_count": int(np.count_nonzero(finite)),
+        "cropped_point_count": int(cropped_vertices.shape[0]),
+        "removed_point_count": int(vertices.shape[0] - cropped_vertices.shape[0]),
+    }
+
+
+def _get_colmap_version(colmap_cmd: str) -> Dict[str, Any]:
+    for flag in ("-v", "--version", "help"):
+        try:
+            output = _run_cmd_capture_output([colmap_cmd, flag])
+            return {"status": "ok", "flag": flag, "output": output.strip()}
+        except Exception as exc:
+            last_error = str(exc)
+    return {"status": "failed", "error": last_error}
+
+
 def _prepare_flat_colmap_workspace(source_workspace_root: Path, prepared_root: Path) -> Path:
     images_src = source_workspace_root / "images"
     input_src = source_workspace_root / "input"
     distorted_src = source_workspace_root / "distorted"
     stereo_src = source_workspace_root / "stereo"
     sparse_src = source_workspace_root / "sparse" / "0"
+    if not sparse_src.exists() and (source_workspace_root / "sparse").exists():
+        direct_sparse = source_workspace_root / "sparse"
+        if any((direct_sparse / name).exists() for name in ("cameras.bin", "cameras.txt")):
+            sparse_src = direct_sparse
     if not images_src.exists() or not stereo_src.exists() or not sparse_src.exists():
         raise FileNotFoundError(
-            "Expected source workspace to contain images/, stereo/, and sparse/0; "
+            "Expected source workspace to contain images/, stereo/, and sparse/0 or sparse/; "
             f"got images={images_src.exists()} stereo={stereo_src.exists()} sparse0={sparse_src.exists()}"
         )
     prepared_root.mkdir(parents=True, exist_ok=True)
@@ -404,6 +585,11 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
         "1" if bool(args.patch_match_geom_consistency) else "0",
     ]
     _append_colmap_option(base_cmd, "--PatchMatchStereo.filter", getattr(args, "patch_match_filter", None))
+    _append_colmap_option(
+        base_cmd,
+        "--PatchMatchStereo.write_consistency_graph",
+        getattr(args, "patch_match_write_consistency_graph", None),
+    )
     _append_colmap_option(base_cmd, "--PatchMatchStereo.window_radius", getattr(args, "patch_match_window_radius", None))
     _append_colmap_option(base_cmd, "--PatchMatchStereo.num_iterations", getattr(args, "patch_match_num_iterations", None))
     _append_colmap_option(
@@ -444,6 +630,7 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
         "patch_match_depth_min": depth_min,
         "patch_match_depth_max": depth_max,
         "patch_match_filter": getattr(args, "patch_match_filter", None),
+        "patch_match_write_consistency_graph": getattr(args, "patch_match_write_consistency_graph", None),
         "patch_match_window_radius": getattr(args, "patch_match_window_radius", None),
         "patch_match_num_iterations": getattr(args, "patch_match_num_iterations", None),
         "patch_match_min_triangulation_angle": getattr(args, "patch_match_min_triangulation_angle", None),
@@ -507,6 +694,7 @@ def _run_patch_match_stereo(args: argparse.Namespace, prepared_workspace: Path) 
 
 def main() -> None:
     args = _build_argparser().parse_args()
+    _apply_reference_preset(args)
     strict_manifest_path = Path(args.strict_protocol_manifest).resolve()
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -535,17 +723,21 @@ def main() -> None:
         raise FileNotFoundError(f"Expected COLMAP stereo workspace at {stereo_root}")
 
     fused_ply = out_dir / "reference_fused_geometric.ply"
+    cropped_fused_ply = out_dir / str(args.cropped_fused_name)
     delaunay_mesh = out_dir / "reference_mesh_delaunay.ply"
-    poisson_mesh = out_dir / "reference_mesh_poisson.ply"
+    poisson_mesh = out_dir / str(args.poisson_mesh_name)
     mesh_path = delaunay_mesh
     mesh_backend = "delaunay_mesher"
     reference_runtime_audit: Dict[str, Any] = {
+        "reference_preset": str(args.reference_preset),
         "colmap_cmd": str(args.colmap_cmd),
         "colmap_cmd_resolved": _resolve_executable(str(args.colmap_cmd)),
+        "colmap_version": _get_colmap_version(str(args.colmap_cmd)),
         "patch_match_max_image_size": int(args.patch_match_max_image_size),
         "patch_match_auto_source_count": getattr(args, "patch_match_auto_source_count", None),
         "patch_match_auto_source_count_rewritten": bool(patch_match_cfg_rewritten),
         "patch_match_filter": getattr(args, "patch_match_filter", None),
+        "patch_match_write_consistency_graph": getattr(args, "patch_match_write_consistency_graph", None),
         "patch_match_window_radius": getattr(args, "patch_match_window_radius", None),
         "patch_match_num_iterations": getattr(args, "patch_match_num_iterations", None),
         "patch_match_min_triangulation_angle": getattr(args, "patch_match_min_triangulation_angle", None),
@@ -566,6 +758,11 @@ def main() -> None:
         "poisson_depth": getattr(args, "poisson_depth", None),
         "poisson_trim": getattr(args, "poisson_trim", None),
         "poisson_point_weight": getattr(args, "poisson_point_weight", None),
+        "roi_source": str(args.roi_source),
+        "bbox_lower_quantile": float(args.bbox_lower_quantile),
+        "bbox_upper_quantile": float(args.bbox_upper_quantile),
+        "bbox_padding_ratio": float(args.bbox_padding_ratio),
+        "crop_fused_to_roi_before_mesh": bool(args.crop_fused_to_roi_before_mesh),
         "reference_depth_backend": str(args.reference_depth_backend),
         "reference_point_splat_radius_px": int(args.reference_point_splat_radius_px),
     }
@@ -606,13 +803,68 @@ def main() -> None:
         raise RuntimeError(f"COLMAP stereo_fusion did not produce a valid fused point cloud at {fused_ply}")
     fused_points = load_ply_points_xyz(fused_ply)
     reference_runtime_audit["fused_point_count"] = int(fused_points.shape[0])
+    reference_runtime_audit["fused_point_stats"] = _point_cloud_stats(fused_points)
     if fused_points.shape[0] <= 0:
         save_json(out_dir / "reference_runtime_audit_empty_fusion.json", reference_runtime_audit)
         raise RuntimeError(
             f"COLMAP stereo_fusion produced an empty fused point cloud at {fused_ply}. "
             "Try --stereo_fusion_input_type photometric and/or --no-patch_match_geom_consistency."
         )
-    _ensure_file_link_or_copy(prepared_workspace / "fused.ply", fused_ply)
+
+    if str(args.roi_source) == "sparse_sfm_quantile_aabb":
+        sparse_model_dir = prepared_workspace / "sparse"
+        roi_source_points = _load_colmap_sparse_points_xyz(sparse_model_dir)
+        roi_source_path = sparse_model_dir
+        roi_source_type = "sparse_sfm_quantile_aabb"
+    else:
+        roi_source_points = fused_points
+        roi_source_path = fused_ply
+        roi_source_type = "dense_fused_quantile_aabb"
+    reference_runtime_audit["roi_source_point_count"] = int(roi_source_points.shape[0])
+    reference_runtime_audit["roi_source_point_stats"] = _point_cloud_stats(roi_source_points)
+    roi = compute_quantile_bbox(
+        roi_source_points,
+        lower_quantile=float(args.bbox_lower_quantile),
+        upper_quantile=float(args.bbox_upper_quantile),
+        padding_ratio_of_robust_diagonal=float(args.bbox_padding_ratio),
+    )
+    roi_path = out_dir / "reference_roi.json"
+    save_json(
+        roi_path,
+        {
+            "protocol_name": "reference-depth-based-geometric-evaluation-v1",
+            "scene_name": scene_name,
+            "roi_rule": {
+                "type": roi_source_type,
+                "lower_quantile": float(args.bbox_lower_quantile),
+                "upper_quantile": float(args.bbox_upper_quantile),
+                "padding_ratio_of_robust_diagonal": float(args.bbox_padding_ratio),
+            },
+            "bbox_min": roi["bbox_min"].tolist(),
+            "bbox_max": roi["bbox_max"].tolist(),
+            "scene_diagonal": float(roi["scene_diagonal"]),
+            "source_points_path": str(roi_source_path),
+            "source_point_count": int(roi_source_points.shape[0]),
+        },
+    )
+
+    mesh_input_ply = fused_ply
+    reference_points = fused_points
+    if bool(args.crop_fused_to_roi_before_mesh):
+        crop_audit = _crop_ply_vertices_by_bbox(
+            fused_ply,
+            cropped_fused_ply,
+            bbox_min=np.asarray(roi["bbox_min"], dtype=np.float64),
+            bbox_max=np.asarray(roi["bbox_max"], dtype=np.float64),
+        )
+        reference_runtime_audit["fused_roi_crop"] = crop_audit
+        mesh_input_ply = cropped_fused_ply
+        reference_points = load_ply_points_xyz(cropped_fused_ply)
+        reference_runtime_audit["cropped_fused_point_stats"] = _point_cloud_stats(reference_points)
+    else:
+        reference_runtime_audit["fused_roi_crop"] = {"enabled": False}
+
+    _replace_file_link_or_copy(prepared_workspace / "fused.ply", mesh_input_ply)
     fused_vis = Path(str(fused_ply) + ".vis")
     if fused_vis.exists():
         _ensure_file_link_or_copy(prepared_workspace / "fused.ply.vis", fused_vis)
@@ -625,7 +877,7 @@ def main() -> None:
             poisson_cmd = [
                 "poisson_mesher",
                 "--input_path",
-                str(fused_ply),
+                str(mesh_input_ply),
                 "--output_path",
                 str(poisson_mesh),
             ]
@@ -662,7 +914,7 @@ def main() -> None:
                 poisson_cmd = [
                     "poisson_mesher",
                     "--input_path",
-                    str(fused_ply),
+                    str(mesh_input_ply),
                     "--output_path",
                     str(poisson_mesh),
                 ]
@@ -685,32 +937,6 @@ def main() -> None:
     else:
         raise FileNotFoundError("No reference mesh was produced")
 
-    fused_points = load_ply_points_xyz(fused_ply)
-    roi = compute_quantile_bbox(
-        fused_points,
-        lower_quantile=float(args.bbox_lower_quantile),
-        upper_quantile=float(args.bbox_upper_quantile),
-        padding_ratio_of_robust_diagonal=float(args.bbox_padding_ratio),
-    )
-    roi_path = out_dir / "reference_roi.json"
-    save_json(
-        roi_path,
-        {
-            "protocol_name": "reference-depth-based-geometric-evaluation-v1",
-            "scene_name": scene_name,
-            "roi_rule": {
-                "type": "training_reference_dense_quantile_aabb",
-                "lower_quantile": float(args.bbox_lower_quantile),
-                "upper_quantile": float(args.bbox_upper_quantile),
-                "padding_ratio_of_robust_diagonal": float(args.bbox_padding_ratio),
-            },
-            "bbox_min": roi["bbox_min"].tolist(),
-            "bbox_max": roi["bbox_max"].tolist(),
-            "scene_diagonal": float(roi["scene_diagonal"]),
-            "source_points_path": str(fused_ply),
-        },
-    )
-
     camera_manifest_path = out_dir / "probe_camera_manifest.json"
     if args.force_views or (not camera_manifest_path.exists()):
         camera_manifest = build_probe_view_manifest(
@@ -730,6 +956,12 @@ def main() -> None:
         if mesh_path is None:
             raise FileNotFoundError("Mesh reference backend selected, but no mesh was produced")
         vertices_world, faces = load_ply_mesh(mesh_path)
+        reference_runtime_audit["mesh_stats"] = {
+            "path": str(mesh_path),
+            "vertex_count": int(vertices_world.shape[0]),
+            "face_count": int(faces.shape[0]),
+            "vertex_stats": _point_cloud_stats(vertices_world),
+        }
     bbox_min = np.asarray(roi["bbox_min"], dtype=np.float64)
     bbox_max = np.asarray(roi["bbox_max"], dtype=np.float64)
     thresholds_m = parse_thresholds_m(args.thresholds_m)
@@ -741,14 +973,14 @@ def main() -> None:
         if str(args.reference_depth_backend) == "mesh":
             depth = render_mesh_depth_for_view(vertices_world, faces, view)
             support_count = render_support_count_for_view(
-                fused_points,
+                reference_points,
                 view,
                 depth_tolerance_m=float(args.support_depth_tolerance_m),
                 support_radius_px=int(args.support_radius_px),
             )
         else:
             depth, support_count = render_point_splat_depth_for_view(
-                fused_points,
+                reference_points,
                 view,
                 depth_tolerance_m=float(args.support_depth_tolerance_m),
                 splat_radius_px=int(args.reference_point_splat_radius_px),
@@ -782,10 +1014,12 @@ def main() -> None:
         )
 
     reference_construction_overrides = {
+        "reference_preset": str(args.reference_preset),
         "patch_match_max_image_size": int(args.patch_match_max_image_size),
         "patch_match_auto_source_count": getattr(args, "patch_match_auto_source_count", None),
         "patch_match_auto_source_count_rewritten": bool(patch_match_cfg_rewritten),
         "patch_match_filter": getattr(args, "patch_match_filter", None),
+        "patch_match_write_consistency_graph": getattr(args, "patch_match_write_consistency_graph", None),
         "patch_match_window_radius": getattr(args, "patch_match_window_radius", None),
         "patch_match_num_iterations": getattr(args, "patch_match_num_iterations", None),
         "patch_match_geom_consistency": bool(args.patch_match_geom_consistency),
@@ -804,6 +1038,13 @@ def main() -> None:
         "poisson_depth": getattr(args, "poisson_depth", None),
         "poisson_trim": getattr(args, "poisson_trim", None),
         "poisson_point_weight": getattr(args, "poisson_point_weight", None),
+        "poisson_mesh_name": str(args.poisson_mesh_name),
+        "roi_source": str(args.roi_source),
+        "bbox_lower_quantile": float(args.bbox_lower_quantile),
+        "bbox_upper_quantile": float(args.bbox_upper_quantile),
+        "bbox_padding_ratio": float(args.bbox_padding_ratio),
+        "crop_fused_to_roi_before_mesh": bool(args.crop_fused_to_roi_before_mesh),
+        "cropped_fused_name": str(args.cropped_fused_name),
     }
 
     ref_manifest_path = out_dir / "reference_depth_manifest.json"
@@ -816,6 +1057,7 @@ def main() -> None:
             "camera_manifest_path": str(camera_manifest_path),
             "reference_workspace_root": str(workspace_root),
             "reference_fused_ply": str(fused_ply),
+            "reference_fused_ply_for_meshing": str(mesh_input_ply),
             "reference_mesh_path": str(mesh_path) if mesh_path is not None else None,
             "reference_mesh_backend": mesh_backend,
             "reference_depth_backend": str(args.reference_depth_backend),
@@ -851,6 +1093,7 @@ def main() -> None:
             "train_union_list": str(train_union_list),
             "probe_list": str(probe_list),
             "reference_fused_ply": str(fused_ply),
+            "reference_fused_ply_for_meshing": str(mesh_input_ply),
             "reference_mesh_path": str(mesh_path) if mesh_path is not None else None,
             "reference_mesh_backend": mesh_backend,
             "reference_depth_backend": str(args.reference_depth_backend),

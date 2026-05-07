@@ -5,6 +5,7 @@ import io
 import json
 import math
 import subprocess
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -59,6 +60,180 @@ def _camera_to_world_from_caminfo(cam_info) -> np.ndarray:
     return np.linalg.inv(w2c)
 
 
+_COLMAP_CAMERA_MODEL_IDS = {
+    0: ("SIMPLE_PINHOLE", 3),
+    1: ("PINHOLE", 4),
+    2: ("SIMPLE_RADIAL", 4),
+    3: ("RADIAL", 5),
+    4: ("OPENCV", 8),
+    5: ("OPENCV_FISHEYE", 8),
+    6: ("FULL_OPENCV", 12),
+    7: ("FOV", 5),
+    8: ("SIMPLE_RADIAL_FISHEYE", 4),
+    9: ("RADIAL_FISHEYE", 5),
+    10: ("THIN_PRISM_FISHEYE", 12),
+}
+
+
+def _read_next_bytes(fid, num_bytes: int, fmt: str):
+    return struct.unpack("<" + fmt, fid.read(num_bytes))
+
+
+def _qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
+    qvec = np.asarray(qvec, dtype=np.float64)
+    return np.array(
+        [
+            [
+                1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+                2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2],
+            ],
+            [
+                2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[3] ** 2,
+                2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
+            ],
+            [
+                2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
+                2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+                1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2,
+            ],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _read_colmap_cameras_binary(path: Path) -> Dict[int, Dict[str, Any]]:
+    cameras: Dict[int, Dict[str, Any]] = {}
+    with path.open("rb") as fid:
+        num_cameras = _read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_cameras):
+            camera_id, model_id, width, height = _read_next_bytes(fid, 24, "iiQQ")
+            if int(model_id) not in _COLMAP_CAMERA_MODEL_IDS:
+                raise ValueError(f"Unsupported COLMAP camera model id {model_id} in {path}")
+            model_name, num_params = _COLMAP_CAMERA_MODEL_IDS[int(model_id)]
+            params = np.asarray(_read_next_bytes(fid, 8 * num_params, "d" * num_params), dtype=np.float64)
+            cameras[int(camera_id)] = {
+                "model": model_name,
+                "width": int(width),
+                "height": int(height),
+                "params": params,
+            }
+    return cameras
+
+
+def _read_colmap_images_binary(path: Path) -> Dict[int, Dict[str, Any]]:
+    images: Dict[int, Dict[str, Any]] = {}
+    with path.open("rb") as fid:
+        num_images = _read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_images):
+            data = _read_next_bytes(fid, 64, "idddddddi")
+            image_id = int(data[0])
+            qvec = np.asarray(data[1:5], dtype=np.float64)
+            tvec = np.asarray(data[5:8], dtype=np.float64)
+            camera_id = int(data[8])
+            chars: List[str] = []
+            while True:
+                char = _read_next_bytes(fid, 1, "c")[0]
+                if char == b"\x00":
+                    break
+                chars.append(char.decode("utf-8"))
+            num_points2d = _read_next_bytes(fid, 8, "Q")[0]
+            fid.seek(24 * int(num_points2d), io.SEEK_CUR)
+            images[image_id] = {
+                "qvec": qvec,
+                "tvec": tvec,
+                "camera_id": camera_id,
+                "name": "".join(chars),
+            }
+    return images
+
+
+def _camera_intrinsics_from_colmap(camera: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    model = str(camera["model"])
+    params = np.asarray(camera["params"], dtype=np.float64)
+    if model == "SIMPLE_PINHOLE":
+        f, cx, cy = params[:3]
+        return float(f), float(f), float(cx), float(cy)
+    if model in {"PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV"}:
+        fx, fy, cx, cy = params[:4]
+        return float(fx), float(fy), float(cx), float(cy)
+    if model in {"SIMPLE_RADIAL", "RADIAL", "SIMPLE_RADIAL_FISHEYE", "RADIAL_FISHEYE", "FOV"}:
+        f, cx, cy = params[:3]
+        return float(f), float(f), float(cx), float(cy)
+    raise ValueError(f"Unsupported camera model for depth-reference manifest: {model}")
+
+
+def _camera_to_world_from_colmap(qvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
+    rot_w2c = _qvec_to_rotmat(qvec)
+    trans_w2c = np.asarray(tvec, dtype=np.float64)
+    c2w = np.eye(4, dtype=np.float64)
+    c2w[:3, :3] = rot_w2c.T
+    c2w[:3, 3] = -rot_w2c.T @ trans_w2c
+    return c2w
+
+
+def _build_probe_view_manifest_from_colmap_sparse(
+    *,
+    source_path: Path,
+    resolution_arg: int,
+    test_list: Path,
+    scene_name: str,
+    requested_test_lookup: set[str],
+) -> Dict[str, Any] | None:
+    sparse_dir = source_path / "sparse"
+    cameras_bin = sparse_dir / "cameras.bin"
+    images_bin = sparse_dir / "images.bin"
+    if not cameras_bin.exists() or not images_bin.exists():
+        return None
+    cameras = _read_colmap_cameras_binary(cameras_bin)
+    images = _read_colmap_images_binary(images_bin)
+    matched = []
+    for image in images.values():
+        name = str(image["name"])
+        if name in requested_test_lookup or Path(name).name in requested_test_lookup or Path(name).stem in requested_test_lookup:
+            matched.append(image)
+    if not matched:
+        raise RuntimeError(
+            f"No probe cameras matched {test_list}. "
+            f"Requested names under COLMAP sparse model {sparse_dir}."
+        )
+
+    views: List[Dict[str, Any]] = []
+    for idx, image in enumerate(sorted(matched, key=lambda item: str(item["name"]))):
+        camera = cameras[int(image["camera_id"])]
+        orig_w = int(camera["width"])
+        orig_h = int(camera["height"])
+        width, height = compute_scaled_resolution(orig_w, orig_h, resolution_arg=resolution_arg)
+        scale_x = float(width) / float(orig_w)
+        scale_y = float(height) / float(orig_h)
+        fx, fy, cx, cy = _camera_intrinsics_from_colmap(camera)
+        views.append(
+            {
+                "view_id": f"{idx:05d}",
+                "image_name": str(image["name"]),
+                "width": int(width),
+                "height": int(height),
+                "fx": float(fx * scale_x),
+                "fy": float(fy * scale_y),
+                "cx": float(cx * scale_x),
+                "cy": float(cy * scale_y),
+                "camera_to_world": _camera_to_world_from_colmap(image["qvec"], image["tvec"]).tolist(),
+            }
+        )
+    return {
+        "camera_manifest_type": "heldout_probe_camera_manifest_v1",
+        "camera_manifest_source": "colmap_sparse_binary",
+        "scene_name": str(scene_name),
+        "source_path": str(source_path.resolve()),
+        "images_dir_name": "images",
+        "resolution_arg": int(resolution_arg),
+        "train_list": "",
+        "test_list": str(test_list.resolve()),
+        "views": views,
+    }
+
+
 def build_probe_view_manifest(
     *,
     source_path: Path,
@@ -72,6 +247,18 @@ def build_probe_view_manifest(
     requested_test_lookup = set(requested_test_names)
     requested_test_lookup.update(Path(name).name for name in requested_test_names)
     requested_test_lookup.update(Path(name).stem for name in requested_test_names)
+
+    colmap_manifest = _build_probe_view_manifest_from_colmap_sparse(
+        source_path=source_path,
+        resolution_arg=resolution_arg,
+        test_list=test_list,
+        scene_name=scene_name,
+        requested_test_lookup=requested_test_lookup,
+    )
+    if colmap_manifest is not None:
+        colmap_manifest["train_list"] = str(train_list.resolve())
+        colmap_manifest["images_dir_name"] = str(images_dir_name)
+        return colmap_manifest
 
     # The repo reader prints per-camera progress; suppress it so long dense runs can
     # safely continue even when stdout is redirected or detached.

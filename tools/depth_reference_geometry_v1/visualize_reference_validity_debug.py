@@ -44,6 +44,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--support_cmap", default="magma")
     ap.add_argument("--invalid_depth_rgb", default="0.94,0.94,0.94")
     ap.add_argument("--show_colorbars", action="store_true")
+    ap.add_argument(
+        "--image_interpolation",
+        default="auto",
+        help="Matplotlib imshow interpolation for visualization only, e.g. auto, nearest, bilinear, bicubic.",
+    )
     ap.add_argument("--dpi", type=int, default=180)
     return ap
 
@@ -165,6 +170,7 @@ def _render_per_view_diagnostic(
     depth_cmap: str,
     support_vmax: float,
     support_cmap: str,
+    image_interpolation: str,
 ) -> None:
     fig, axes = plt.subplots(1, 6, figsize=(20, 4), squeeze=False)
     row = axes[0]
@@ -177,7 +183,7 @@ def _render_per_view_diagnostic(
         (invalid_reason_rgb, "Invalid Reason"),
     ]
     for ax, (img, title) in zip(row, panels):
-        ax.imshow(img)
+        ax.imshow(img, interpolation=image_interpolation)
         ax.set_title(title)
         ax.axis("off")
 
@@ -211,6 +217,7 @@ def _render_contact_sheet(
     depth_cmap: str,
     support_vmax: float,
     support_cmap: str,
+    image_interpolation: str,
 ) -> None:
     nrows = len(rows_payload)
     fig, axes = plt.subplots(nrows, 6, figsize=(20, 3.2 * nrows), squeeze=False)
@@ -224,7 +231,7 @@ def _render_contact_sheet(
             (payload["invalid_reason_rgb"], "Invalid Reason"),
         ]
         for col_idx, (img, title) in enumerate(panels):
-            axes[row_idx, col_idx].imshow(img)
+            axes[row_idx, col_idx].imshow(img, interpolation=image_interpolation)
             axes[row_idx, col_idx].set_title(title)
             axes[row_idx, col_idx].axis("off")
 
@@ -340,6 +347,7 @@ def main() -> None:
             depth_cmap=str(args.depth_cmap),
             support_vmax=support_vmax,
             support_cmap=str(args.support_cmap),
+            image_interpolation=str(args.image_interpolation),
         )
 
         rows_payload.append(
@@ -394,6 +402,7 @@ def main() -> None:
         depth_cmap=str(args.depth_cmap),
         support_vmax=support_vmax,
         support_cmap=str(args.support_cmap),
+        image_interpolation=str(args.image_interpolation),
     )
 
     _write_csv(

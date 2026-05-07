@@ -49,6 +49,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--invalid_depth_rgb", default="0.0,0.0,0.0")
     ap.add_argument("--show_depth_colorbar", action="store_true")
     ap.add_argument("--resize_gt_to_view", action="store_true")
+    ap.add_argument(
+        "--image_interpolation",
+        default="auto",
+        help="Matplotlib imshow interpolation for visualization only, e.g. auto, nearest, bilinear, bicubic.",
+    )
     ap.add_argument("--gt_title", default="GT")
     ap.add_argument("--reference_title", default="")
     ap.add_argument("--method_panel_layout", choices=["error_only", "depth_and_error"], default="error_only")
@@ -144,30 +149,31 @@ def _render_per_view_comparison(
     cmap_name: str,
     gt_title: str,
     reference_title: str,
+    image_interpolation: str,
 ) -> None:
     ncols = 2 + len(method_panels) if method_panel_layout == "error_only" else 2 + 2 * len(method_panels)
     fig, axes = plt.subplots(1, ncols, figsize=(3.15 * ncols, 3.6), squeeze=False)
     axes_row = axes[0]
-    axes_row[0].imshow(gt_rgb)
+    axes_row[0].imshow(gt_rgb, interpolation=image_interpolation)
     axes_row[0].set_title(f"{gt_title}\n{image_name}")
     axes_row[0].axis("off")
 
-    axes_row[1].imshow(depth_rgb)
+    axes_row[1].imshow(depth_rgb, interpolation=image_interpolation)
     axes_row[1].set_title(reference_title)
     axes_row[1].axis("off")
 
     if method_panel_layout == "error_only":
         for idx, panel in enumerate(method_panels, start=2):
-            axes_row[idx].imshow(panel["class_rgb"])
+            axes_row[idx].imshow(panel["class_rgb"], interpolation=image_interpolation)
             axes_row[idx].set_title(panel["label"])
             axes_row[idx].axis("off")
     else:
         col_idx = 2
         for panel in method_panels:
-            axes_row[col_idx].imshow(panel["depth_rgb"])
+            axes_row[col_idx].imshow(panel["depth_rgb"], interpolation=image_interpolation)
             axes_row[col_idx].set_title(f"{panel['label']}\nDepth")
             axes_row[col_idx].axis("off")
-            axes_row[col_idx + 1].imshow(panel["class_rgb"])
+            axes_row[col_idx + 1].imshow(panel["class_rgb"], interpolation=image_interpolation)
             axes_row[col_idx + 1].set_title(f"{panel['label']}\nError @ {threshold_m:.2f} m")
             axes_row[col_idx + 1].axis("off")
             col_idx += 2
@@ -204,32 +210,33 @@ def _render_scene_contact_sheet(
     cmap_name: str,
     gt_title: str,
     reference_title: str,
+    image_interpolation: str,
 ) -> None:
     nrows = len(rows_payload)
     ncols = 2 + len(method_labels) if method_panel_layout == "error_only" else 2 + 2 * len(method_labels)
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.0 * ncols, 2.7 * nrows), squeeze=False)
 
     for row_idx, payload in enumerate(rows_payload):
-        axes[row_idx, 0].imshow(payload["gt_rgb"])
+        axes[row_idx, 0].imshow(payload["gt_rgb"], interpolation=image_interpolation)
         axes[row_idx, 0].set_title(f"{gt_title}\n{payload['image_name']}")
         axes[row_idx, 0].axis("off")
 
-        axes[row_idx, 1].imshow(payload["depth_rgb"])
+        axes[row_idx, 1].imshow(payload["depth_rgb"], interpolation=image_interpolation)
         axes[row_idx, 1].set_title(reference_title)
         axes[row_idx, 1].axis("off")
 
         if method_panel_layout == "error_only":
             for col_idx, method_label in enumerate(method_labels, start=2):
-                axes[row_idx, col_idx].imshow(payload["method_panels"][method_label]["class_rgb"])
+                axes[row_idx, col_idx].imshow(payload["method_panels"][method_label]["class_rgb"], interpolation=image_interpolation)
                 axes[row_idx, col_idx].set_title(method_label)
                 axes[row_idx, col_idx].axis("off")
         else:
             col_idx = 2
             for method_label in method_labels:
-                axes[row_idx, col_idx].imshow(payload["method_panels"][method_label]["depth_rgb"])
+                axes[row_idx, col_idx].imshow(payload["method_panels"][method_label]["depth_rgb"], interpolation=image_interpolation)
                 axes[row_idx, col_idx].set_title(f"{method_label}\nDepth")
                 axes[row_idx, col_idx].axis("off")
-                axes[row_idx, col_idx + 1].imshow(payload["method_panels"][method_label]["class_rgb"])
+                axes[row_idx, col_idx + 1].imshow(payload["method_panels"][method_label]["class_rgb"], interpolation=image_interpolation)
                 axes[row_idx, col_idx + 1].set_title(f"{method_label}\nError")
                 axes[row_idx, col_idx + 1].axis("off")
                 col_idx += 2
@@ -417,6 +424,7 @@ def main() -> None:
             cmap_name=str(args.depth_cmap),
             gt_title=str(args.gt_title),
             reference_title=reference_title,
+            image_interpolation=str(args.image_interpolation),
         )
 
         rows_payload.append(
@@ -452,6 +460,7 @@ def main() -> None:
         cmap_name=str(args.depth_cmap),
         gt_title=str(args.gt_title),
         reference_title=reference_title,
+        image_interpolation=str(args.image_interpolation),
     )
 
     _write_csv(
