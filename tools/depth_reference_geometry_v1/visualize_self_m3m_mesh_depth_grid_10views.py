@@ -13,6 +13,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
 import numpy as np
 from PIL import Image
 
@@ -400,10 +401,17 @@ def visualize(args: argparse.Namespace) -> None:
         for depth, valid, error in zip(method_depths, method_valids, method_errors):
             panels.append(_depth_to_rgb(depth, valid, float(depth_vmin), float(depth_vmax)))
             panels.append(_error_to_rgb(error, valid))
-        rows.append({"image_name": image_name, "panels": panels})
+        rows.append(
+            {
+                "image_name": image_name,
+                "panels": panels,
+                "depth_vmin": float(depth_vmin),
+                "depth_vmax": float(depth_vmax),
+            }
+        )
 
     fig_w = 24.0
-    fig_h = max(10.0, 1.28 * len(rows))
+    fig_h = max(11.1, 1.28 * len(rows) + 0.9)
     fig, axes = plt.subplots(len(rows), 12, figsize=(fig_w, fig_h), dpi=200)
     col_titles = ["RGB", "Mesh"]
     for method in methods:
@@ -418,9 +426,51 @@ def visualize(args: argparse.Namespace) -> None:
                 ax.set_title(col_titles[c_idx], fontsize=8)
             if c_idx == 0:
                 ax.set_ylabel(Path(row["image_name"]).stem.split("_")[-2], fontsize=7)
-    fig.subplots_adjust(wspace=0.02, hspace=0.04, left=0.025, right=0.995, top=0.965, bottom=0.01)
-    png_path = out_dir / "depth_visual_grid_10views_core5.png"
-    pdf_path = out_dir / "depth_visual_grid_10views_core5.pdf"
+            if c_idx == 1:
+                ax.text(
+                    0.02,
+                    0.96,
+                    f"{row['depth_vmin']:.2f}-{row['depth_vmax']:.2f} m",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=5.5,
+                    color="white",
+                    bbox={"facecolor": "black", "alpha": 0.55, "pad": 1.2, "edgecolor": "none"},
+                )
+    fig.subplots_adjust(wspace=0.02, hspace=0.04, left=0.025, right=0.995, top=0.94, bottom=0.135)
+    depth_cax = fig.add_axes([0.18, 0.065, 0.28, 0.018])
+    depth_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=0.0, vmax=1.0), cmap="viridis")
+    depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
+    depth_cb.set_ticks([0.0, 1.0])
+    depth_cb.set_ticklabels(["near", "far"])
+    depth_cb.ax.tick_params(labelsize=7)
+    depth_cb.set_label(
+        "Depth color: near to far. Per-row 2-98% range is printed on Mesh.",
+        fontsize=7,
+    )
+
+    err_cax = fig.add_axes([0.57, 0.065, 0.28, 0.018])
+    err_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=-0.20, vmax=0.20), cmap="coolwarm")
+    err_cb = fig.colorbar(err_sm, cax=err_cax, orientation="horizontal")
+    err_cb.set_ticks([-0.20, -0.10, 0.0, 0.10, 0.20])
+    err_cb.set_ticklabels(["-20%", "-10%", "0", "+10%", "+20%"])
+    err_cb.ax.tick_params(labelsize=7)
+    err_cb.set_label(
+        "Relative error: blue = closer/front, red = farther/behind.",
+        fontsize=7,
+    )
+
+    fig.text(
+        0.5,
+        0.026,
+        "Error = (D_method - D_mesh) / D_mesh; maps are clipped to +/-20%. Black pixels are invalid or outside mesh/method support.",
+        ha="center",
+        va="center",
+        fontsize=7,
+    )
+    png_path = out_dir / "depth_visual_grid_10views_core5_with_legend.png"
+    pdf_path = out_dir / "depth_visual_grid_10views_core5_with_legend.pdf"
     fig.savefig(png_path)
     fig.savefig(pdf_path)
     plt.close(fig)
@@ -441,6 +491,10 @@ def visualize(args: argparse.Namespace) -> None:
             "valid_mask": "mesh_valid & method_valid & D_mesh > relative_depth_min",
             "depth_colormap": "viridis per-view 2-98 percentile over mesh and all methods",
             "error_colormap": "coolwarm fixed [-0.20, +0.20]",
+            "legend": {
+                "depth": "Viridis, row-normalized to per-view 2-98 percentile; numeric depth range printed on Mesh panel.",
+                "relative_error": "Coolwarm fixed to [-0.20,+0.20]; blue means method depth is closer than mesh, red means farther, black means invalid.",
+            },
             "outputs": {
                 "png": str(png_path),
                 "pdf": str(pdf_path),
