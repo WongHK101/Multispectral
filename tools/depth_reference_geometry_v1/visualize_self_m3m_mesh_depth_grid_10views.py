@@ -42,6 +42,8 @@ METHOD_DISPLAY = {
     "UMGS-I": "UMGS-I",
 }
 
+DEFAULT_BANDS = ("RGB", "G", "R", "RE", "NIR")
+
 
 def _frame_number(image_name: str) -> int | None:
     match = re.search(r"_(\d{4})_", str(image_name))
@@ -312,37 +314,29 @@ def _error_to_rgb(error: np.ndarray, valid: np.ndarray, vmin: float = -0.20, vma
     return rgb
 
 
-def visualize(args: argparse.Namespace) -> None:
-    out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ref_manifest_path = Path(args.reference_manifest).resolve()
-    ref_manifest = load_json(ref_manifest_path)
+def _placeholder_panel(height: int, width: int) -> np.ndarray:
+    panel = np.zeros((height, width, 3), dtype=np.uint8)
+    panel[:, :, :] = 10
+    return panel
+
+
+def _render_single_band_grid(
+    *,
+    out_dir: Path,
+    ref_manifest_path: Path,
+    ref_manifest: Dict[str, Any],
+    methods: Sequence[Dict[str, Any]],
+    rgb_image_dir: Path,
+    relative_depth_min: float,
+    grid_prefix: str,
+    stats_filename: str,
+    manifest_filename: str,
+    wspace: float,
+    hspace: float,
+    band: str,
+    mms_rgb_substitute_band: str,
+) -> Dict[str, Any]:
     ref_root = ref_manifest_path.parent
-    method_specs: List[Tuple[str, Path]] = []
-    for spec in args.method_bundle:
-        if "=" not in spec:
-            raise ValueError(f"--method_bundle must be NAME=PATH, got {spec!r}")
-        name, path = spec.split("=", 1)
-        method_specs.append((name, Path(path).resolve()))
-    if len(method_specs) != 5:
-        raise ValueError(f"Expected exactly 5 method bundles, got {len(method_specs)}")
-
-    methods: List[Dict[str, Any]] = []
-    for name, bundle_root in method_specs:
-        split_manifest = load_json(bundle_root / "split_manifest.json")
-        adapter_manifest = load_json(bundle_root / "adapter_manifest.json")
-        methods.append(
-            {
-                "name": name,
-                "display": METHOD_DISPLAY.get(name, name),
-                "root": bundle_root,
-                "split_manifest": split_manifest,
-                "adapter_manifest": adapter_manifest,
-                "views_by_name": {str(v["image_name"]): v for v in split_manifest["views"]},
-            }
-        )
-
-    rgb_image_dir = Path(args.rgb_image_dir).resolve()
     rows = []
     stats_rows: List[Dict[str, Any]] = []
     for ref_view in ref_manifest["views"]:
@@ -355,7 +349,38 @@ def visualize(args: argparse.Namespace) -> None:
         method_depths: List[np.ndarray] = []
         method_valids: List[np.ndarray] = []
         method_errors: List[np.ndarray] = []
+        method_depth_annotations: List[str | None] = []
+        method_error_annotations: List[str | None] = []
+
         for method in methods:
+            if not method["available"]:
+                model_depth = np.full(ref_depth.shape, np.nan, dtype=np.float64)
+                valid = np.zeros(ref_depth.shape, dtype=bool)
+                error = np.full(ref_depth.shape, np.nan, dtype=np.float64)
+                method_depths.append(model_depth)
+                method_valids.append(valid)
+                method_errors.append(error)
+                method_depth_annotations.append("NO MODEL")
+                method_error_annotations.append("NO DATA")
+                stats_rows.append(
+                    {
+                        "band": band,
+                        "image_name": image_name,
+                        "method": method["name"],
+                        "method_source": method.get("source_tag", ""),
+                        "available": False,
+                        "missing_reason": method.get("missing_reason", "missing_model_bundle"),
+                        "valid_pixels": 0,
+                        "ref_valid_pixels": int(np.count_nonzero(ref_valid)),
+                        "valid_ratio_on_ref": 0.0,
+                        "AbsRel": math.nan,
+                        "Agree@1%": 0.0,
+                        "Agree@5%": 0.0,
+                        "Agree@10%": 0.0,
+                    }
+                )
+                continue
+
             model_view = method["views_by_name"].get(image_name)
             if model_view is None:
                 raise ValueError(f"{method['name']} bundle is missing {image_name}")
@@ -369,17 +394,23 @@ def visualize(args: argparse.Namespace) -> None:
                 & np.isfinite(opacity)
                 & (opacity >= float(rule.get("opacity_threshold", 0.5)))
             )
-            valid = ref_valid & model_valid & np.isfinite(ref_depth) & (ref_depth > float(args.relative_depth_min))
+            valid = ref_valid & model_valid & np.isfinite(ref_depth) & (ref_depth > float(relative_depth_min))
             error = np.full(ref_depth.shape, np.nan, dtype=np.float64)
             error[valid] = (model_depth[valid] - ref_depth[valid]) / ref_depth[valid]
             method_depths.append(model_depth)
             method_valids.append(valid)
             method_errors.append(error)
+            method_depth_annotations.append(None)
+            method_error_annotations.append(None)
             absrel = float(np.nanmean(np.abs(error[valid]))) if np.any(valid) else math.nan
             stats_rows.append(
                 {
+                    "band": band,
                     "image_name": image_name,
                     "method": method["name"],
+                    "method_source": method.get("source_tag", ""),
+                    "available": True,
+                    "missing_reason": "",
                     "valid_pixels": int(np.count_nonzero(valid)),
                     "ref_valid_pixels": int(np.count_nonzero(ref_valid)),
                     "valid_ratio_on_ref": float(np.count_nonzero(valid)) / float(max(1, np.count_nonzero(ref_valid))),
@@ -389,22 +420,44 @@ def visualize(args: argparse.Namespace) -> None:
                     "Agree@10%": float(np.count_nonzero(valid & (np.abs(error) <= 0.10))) / float(max(1, np.count_nonzero(ref_valid))),
                 }
             )
+
         depth_values = [ref_depth[ref_valid & np.isfinite(ref_depth)]]
         for depth, valid in zip(method_depths, method_valids):
             depth_values.append(depth[valid & np.isfinite(depth)])
-        concat = np.concatenate([x.reshape(-1) for x in depth_values if x.size > 0])
-        if concat.size == 0:
+        usable_depth_arrays = [x.reshape(-1) for x in depth_values if x.size > 0]
+        if not usable_depth_arrays:
             depth_vmin, depth_vmax = 0.0, 1.0
         else:
+            concat = np.concatenate(usable_depth_arrays)
             depth_vmin, depth_vmax = np.percentile(concat, [2.0, 98.0])
+
         panels = [rgb, _depth_to_rgb(ref_depth, ref_valid, float(depth_vmin), float(depth_vmax))]
-        for depth, valid, error in zip(method_depths, method_valids, method_errors):
-            panels.append(_depth_to_rgb(depth, valid, float(depth_vmin), float(depth_vmax)))
-            panels.append(_error_to_rgb(error, valid))
+        panel_annotations: List[str | None] = [None, None]
+        for depth, valid, error, depth_note, err_note in zip(
+            method_depths,
+            method_valids,
+            method_errors,
+            method_depth_annotations,
+            method_error_annotations,
+        ):
+            if depth_note is not None:
+                panels.append(_placeholder_panel(h, w))
+                panel_annotations.append(depth_note)
+            else:
+                panels.append(_depth_to_rgb(depth, valid, float(depth_vmin), float(depth_vmax)))
+                panel_annotations.append(None)
+            if err_note is not None:
+                panels.append(_placeholder_panel(h, w))
+                panel_annotations.append(err_note)
+            else:
+                panels.append(_error_to_rgb(error, valid))
+                panel_annotations.append(None)
+
         rows.append(
             {
                 "image_name": image_name,
                 "panels": panels,
+                "panel_annotations": panel_annotations,
                 "depth_vmin": float(depth_vmin),
                 "depth_vmax": float(depth_vmax),
             }
@@ -417,11 +470,23 @@ def visualize(args: argparse.Namespace) -> None:
     for method in methods:
         col_titles.extend([method["display"], "Rel. err"])
     for r_idx, row in enumerate(rows):
-        for c_idx, panel in enumerate(row["panels"]):
+        for c_idx, (panel, note) in enumerate(zip(row["panels"], row["panel_annotations"])):
             ax = axes[r_idx, c_idx] if len(rows) > 1 else axes[c_idx]
             ax.imshow(panel)
             ax.set_xticks([])
             ax.set_yticks([])
+            if note:
+                ax.text(
+                    0.5,
+                    0.5,
+                    note,
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color="white",
+                    bbox={"facecolor": "black", "alpha": 0.6, "pad": 1.0, "edgecolor": "none"},
+                )
             if r_idx == 0:
                 ax.set_title(col_titles[c_idx], fontsize=8)
             if c_idx == 0:
@@ -438,7 +503,7 @@ def visualize(args: argparse.Namespace) -> None:
                     color="white",
                     bbox={"facecolor": "black", "alpha": 0.55, "pad": 1.2, "edgecolor": "none"},
                 )
-    fig.subplots_adjust(wspace=0.02, hspace=0.04, left=0.025, right=0.995, top=0.94, bottom=0.135)
+    fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=0.135)
     depth_cax = fig.add_axes([0.18, 0.065, 0.28, 0.018])
     depth_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=0.0, vmax=1.0), cmap="viridis")
     depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
@@ -469,40 +534,245 @@ def visualize(args: argparse.Namespace) -> None:
         va="center",
         fontsize=7,
     )
-    png_path = out_dir / "depth_visual_grid_10views_core5_with_legend.png"
-    pdf_path = out_dir / "depth_visual_grid_10views_core5_with_legend.pdf"
+
+    png_path = out_dir / f"{grid_prefix}.png"
+    pdf_path = out_dir / f"{grid_prefix}.pdf"
     fig.savefig(png_path)
     fig.savefig(pdf_path)
     plt.close(fig)
 
-    stats_path = out_dir / "depth_visual_stats.csv"
+    stats_path = out_dir / stats_filename
     with stats_path.open("w", encoding="utf-8", newline="") as f:
-        fieldnames = ["image_name", "method", "valid_pixels", "ref_valid_pixels", "valid_ratio_on_ref", "AbsRel", "Agree@1%", "Agree@5%", "Agree@10%"]
+        fieldnames = [
+            "band",
+            "image_name",
+            "method",
+            "method_source",
+            "available",
+            "missing_reason",
+            "valid_pixels",
+            "ref_valid_pixels",
+            "valid_ratio_on_ref",
+            "AbsRel",
+            "Agree@1%",
+            "Agree@5%",
+            "Agree@10%",
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(stats_rows)
-    save_json(
-        out_dir / "depth_visual_manifest.json",
-        {
-            "reference_manifest": str(ref_manifest_path),
-            "rgb_image_dir": str(rgb_image_dir),
-            "method_bundles": [{"method": name, "bundle_root": str(path)} for name, path in method_specs],
-            "error_definition": "(D_method - D_mesh) / D_mesh",
-            "valid_mask": "mesh_valid & method_valid & D_mesh > relative_depth_min",
-            "depth_colormap": "viridis per-view 2-98 percentile over mesh and all methods",
-            "error_colormap": "coolwarm fixed [-0.20, +0.20]",
-            "legend": {
-                "depth": "Viridis, row-normalized to per-view 2-98 percentile; numeric depth range printed on Mesh panel.",
-                "relative_error": "Coolwarm fixed to [-0.20,+0.20]; blue means method depth is closer than mesh, red means farther, black means invalid.",
-            },
-            "outputs": {
-                "png": str(png_path),
-                "pdf": str(pdf_path),
-                "stats_csv": str(stats_path),
-            },
+
+    method_bundle_records = []
+    for method in methods:
+        method_bundle_records.append(
+            {
+                "method": method["name"],
+                "display": method["display"],
+                "available": method["available"],
+                "bundle_root": str(method["root"]) if method["root"] is not None else "",
+                "source_tag": method.get("source_tag", ""),
+                "missing_reason": method.get("missing_reason", ""),
+            }
+        )
+    manifest_payload = {
+        "band": band,
+        "reference_manifest": str(ref_manifest_path),
+        "rgb_image_dir": str(rgb_image_dir),
+        "method_bundles": method_bundle_records,
+        "mms_rgb_substitute_band": mms_rgb_substitute_band if band == "RGB" else "",
+        "error_definition": "(D_method - D_mesh) / D_mesh",
+        "valid_mask": "mesh_valid & method_valid & D_mesh > relative_depth_min",
+        "depth_colormap": "viridis per-view 2-98 percentile over mesh and all methods",
+        "error_colormap": "coolwarm fixed [-0.20, +0.20]",
+        "figure_layout": {
+            "columns": 12,
+            "wspace": float(wspace),
+            "hspace": float(hspace),
         },
+        "legend": {
+            "depth": "Viridis, row-normalized to per-view 2-98 percentile; numeric depth range printed on Mesh panel.",
+            "relative_error": "Coolwarm fixed to [-0.20,+0.20]; blue means method depth is closer than mesh, red means farther, black means invalid.",
+        },
+        "outputs": {
+            "png": str(png_path),
+            "pdf": str(pdf_path),
+            "stats_csv": str(stats_path),
+        },
+    }
+    manifest_path = out_dir / manifest_filename
+    save_json(manifest_path, manifest_payload)
+    print(f"VISUAL_GRID[{band}] {png_path}")
+    return {
+        "band": band,
+        "manifest_path": str(manifest_path),
+        "png": str(png_path),
+        "pdf": str(pdf_path),
+        "stats_csv": str(stats_path),
+        "method_bundles": method_bundle_records,
+    }
+
+
+def _parse_method_specs(method_specs: Sequence[str]) -> List[Tuple[str, Path]]:
+    parsed: List[Tuple[str, Path]] = []
+    for spec in method_specs:
+        if "=" not in spec:
+            raise ValueError(f"Expected NAME=PATH format, got {spec!r}")
+        name, path = spec.split("=", 1)
+        parsed.append((name.strip(), Path(path).resolve()))
+    return parsed
+
+
+def _resolve_bundle_root_for_band(
+    *,
+    method_name: str,
+    method_root: Path,
+    band: str,
+    mms_rgb_substitute_band: str,
+) -> Tuple[Path | None, str, str]:
+    # Supports both direct Model_X bundle roots and parent roots containing Model_* subdirs.
+    direct_split = method_root / "split_manifest.json"
+    direct_adapter = method_root / "adapter_manifest.json"
+    if direct_split.exists() and direct_adapter.exists():
+        return method_root, "explicit_bundle_root", ""
+
+    source_tag = f"Model_{band}"
+    if band == "RGB" and method_name in {"MMS retained-self", "MMS_retained-self"}:
+        substitute_band = str(mms_rgb_substitute_band).upper()
+        source_tag = f"MMS_{substitute_band}_as_RGB_substitute"
+        bundle_root = method_root / f"Model_{substitute_band}"
+    else:
+        bundle_root = method_root / f"Model_{band}"
+
+    if not bundle_root.exists():
+        return None, source_tag, f"missing_model_dir:{bundle_root}"
+    if not (bundle_root / "split_manifest.json").exists():
+        return None, source_tag, f"missing_split_manifest:{bundle_root / 'split_manifest.json'}"
+    if not (bundle_root / "adapter_manifest.json").exists():
+        return None, source_tag, f"missing_adapter_manifest:{bundle_root / 'adapter_manifest.json'}"
+    return bundle_root, source_tag, ""
+
+
+def _build_methods_for_band(
+    *,
+    method_specs: Sequence[Tuple[str, Path]],
+    band: str,
+    mms_rgb_substitute_band: str,
+) -> List[Dict[str, Any]]:
+    methods: List[Dict[str, Any]] = []
+    for name, root in method_specs:
+        bundle_root, source_tag, missing_reason = _resolve_bundle_root_for_band(
+            method_name=name,
+            method_root=root,
+            band=band,
+            mms_rgb_substitute_band=mms_rgb_substitute_band,
+        )
+        if bundle_root is None:
+            methods.append(
+                {
+                    "name": name,
+                    "display": METHOD_DISPLAY.get(name, name),
+                    "root": None,
+                    "source_tag": source_tag,
+                    "available": False,
+                    "missing_reason": missing_reason,
+                }
+            )
+            continue
+        split_manifest = load_json(bundle_root / "split_manifest.json")
+        adapter_manifest = load_json(bundle_root / "adapter_manifest.json")
+        methods.append(
+            {
+                "name": name,
+                "display": METHOD_DISPLAY.get(name, name),
+                "root": bundle_root,
+                "source_tag": source_tag,
+                "split_manifest": split_manifest,
+                "adapter_manifest": adapter_manifest,
+                "views_by_name": {str(v["image_name"]): v for v in split_manifest["views"]},
+                "available": True,
+                "missing_reason": "",
+            }
+        )
+    return methods
+
+
+def visualize(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ref_manifest_path = Path(args.reference_manifest).resolve()
+    ref_manifest = load_json(ref_manifest_path)
+    method_specs = _parse_method_specs(args.method_bundle)
+    methods = _build_methods_for_band(
+        method_specs=method_specs,
+        band=str(args.band).upper(),
+        mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
     )
-    print(f"VISUAL_GRID {png_path}")
+    if len(methods) != 5:
+        raise ValueError(f"Expected exactly 5 methods, got {len(methods)}")
+    _render_single_band_grid(
+        out_dir=out_dir,
+        ref_manifest_path=ref_manifest_path,
+        ref_manifest=ref_manifest,
+        methods=methods,
+        rgb_image_dir=Path(args.rgb_image_dir).resolve(),
+        relative_depth_min=float(args.relative_depth_min),
+        grid_prefix=str(args.grid_prefix),
+        stats_filename=str(args.stats_filename),
+        manifest_filename=str(args.manifest_filename),
+        wspace=float(args.wspace),
+        hspace=float(args.hspace),
+        band=str(args.band).upper(),
+        mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+    )
+
+
+def visualize_multiband(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ref_manifest_path = Path(args.reference_manifest).resolve()
+    ref_manifest = load_json(ref_manifest_path)
+    bands = [item.strip().upper() for item in str(args.bands).split(",") if item.strip()]
+    if not bands:
+        raise ValueError("No bands provided for --bands")
+    method_specs = _parse_method_specs(args.method_root)
+    if len(method_specs) != 5:
+        raise ValueError(f"Expected exactly 5 method roots via --method_root, got {len(method_specs)}")
+
+    all_manifest_records: Dict[str, Any] = {
+        "reference_manifest": str(ref_manifest_path),
+        "rgb_image_dir": str(Path(args.rgb_image_dir).resolve()),
+        "bands": bands,
+        "relative_depth_min": float(args.relative_depth_min),
+        "figure_layout": {"columns": 12, "wspace": float(args.wspace), "hspace": float(args.hspace)},
+        "mms_rgb_substitute_band": str(args.mms_rgb_substitute_band).upper(),
+        "per_band_outputs": {},
+    }
+
+    for band in bands:
+        methods = _build_methods_for_band(
+            method_specs=method_specs,
+            band=band,
+            mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+        )
+        result = _render_single_band_grid(
+            out_dir=out_dir,
+            ref_manifest_path=ref_manifest_path,
+            ref_manifest=ref_manifest,
+            methods=methods,
+            rgb_image_dir=Path(args.rgb_image_dir).resolve(),
+            relative_depth_min=float(args.relative_depth_min),
+            grid_prefix=f"depth_visual_grid_10views_core5_{band}",
+            stats_filename=f"depth_visual_stats_{band}.csv",
+            manifest_filename=f"depth_visual_manifest_{band}.json",
+            wspace=float(args.wspace),
+            hspace=float(args.hspace),
+            band=band,
+            mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+        )
+        all_manifest_records["per_band_outputs"][band] = result
+
+    save_json(out_dir / "depth_visual_manifest_all_bands.json", all_manifest_records)
+    print(f"VISUAL_MULTI_BAND_MANIFEST {out_dir / 'depth_visual_manifest_all_bands.json'}")
 
 
 def _argparser() -> argparse.ArgumentParser:
@@ -530,7 +800,26 @@ def _argparser() -> argparse.ArgumentParser:
     v.add_argument("--out_dir", required=True)
     v.add_argument("--method_bundle", action="append", required=True)
     v.add_argument("--relative_depth_min", type=float, default=1e-6)
+    v.add_argument("--band", default="G")
+    v.add_argument("--mms_rgb_substitute_band", default="D")
+    v.add_argument("--wspace", type=float, default=0.006)
+    v.add_argument("--hspace", type=float, default=0.025)
+    v.add_argument("--grid_prefix", default="depth_visual_grid_10views_core5_with_legend")
+    v.add_argument("--stats_filename", default="depth_visual_stats.csv")
+    v.add_argument("--manifest_filename", default="depth_visual_manifest.json")
     v.set_defaults(func=visualize)
+
+    vb = sub.add_parser("visualize_multiband")
+    vb.add_argument("--reference_manifest", required=True)
+    vb.add_argument("--rgb_image_dir", required=True)
+    vb.add_argument("--out_dir", required=True)
+    vb.add_argument("--method_root", action="append", required=True, help="NAME=ROOT where ROOT contains Model_<BAND> subdirs or direct bundle manifests")
+    vb.add_argument("--bands", default="RGB,G,R,RE,NIR")
+    vb.add_argument("--mms_rgb_substitute_band", default="D")
+    vb.add_argument("--relative_depth_min", type=float, default=1e-6)
+    vb.add_argument("--wspace", type=float, default=0.006)
+    vb.add_argument("--hspace", type=float, default=0.025)
+    vb.set_defaults(func=visualize_multiband)
     return parser
 
 
