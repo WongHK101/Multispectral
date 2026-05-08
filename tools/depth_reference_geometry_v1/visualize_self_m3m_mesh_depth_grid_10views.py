@@ -628,6 +628,7 @@ def _resolve_bundle_root_for_band(
     method_root: Path,
     band: str,
     mms_rgb_substitute_band: str,
+    shared_rgb_anchor_root: Path | None,
 ) -> Tuple[Path | None, str, str]:
     # Supports both direct Model_X bundle roots and parent roots containing Model_* subdirs.
     direct_split = method_root / "split_manifest.json"
@@ -640,6 +641,12 @@ def _resolve_bundle_root_for_band(
         substitute_band = str(mms_rgb_substitute_band).upper()
         source_tag = f"MMS_{substitute_band}_as_RGB_substitute"
         bundle_root = method_root / f"Model_{substitute_band}"
+    elif band == "RGB" and method_name in {"From-scratch", "Geometry-unfrozen", "UMGS-J"}:
+        if shared_rgb_anchor_root is not None:
+            bundle_root = shared_rgb_anchor_root / "Model_RGB"
+            source_tag = "UMGS-I_RGB_anchor_substitute"
+        else:
+            bundle_root = method_root / f"Model_{band}"
     else:
         bundle_root = method_root / f"Model_{band}"
 
@@ -657,6 +664,7 @@ def _build_methods_for_band(
     method_specs: Sequence[Tuple[str, Path]],
     band: str,
     mms_rgb_substitute_band: str,
+    shared_rgb_anchor_root: Path | None,
 ) -> List[Dict[str, Any]]:
     methods: List[Dict[str, Any]] = []
     for name, root in method_specs:
@@ -665,6 +673,7 @@ def _build_methods_for_band(
             method_root=root,
             band=band,
             mms_rgb_substitute_band=mms_rgb_substitute_band,
+            shared_rgb_anchor_root=shared_rgb_anchor_root,
         )
         if bundle_root is None:
             methods.append(
@@ -706,6 +715,9 @@ def visualize(args: argparse.Namespace) -> None:
         method_specs=method_specs,
         band=str(args.band).upper(),
         mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+        shared_rgb_anchor_root=Path(args.shared_rgb_anchor_root).resolve()
+        if str(args.shared_rgb_anchor_root).strip()
+        else None,
     )
     if len(methods) != 5:
         raise ValueError(f"Expected exactly 5 methods, got {len(methods)}")
@@ -753,6 +765,9 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             method_specs=method_specs,
             band=band,
             mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+            shared_rgb_anchor_root=Path(args.shared_rgb_anchor_root).resolve()
+            if str(args.shared_rgb_anchor_root).strip()
+            else None,
         )
         result = _render_single_band_grid(
             out_dir=out_dir,
@@ -802,6 +817,7 @@ def _argparser() -> argparse.ArgumentParser:
     v.add_argument("--relative_depth_min", type=float, default=1e-6)
     v.add_argument("--band", default="G")
     v.add_argument("--mms_rgb_substitute_band", default="D")
+    v.add_argument("--shared_rgb_anchor_root", default="")
     v.add_argument("--wspace", type=float, default=0.006)
     v.add_argument("--hspace", type=float, default=0.025)
     v.add_argument("--grid_prefix", default="depth_visual_grid_10views_core5_with_legend")
@@ -816,6 +832,7 @@ def _argparser() -> argparse.ArgumentParser:
     vb.add_argument("--method_root", action="append", required=True, help="NAME=ROOT where ROOT contains Model_<BAND> subdirs or direct bundle manifests")
     vb.add_argument("--bands", default="RGB,G,R,RE,NIR")
     vb.add_argument("--mms_rgb_substitute_band", default="D")
+    vb.add_argument("--shared_rgb_anchor_root", default="")
     vb.add_argument("--relative_depth_min", type=float, default=1e-6)
     vb.add_argument("--wspace", type=float, default=0.006)
     vb.add_argument("--hspace", type=float, default=0.025)
