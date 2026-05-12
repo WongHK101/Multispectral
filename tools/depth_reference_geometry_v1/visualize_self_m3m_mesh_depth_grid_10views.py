@@ -320,6 +320,38 @@ def _placeholder_panel(height: int, width: int) -> np.ndarray:
     return panel
 
 
+def _compute_reference_depth_ranges(
+    ref_manifest_path: Path,
+    ref_manifest: Dict[str, Any],
+    *,
+    q_low: float = 2.0,
+    q_high: float = 98.0,
+) -> Dict[str, Dict[str, Any]]:
+    ref_root = ref_manifest_path.parent
+    ranges: Dict[str, Dict[str, Any]] = {}
+    for ref_view in ref_manifest["views"]:
+        image_name = str(ref_view["image_name"])
+        ref_npz = _load_depth_npz(ref_root, ref_view)
+        ref_depth = np.asarray(ref_npz["depth"], dtype=np.float64)
+        ref_valid = np.asarray(ref_npz.get("valid_mask", np.isfinite(ref_depth) & (ref_depth > 0.0))).astype(bool)
+        values = ref_depth[ref_valid & np.isfinite(ref_depth)]
+        if values.size == 0:
+            depth_vmin, depth_vmax = 0.0, 1.0
+        else:
+            depth_vmin, depth_vmax = np.percentile(values, [q_low, q_high])
+            if float(depth_vmax) <= float(depth_vmin):
+                depth_vmax = float(depth_vmin) + 1e-6
+        ranges[image_name] = {
+            "depth_vmin": float(depth_vmin),
+            "depth_vmax": float(depth_vmax),
+            "source": "reference_mesh_depth",
+            "percentile_low": float(q_low),
+            "percentile_high": float(q_high),
+            "valid_pixels": int(values.size),
+        }
+    return ranges
+
+
 def _render_single_band_grid(
     *,
     out_dir: Path,
@@ -335,6 +367,8 @@ def _render_single_band_grid(
     hspace: float,
     band: str,
     mms_rgb_substitute_band: str,
+    depth_range_source: str,
+    shared_depth_ranges: Dict[str, Dict[str, Any]] | None,
 ) -> Dict[str, Any]:
     ref_root = ref_manifest_path.parent
     rows = []
@@ -421,15 +455,23 @@ def _render_single_band_grid(
                 }
             )
 
-        depth_values = [ref_depth[ref_valid & np.isfinite(ref_depth)]]
-        for depth, valid in zip(method_depths, method_valids):
-            depth_values.append(depth[valid & np.isfinite(depth)])
-        usable_depth_arrays = [x.reshape(-1) for x in depth_values if x.size > 0]
-        if not usable_depth_arrays:
-            depth_vmin, depth_vmax = 0.0, 1.0
+        if shared_depth_ranges is not None and image_name in shared_depth_ranges:
+            depth_range_record = shared_depth_ranges[image_name]
+            depth_vmin = float(depth_range_record["depth_vmin"])
+            depth_vmax = float(depth_range_record["depth_vmax"])
+            depth_range_note = str(depth_range_record.get("source", depth_range_source))
         else:
-            concat = np.concatenate(usable_depth_arrays)
-            depth_vmin, depth_vmax = np.percentile(concat, [2.0, 98.0])
+            depth_values = [ref_depth[ref_valid & np.isfinite(ref_depth)]]
+            if depth_range_source == "mesh_and_methods":
+                for depth, valid in zip(method_depths, method_valids):
+                    depth_values.append(depth[valid & np.isfinite(depth)])
+            usable_depth_arrays = [x.reshape(-1) for x in depth_values if x.size > 0]
+            if not usable_depth_arrays:
+                depth_vmin, depth_vmax = 0.0, 1.0
+            else:
+                concat = np.concatenate(usable_depth_arrays)
+                depth_vmin, depth_vmax = np.percentile(concat, [2.0, 98.0])
+            depth_range_note = depth_range_source
 
         panels = [rgb, _depth_to_rgb(ref_depth, ref_valid, float(depth_vmin), float(depth_vmax))]
         panel_annotations: List[str | None] = [None, None]
@@ -460,6 +502,7 @@ def _render_single_band_grid(
                 "panel_annotations": panel_annotations,
                 "depth_vmin": float(depth_vmin),
                 "depth_vmax": float(depth_vmax),
+                "depth_range_source": depth_range_note,
             }
         )
 
@@ -582,7 +625,13 @@ def _render_single_band_grid(
         "mms_rgb_substitute_band": mms_rgb_substitute_band if band == "RGB" else "",
         "error_definition": "(D_method - D_mesh) / D_mesh",
         "valid_mask": "mesh_valid & method_valid & D_mesh > relative_depth_min",
-        "depth_colormap": "viridis per-view 2-98 percentile over mesh and all methods",
+        "depth_colormap": (
+            "viridis per-view 2-98 percentile over reference mesh depth"
+            if depth_range_source == "reference"
+            else "viridis per-view 2-98 percentile over mesh and all methods"
+        ),
+        "depth_range_source": depth_range_source,
+        "shared_depth_ranges": shared_depth_ranges or {},
         "error_colormap": "coolwarm fixed [-0.20, +0.20]",
         "figure_layout": {
             "columns": 12,
@@ -590,7 +639,11 @@ def _render_single_band_grid(
             "hspace": float(hspace),
         },
         "legend": {
-            "depth": "Viridis, row-normalized to per-view 2-98 percentile; numeric depth range printed on Mesh panel.",
+            "depth": (
+                "Viridis, row-normalized to per-view reference-mesh 2-98 percentile; numeric depth range printed on Mesh panel."
+                if depth_range_source == "reference"
+                else "Viridis, row-normalized to per-view mesh+method 2-98 percentile; numeric depth range printed on Mesh panel."
+            ),
             "relative_error": "Coolwarm fixed to [-0.20,+0.20]; blue means method depth is closer than mesh, red means farther, black means invalid.",
         },
         "outputs": {
@@ -735,6 +788,10 @@ def visualize(args: argparse.Namespace) -> None:
         hspace=float(args.hspace),
         band=str(args.band).upper(),
         mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+        depth_range_source=str(args.depth_range_source),
+        shared_depth_ranges=_compute_reference_depth_ranges(ref_manifest_path, ref_manifest)
+        if str(args.depth_range_source) == "reference"
+        else None,
     )
 
 
@@ -757,8 +814,16 @@ def visualize_multiband(args: argparse.Namespace) -> None:
         "relative_depth_min": float(args.relative_depth_min),
         "figure_layout": {"columns": 12, "wspace": float(args.wspace), "hspace": float(args.hspace)},
         "mms_rgb_substitute_band": str(args.mms_rgb_substitute_band).upper(),
+        "depth_range_source": str(args.depth_range_source),
         "per_band_outputs": {},
     }
+    shared_depth_ranges = (
+        _compute_reference_depth_ranges(ref_manifest_path, ref_manifest)
+        if str(args.depth_range_source) == "reference"
+        else None
+    )
+    if shared_depth_ranges is not None:
+        all_manifest_records["shared_depth_ranges"] = shared_depth_ranges
 
     for band in bands:
         methods = _build_methods_for_band(
@@ -783,6 +848,8 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             hspace=float(args.hspace),
             band=band,
             mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
+            depth_range_source=str(args.depth_range_source),
+            shared_depth_ranges=shared_depth_ranges,
         )
         all_manifest_records["per_band_outputs"][band] = result
 
@@ -818,6 +885,7 @@ def _argparser() -> argparse.ArgumentParser:
     v.add_argument("--band", default="G")
     v.add_argument("--mms_rgb_substitute_band", default="D")
     v.add_argument("--shared_rgb_anchor_root", default="")
+    v.add_argument("--depth_range_source", default="reference", choices=("reference", "mesh_and_methods"))
     v.add_argument("--wspace", type=float, default=0.006)
     v.add_argument("--hspace", type=float, default=0.025)
     v.add_argument("--grid_prefix", default="depth_visual_grid_10views_core5_with_legend")
@@ -833,6 +901,7 @@ def _argparser() -> argparse.ArgumentParser:
     vb.add_argument("--bands", default="RGB,G,R,RE,NIR")
     vb.add_argument("--mms_rgb_substitute_band", default="D")
     vb.add_argument("--shared_rgb_anchor_root", default="")
+    vb.add_argument("--depth_range_source", default="reference", choices=("reference", "mesh_and_methods"))
     vb.add_argument("--relative_depth_min", type=float, default=1e-6)
     vb.add_argument("--wspace", type=float, default=0.006)
     vb.add_argument("--hspace", type=float, default=0.025)
