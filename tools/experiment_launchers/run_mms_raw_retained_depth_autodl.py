@@ -31,7 +31,7 @@ MMS_SRC = Path("/root/autodl-tmp/src/MS-Splatting")
 COLMAP = Path("/root/autodl-tmp/opt/colmap-cuda-3.9.1/bin/colmap")
 RUN_BASE = Path("/root/autodl-tmp/runs/paper_autodl_full_20260429")
 RAW_ATTEMPT = RUN_BASE / "mms_raw_representative_attempt_20260512"
-RUN = RUN_BASE / "mms_raw_retained_depth_20260512"
+RUN = Path(os.environ.get("UMGS_MMS_RETAINED_DEPTH_RUN", str(RUN_BASE / "mms_raw_retained_depth_20260512")))
 LOGS = RUN / "logs"
 STATUS = RUN / "status"
 DEPTH = RUN / "depth"
@@ -347,8 +347,27 @@ def d_index_from_path(file_path: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
-def write_native_d_cameras(scene: Scene, preprocessed: Path, out_path: Path) -> Path:
+def _load_dataparser_transform(path: Path) -> tuple[np.ndarray, float, str]:
+    if not path.exists():
+        return np.eye(4, dtype=np.float64), 1.0, "missing_identity_fallback"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = np.asarray(payload.get("transform"), dtype=np.float64)
+    if raw.shape != (3, 4):
+        raise ValueError(f"Expected 3x4 dataparser transform in {path}, got {raw.shape}")
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :4] = raw
+    return transform, float(payload.get("scale", 1.0)), str(path)
+
+
+def write_native_d_cameras(scene: Scene, preprocessed: Path, out_path: Path, dataparser_transform_path: Path | None = None) -> Path:
     transforms = json.loads((preprocessed / "transforms.json").read_text(encoding="utf-8"))
+    dataparser_transform, dataparser_scale, dataparser_source = _load_dataparser_transform(
+        dataparser_transform_path if dataparser_transform_path is not None else Path("__missing_dataparser_transform__")
+    )
+    # Nerfstudio stores poses with OpenGL camera axes and applies a dataparser
+    # world transform before training. The learned Gaussian means live in that
+    # transformed world, while the depth adapter expects 3DGS-style camera axes.
+    opengl_to_3dgs_camera_axes = np.diag([1.0, -1.0, -1.0])
     names = raw_d_names(scene)
     rows = []
     for frame in transforms.get("frames", []):
@@ -358,11 +377,14 @@ def write_native_d_cameras(scene: Scene, preprocessed: Path, out_path: Path) -> 
         if idx is None or idx < 1 or idx > len(names):
             continue
         c2w = np.asarray(frame["transform_matrix"], dtype=np.float64)
+        c2w = dataparser_transform @ c2w
+        c2w[:3, 3] *= dataparser_scale
+        c2w_3dgs_axes = c2w[:3, :3] @ opengl_to_3dgs_camera_axes
         rows.append(
             {
                 "img_name": names[idx - 1],
                 "position": c2w[:3, 3].tolist(),
-                "rotation": c2w[:3, :3].tolist(),
+                "rotation": c2w_3dgs_axes.tolist(),
                 "width": int(frame.get("w", 0)),
                 "height": int(frame.get("h", 0)),
                 "fx": float(frame.get("fl_x", 0.0)),
@@ -370,6 +392,9 @@ def write_native_d_cameras(scene: Scene, preprocessed: Path, out_path: Path) -> 
                 "cx": float(frame.get("cx", 0.0)),
                 "cy": float(frame.get("cy", 0.0)),
                 "mms_file_path": str(frame.get("file_path", "")),
+                "dataparser_transform_source": dataparser_source,
+                "dataparser_scale": dataparser_scale,
+                "camera_axis_conversion": "right_multiply_diag_1_-1_-1_opengl_to_3dgs",
             }
         )
     if len(rows) < 3:
@@ -391,7 +416,13 @@ def ensure_converted_models(scene: Scene, preprocessed: Path, ckpt: Path) -> Pat
     opacities = state["_model.gauss_params.opacities"].detach().cpu().numpy().astype(np.float32)
     scales = state["_model.gauss_params.scales"].detach().cpu().numpy().astype(np.float32)
     quats = state["_model.gauss_params.quats"].detach().cpu().numpy().astype(np.float32)
-    native_cams = write_native_d_cameras(scene, preprocessed, out_root / "native_d_cameras_for_depth.json")
+    dataparser_transform_path = ckpt.parent.parent / "dataparser_transforms.json"
+    native_cams = write_native_d_cameras(
+        scene,
+        preprocessed,
+        out_root / "native_d_cameras_for_depth.json",
+        dataparser_transform_path=dataparser_transform_path,
+    )
     cfg_source = scene.e3_root / "out/Model_G/cfg_args"
     cfg_rgb = scene.e3_root / "out/Model_RGB/cfg_args"
     for band in ["D"] + BANDS:
@@ -410,10 +441,15 @@ def ensure_converted_models(scene: Scene, preprocessed: Path, ckpt: Path) -> Pat
             "scene": scene.name,
             "source_checkpoint": str(ckpt),
             "preprocessed_transforms": str(preprocessed / "transforms.json"),
+            "dataparser_transforms": str(dataparser_transform_path),
             "native_cameras_json": str(native_cams),
             "num_points": int(means.shape[0]),
             "depth_semantics": "converted_mms_retained_learned_gaussian_depth",
-            "camera_semantics": "MMS native D-camera poses aliased back to original raw D image names for reference-depth alignment.",
+            "camera_semantics": (
+                "MMS D-camera poses aliased back to original raw D image names, "
+                "transformed by Nerfstudio dataparser_transforms.json, and converted "
+                "from OpenGL camera axes to 3DGS camera axes for reference-depth alignment."
+            ),
             "created_at": stamp(),
         },
     )
