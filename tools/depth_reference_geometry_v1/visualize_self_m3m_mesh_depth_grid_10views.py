@@ -34,10 +34,10 @@ from tools.depth_reference_geometry_v1.depth_reference_common import (
 
 
 METHOD_DISPLAY = {
-    "From-scratch": "From",
+    "From-scratch": "Band-only",
     "Geometry-unfrozen": "Unfrozen",
-    "MMS retained-self": "MMS",
-    "MMS_retained-self": "MMS",
+    "MMS retained-self": "MS-Splatting",
+    "MMS_retained-self": "MS-Splatting",
     "UMGS-J": "UMGS-J",
     "UMGS-I": "UMGS-I",
 }
@@ -369,6 +369,13 @@ def _render_single_band_grid(
     mms_rgb_substitute_band: str,
     depth_range_source: str,
     shared_depth_ranges: Dict[str, Dict[str, Any]] | None,
+    show_mesh_range_text: bool,
+    title_fontsize: float,
+    label_fontsize: float,
+    note_fontsize: float,
+    fig_width: float,
+    row_height: float,
+    bottom_margin: float,
 ) -> Dict[str, Any]:
     ref_root = ref_manifest_path.parent
     rows = []
@@ -506,8 +513,8 @@ def _render_single_band_grid(
             }
         )
 
-    fig_w = 24.0
-    fig_h = max(11.1, 1.28 * len(rows) + 0.9)
+    fig_w = float(fig_width)
+    fig_h = max(8.0, float(row_height) * len(rows) + 0.9)
     fig, axes = plt.subplots(len(rows), 12, figsize=(fig_w, fig_h), dpi=200)
     col_titles = ["RGB", "Mesh"]
     for method in methods:
@@ -526,15 +533,15 @@ def _render_single_band_grid(
                     transform=ax.transAxes,
                     ha="center",
                     va="center",
-                    fontsize=6,
+                    fontsize=float(note_fontsize),
                     color="white",
                     bbox={"facecolor": "black", "alpha": 0.6, "pad": 1.0, "edgecolor": "none"},
                 )
             if r_idx == 0:
-                ax.set_title(col_titles[c_idx], fontsize=8)
+                ax.set_title(col_titles[c_idx], fontsize=float(title_fontsize), fontweight="bold")
             if c_idx == 0:
-                ax.set_ylabel(Path(row["image_name"]).stem.split("_")[-2], fontsize=7)
-            if c_idx == 1:
+                ax.set_ylabel(Path(row["image_name"]).stem.split("_")[-2], fontsize=float(label_fontsize))
+            if c_idx == 1 and show_mesh_range_text:
                 ax.text(
                     0.02,
                     0.96,
@@ -542,40 +549,40 @@ def _render_single_band_grid(
                     transform=ax.transAxes,
                     ha="left",
                     va="top",
-                    fontsize=5.5,
+                    fontsize=float(note_fontsize),
                     color="white",
                     bbox={"facecolor": "black", "alpha": 0.55, "pad": 1.2, "edgecolor": "none"},
                 )
-    fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=0.135)
-    depth_cax = fig.add_axes([0.18, 0.065, 0.28, 0.018])
+    fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=float(bottom_margin))
+    depth_cax = fig.add_axes([0.18, float(bottom_margin) * 0.48, 0.28, 0.018])
     depth_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=0.0, vmax=1.0), cmap="viridis")
     depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
     depth_cb.set_ticks([0.0, 1.0])
     depth_cb.set_ticklabels(["near", "far"])
-    depth_cb.ax.tick_params(labelsize=7)
+    depth_cb.ax.tick_params(labelsize=float(note_fontsize))
     depth_cb.set_label(
-        "Depth color: near to far. Per-row 2-98% range is printed on Mesh.",
-        fontsize=7,
+        "Depth color: near to far. Per-view 2-98% mesh range.",
+        fontsize=float(note_fontsize),
     )
 
-    err_cax = fig.add_axes([0.57, 0.065, 0.28, 0.018])
+    err_cax = fig.add_axes([0.57, float(bottom_margin) * 0.48, 0.28, 0.018])
     err_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=-0.20, vmax=0.20), cmap="coolwarm")
     err_cb = fig.colorbar(err_sm, cax=err_cax, orientation="horizontal")
     err_cb.set_ticks([-0.20, -0.10, 0.0, 0.10, 0.20])
     err_cb.set_ticklabels(["-20%", "-10%", "0", "+10%", "+20%"])
-    err_cb.ax.tick_params(labelsize=7)
+    err_cb.ax.tick_params(labelsize=float(note_fontsize))
     err_cb.set_label(
         "Relative error: blue = closer/front, red = farther/behind.",
-        fontsize=7,
+        fontsize=float(note_fontsize),
     )
 
     fig.text(
         0.5,
-        0.026,
+        float(bottom_margin) * 0.18,
         "Error = (D_method - D_mesh) / D_mesh; maps are clipped to +/-20%. Black pixels are invalid or outside mesh/method support.",
         ha="center",
         va="center",
-        fontsize=7,
+        fontsize=float(note_fontsize),
     )
 
     png_path = out_dir / f"{grid_prefix}.png"
@@ -637,12 +644,19 @@ def _render_single_band_grid(
             "columns": 12,
             "wspace": float(wspace),
             "hspace": float(hspace),
+            "show_mesh_range_text": bool(show_mesh_range_text),
+            "title_fontsize": float(title_fontsize),
+            "label_fontsize": float(label_fontsize),
+            "note_fontsize": float(note_fontsize),
+            "fig_width": float(fig_width),
+            "row_height": float(row_height),
+            "bottom_margin": float(bottom_margin),
         },
         "legend": {
             "depth": (
-                "Viridis, row-normalized to per-view reference-mesh 2-98 percentile; numeric depth range printed on Mesh panel."
+                "Viridis, row-normalized to per-view reference-mesh 2-98 percentile."
                 if depth_range_source == "reference"
-                else "Viridis, row-normalized to per-view mesh+method 2-98 percentile; numeric depth range printed on Mesh panel."
+                else "Viridis, row-normalized to per-view mesh+method 2-98 percentile."
             ),
             "relative_error": "Coolwarm fixed to [-0.20,+0.20]; blue means method depth is closer than mesh, red means farther, black means invalid.",
         },
@@ -792,6 +806,13 @@ def visualize(args: argparse.Namespace) -> None:
         shared_depth_ranges=_compute_reference_depth_ranges(ref_manifest_path, ref_manifest)
         if str(args.depth_range_source) == "reference"
         else None,
+        show_mesh_range_text=not bool(args.hide_mesh_range_text),
+        title_fontsize=float(args.title_fontsize),
+        label_fontsize=float(args.label_fontsize),
+        note_fontsize=float(args.note_fontsize),
+        fig_width=float(args.fig_width),
+        row_height=float(args.row_height),
+        bottom_margin=float(args.bottom_margin),
     )
 
 
@@ -812,7 +833,18 @@ def visualize_multiband(args: argparse.Namespace) -> None:
         "rgb_image_dir": str(Path(args.rgb_image_dir).resolve()),
         "bands": bands,
         "relative_depth_min": float(args.relative_depth_min),
-        "figure_layout": {"columns": 12, "wspace": float(args.wspace), "hspace": float(args.hspace)},
+        "figure_layout": {
+            "columns": 12,
+            "wspace": float(args.wspace),
+            "hspace": float(args.hspace),
+            "hide_mesh_range_text": bool(args.hide_mesh_range_text),
+            "title_fontsize": float(args.title_fontsize),
+            "label_fontsize": float(args.label_fontsize),
+            "note_fontsize": float(args.note_fontsize),
+            "fig_width": float(args.fig_width),
+            "row_height": float(args.row_height),
+            "bottom_margin": float(args.bottom_margin),
+        },
         "mms_rgb_substitute_band": str(args.mms_rgb_substitute_band).upper(),
         "depth_range_source": str(args.depth_range_source),
         "per_band_outputs": {},
@@ -850,6 +882,13 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             mms_rgb_substitute_band=str(args.mms_rgb_substitute_band).upper(),
             depth_range_source=str(args.depth_range_source),
             shared_depth_ranges=shared_depth_ranges,
+            show_mesh_range_text=not bool(args.hide_mesh_range_text),
+            title_fontsize=float(args.title_fontsize),
+            label_fontsize=float(args.label_fontsize),
+            note_fontsize=float(args.note_fontsize),
+            fig_width=float(args.fig_width),
+            row_height=float(args.row_height),
+            bottom_margin=float(args.bottom_margin),
         )
         all_manifest_records["per_band_outputs"][band] = result
 
@@ -888,6 +927,13 @@ def _argparser() -> argparse.ArgumentParser:
     v.add_argument("--depth_range_source", default="reference", choices=("reference", "mesh_and_methods"))
     v.add_argument("--wspace", type=float, default=0.006)
     v.add_argument("--hspace", type=float, default=0.025)
+    v.add_argument("--hide_mesh_range_text", action="store_true")
+    v.add_argument("--title_fontsize", type=float, default=8.0)
+    v.add_argument("--label_fontsize", type=float, default=7.0)
+    v.add_argument("--note_fontsize", type=float, default=7.0)
+    v.add_argument("--fig_width", type=float, default=24.0)
+    v.add_argument("--row_height", type=float, default=1.28)
+    v.add_argument("--bottom_margin", type=float, default=0.135)
     v.add_argument("--grid_prefix", default="depth_visual_grid_10views_core5_with_legend")
     v.add_argument("--stats_filename", default="depth_visual_stats.csv")
     v.add_argument("--manifest_filename", default="depth_visual_manifest.json")
@@ -905,6 +951,13 @@ def _argparser() -> argparse.ArgumentParser:
     vb.add_argument("--relative_depth_min", type=float, default=1e-6)
     vb.add_argument("--wspace", type=float, default=0.006)
     vb.add_argument("--hspace", type=float, default=0.025)
+    vb.add_argument("--hide_mesh_range_text", action="store_true")
+    vb.add_argument("--title_fontsize", type=float, default=8.0)
+    vb.add_argument("--label_fontsize", type=float, default=7.0)
+    vb.add_argument("--note_fontsize", type=float, default=7.0)
+    vb.add_argument("--fig_width", type=float, default=24.0)
+    vb.add_argument("--row_height", type=float, default=1.28)
+    vb.add_argument("--bottom_margin", type=float, default=0.135)
     vb.set_defaults(func=visualize_multiband)
     return parser
 
