@@ -555,7 +555,9 @@ def _render_single_band_grid(
                     bbox={"facecolor": "black", "alpha": 0.55, "pad": 1.2, "edgecolor": "none"},
                 )
     fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=float(bottom_margin))
-    depth_cax = fig.add_axes([0.18, float(bottom_margin) * 0.48, 0.28, 0.018])
+    legend_bar_y = max(0.055, float(bottom_margin) - 0.055)
+    legend_note_y = max(0.018, float(bottom_margin) - 0.125)
+    depth_cax = fig.add_axes([0.18, legend_bar_y, 0.28, 0.018])
     depth_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=0.0, vmax=1.0), cmap="viridis")
     depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
     depth_cb.set_ticks([0.0, 1.0])
@@ -566,7 +568,7 @@ def _render_single_band_grid(
         fontsize=legend_fontsize,
     )
 
-    err_cax = fig.add_axes([0.57, float(bottom_margin) * 0.48, 0.28, 0.018])
+    err_cax = fig.add_axes([0.57, legend_bar_y, 0.28, 0.018])
     err_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=-0.20, vmax=0.20), cmap="coolwarm")
     err_cb = fig.colorbar(err_sm, cax=err_cax, orientation="horizontal")
     err_cb.set_ticks([-0.20, -0.10, 0.0, 0.10, 0.20])
@@ -579,7 +581,7 @@ def _render_single_band_grid(
 
     fig.text(
         0.5,
-        float(bottom_margin) * 0.18,
+        legend_note_y,
         "Error = (D_method - D_mesh) / D_mesh; maps are clipped to +/-20%. Black pixels are invalid or outside mesh/method support.",
         ha="center",
         va="center",
@@ -654,6 +656,8 @@ def _render_single_band_grid(
             "fig_width": float(fig_width),
             "row_height": float(row_height),
             "bottom_margin": float(bottom_margin),
+            "legend_bar_y": float(legend_bar_y),
+            "legend_note_y": float(legend_note_y),
         },
         "legend": {
             "depth": (
