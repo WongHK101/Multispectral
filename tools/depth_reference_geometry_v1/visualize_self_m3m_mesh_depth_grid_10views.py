@@ -526,6 +526,9 @@ def _render_single_band_grid(
             ax.imshow(panel)
             ax.set_xticks([])
             ax.set_yticks([])
+            ax.set_frame_on(False)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
             if note:
                 ax.text(
                     0.5,
@@ -555,8 +558,8 @@ def _render_single_band_grid(
                     bbox={"facecolor": "black", "alpha": 0.55, "pad": 1.2, "edgecolor": "none"},
                 )
     fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=float(bottom_margin))
-    legend_bar_y = max(0.055, float(bottom_margin) - 0.055)
-    legend_note_y = max(0.018, float(bottom_margin) - 0.125)
+    legend_bar_y = max(0.055, float(bottom_margin) - 0.035)
+    legend_note_y = max(0.02, legend_bar_y - 0.11)
     depth_cax = fig.add_axes([0.18, legend_bar_y, 0.28, 0.018])
     depth_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=0.0, vmax=1.0), cmap="viridis")
     depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
