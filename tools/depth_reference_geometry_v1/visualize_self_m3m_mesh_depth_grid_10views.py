@@ -376,6 +376,7 @@ def _render_single_band_grid(
     fig_width: float,
     row_height: float,
     bottom_margin: float,
+    panel_gap_px: int,
 ) -> Dict[str, Any]:
     ref_root = ref_manifest_path.parent
     rows = []
@@ -514,15 +515,61 @@ def _render_single_band_grid(
         )
 
     fig_w = float(fig_width)
-    fig_h = max(8.0, float(row_height) * len(rows) + 0.9)
-    fig, axes = plt.subplots(len(rows), 12, figsize=(fig_w, fig_h), dpi=200)
+    dpi = 200
+    n_rows = len(rows)
+    n_cols = 12
+    first_panel = rows[0]["panels"][0]
+    panel_src_h, panel_src_w = first_panel.shape[:2]
+    exact_gap_mode = int(panel_gap_px) > 0
+    if exact_gap_mode:
+        gap_px = int(panel_gap_px)
+        fig_w_px = int(round(fig_w * dpi))
+        left_px = 76
+        right_px = 24
+        top_px = 78
+        bottom_px = 270
+        panel_w_px = (fig_w_px - left_px - right_px - (n_cols - 1) * gap_px) / float(n_cols)
+        panel_h_px = panel_w_px * (float(panel_src_h) / float(panel_src_w))
+        block_h_px = n_rows * panel_h_px + (n_rows - 1) * gap_px
+        fig_h_px = int(math.ceil(top_px + block_h_px + bottom_px))
+        fig_h = fig_h_px / float(dpi)
+        fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+        axes = []
+        for r_idx in range(n_rows):
+            row_axes = []
+            y_px = bottom_px + (n_rows - 1 - r_idx) * (panel_h_px + gap_px)
+            for c_idx in range(n_cols):
+                x_px = left_px + c_idx * (panel_w_px + gap_px)
+                row_axes.append(
+                    fig.add_axes(
+                        [
+                            x_px / fig_w_px,
+                            y_px / fig_h_px,
+                            panel_w_px / fig_w_px,
+                            panel_h_px / fig_h_px,
+                        ]
+                    )
+                )
+            axes.append(row_axes)
+        legend_bar_y = (bottom_px - 90) / fig_h_px
+        legend_note_y = 38 / fig_h_px
+        depth_cax_rect = [0.18, legend_bar_y, 0.28, 0.018]
+        err_cax_rect = [0.57, legend_bar_y, 0.28, 0.018]
+    else:
+        gap_px = 0
+        fig_h = max(8.0, float(row_height) * n_rows + 0.9)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), dpi=dpi)
+        legend_bar_y = max(0.055, float(bottom_margin) - 0.035)
+        legend_note_y = max(0.02, legend_bar_y - 0.11)
+        depth_cax_rect = [0.18, legend_bar_y, 0.28, 0.018]
+        err_cax_rect = [0.57, legend_bar_y, 0.28, 0.018]
     col_titles = ["RGB", "Mesh"]
     for method in methods:
         col_titles.extend([method["display"], "Rel. err"])
     legend_fontsize = float(title_fontsize)
     for r_idx, row in enumerate(rows):
         for c_idx, (panel, note) in enumerate(zip(row["panels"], row["panel_annotations"])):
-            ax = axes[r_idx, c_idx] if len(rows) > 1 else axes[c_idx]
+            ax = axes[r_idx][c_idx] if exact_gap_mode else (axes[r_idx, c_idx] if len(rows) > 1 else axes[c_idx])
             ax.imshow(panel)
             ax.set_xticks([])
             ax.set_yticks([])
@@ -557,10 +604,9 @@ def _render_single_band_grid(
                     color="white",
                     bbox={"facecolor": "black", "alpha": 0.55, "pad": 1.2, "edgecolor": "none"},
                 )
-    fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=float(bottom_margin))
-    legend_bar_y = max(0.055, float(bottom_margin) - 0.035)
-    legend_note_y = max(0.02, legend_bar_y - 0.11)
-    depth_cax = fig.add_axes([0.18, legend_bar_y, 0.28, 0.018])
+    if not exact_gap_mode:
+        fig.subplots_adjust(wspace=float(wspace), hspace=float(hspace), left=0.025, right=0.995, top=0.94, bottom=float(bottom_margin))
+    depth_cax = fig.add_axes(depth_cax_rect)
     depth_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=0.0, vmax=1.0), cmap="viridis")
     depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
     depth_cb.set_ticks([0.0, 1.0])
@@ -571,7 +617,7 @@ def _render_single_band_grid(
         fontsize=legend_fontsize,
     )
 
-    err_cax = fig.add_axes([0.57, legend_bar_y, 0.28, 0.018])
+    err_cax = fig.add_axes(err_cax_rect)
     err_sm = plt.cm.ScalarMappable(norm=Normalize(vmin=-0.20, vmax=0.20), cmap="coolwarm")
     err_cb = fig.colorbar(err_sm, cax=err_cax, orientation="horizontal")
     err_cb.set_ticks([-0.20, -0.10, 0.0, 0.10, 0.20])
@@ -659,6 +705,8 @@ def _render_single_band_grid(
             "fig_width": float(fig_width),
             "row_height": float(row_height),
             "bottom_margin": float(bottom_margin),
+            "panel_gap_px": int(panel_gap_px),
+            "exact_gap_mode": bool(exact_gap_mode),
             "legend_bar_y": float(legend_bar_y),
             "legend_note_y": float(legend_note_y),
         },
@@ -823,6 +871,7 @@ def visualize(args: argparse.Namespace) -> None:
         fig_width=float(args.fig_width),
         row_height=float(args.row_height),
         bottom_margin=float(args.bottom_margin),
+        panel_gap_px=int(args.panel_gap_px),
     )
 
 
@@ -854,6 +903,7 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             "fig_width": float(args.fig_width),
             "row_height": float(args.row_height),
             "bottom_margin": float(args.bottom_margin),
+            "panel_gap_px": int(args.panel_gap_px),
         },
         "mms_rgb_substitute_band": str(args.mms_rgb_substitute_band).upper(),
         "depth_range_source": str(args.depth_range_source),
@@ -899,6 +949,7 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             fig_width=float(args.fig_width),
             row_height=float(args.row_height),
             bottom_margin=float(args.bottom_margin),
+            panel_gap_px=int(args.panel_gap_px),
         )
         all_manifest_records["per_band_outputs"][band] = result
 
@@ -944,6 +995,7 @@ def _argparser() -> argparse.ArgumentParser:
     v.add_argument("--fig_width", type=float, default=24.0)
     v.add_argument("--row_height", type=float, default=1.28)
     v.add_argument("--bottom_margin", type=float, default=0.135)
+    v.add_argument("--panel_gap_px", type=int, default=0, help="If >0, place all image panels with this exact pixel gap.")
     v.add_argument("--grid_prefix", default="depth_visual_grid_10views_core5_with_legend")
     v.add_argument("--stats_filename", default="depth_visual_stats.csv")
     v.add_argument("--manifest_filename", default="depth_visual_manifest.json")
@@ -968,6 +1020,7 @@ def _argparser() -> argparse.ArgumentParser:
     vb.add_argument("--fig_width", type=float, default=24.0)
     vb.add_argument("--row_height", type=float, default=1.28)
     vb.add_argument("--bottom_margin", type=float, default=0.135)
+    vb.add_argument("--panel_gap_px", type=int, default=0, help="If >0, place all image panels with this exact pixel gap.")
     vb.set_defaults(func=visualize_multiband)
     return parser
 
