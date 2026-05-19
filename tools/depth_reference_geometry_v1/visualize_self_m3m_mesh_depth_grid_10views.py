@@ -519,6 +519,7 @@ def _render_single_band_grid(
     col_titles = ["RGB", "Mesh"]
     for method in methods:
         col_titles.extend([method["display"], "Rel. err"])
+    legend_fontsize = float(title_fontsize)
     for r_idx, row in enumerate(rows):
         for c_idx, (panel, note) in enumerate(zip(row["panels"], row["panel_annotations"])):
             ax = axes[r_idx, c_idx] if len(rows) > 1 else axes[c_idx]
@@ -538,7 +539,7 @@ def _render_single_band_grid(
                     bbox={"facecolor": "black", "alpha": 0.6, "pad": 1.0, "edgecolor": "none"},
                 )
             if r_idx == 0:
-                ax.set_title(col_titles[c_idx], fontsize=float(title_fontsize), fontweight="bold")
+                ax.set_title(col_titles[c_idx], fontsize=float(title_fontsize), fontweight="normal")
             if c_idx == 0:
                 ax.set_ylabel(Path(row["image_name"]).stem.split("_")[-2], fontsize=float(label_fontsize))
             if c_idx == 1 and show_mesh_range_text:
@@ -559,10 +560,10 @@ def _render_single_band_grid(
     depth_cb = fig.colorbar(depth_sm, cax=depth_cax, orientation="horizontal")
     depth_cb.set_ticks([0.0, 1.0])
     depth_cb.set_ticklabels(["near", "far"])
-    depth_cb.ax.tick_params(labelsize=float(note_fontsize))
+    depth_cb.ax.tick_params(labelsize=legend_fontsize)
     depth_cb.set_label(
         "Depth color: near to far. Per-view 2-98% mesh range.",
-        fontsize=float(note_fontsize),
+        fontsize=legend_fontsize,
     )
 
     err_cax = fig.add_axes([0.57, float(bottom_margin) * 0.48, 0.28, 0.018])
@@ -570,10 +571,10 @@ def _render_single_band_grid(
     err_cb = fig.colorbar(err_sm, cax=err_cax, orientation="horizontal")
     err_cb.set_ticks([-0.20, -0.10, 0.0, 0.10, 0.20])
     err_cb.set_ticklabels(["-20%", "-10%", "0", "+10%", "+20%"])
-    err_cb.ax.tick_params(labelsize=float(note_fontsize))
+    err_cb.ax.tick_params(labelsize=legend_fontsize)
     err_cb.set_label(
         "Relative error: blue = closer/front, red = farther/behind.",
-        fontsize=float(note_fontsize),
+        fontsize=legend_fontsize,
     )
 
     fig.text(
@@ -582,7 +583,7 @@ def _render_single_band_grid(
         "Error = (D_method - D_mesh) / D_mesh; maps are clipped to +/-20%. Black pixels are invalid or outside mesh/method support.",
         ha="center",
         va="center",
-        fontsize=float(note_fontsize),
+        fontsize=legend_fontsize,
     )
 
     png_path = out_dir / f"{grid_prefix}.png"
@@ -646,8 +647,10 @@ def _render_single_band_grid(
             "hspace": float(hspace),
             "show_mesh_range_text": bool(show_mesh_range_text),
             "title_fontsize": float(title_fontsize),
+            "title_fontweight": "normal",
             "label_fontsize": float(label_fontsize),
             "note_fontsize": float(note_fontsize),
+            "legend_fontsize": float(title_fontsize),
             "fig_width": float(fig_width),
             "row_height": float(row_height),
             "bottom_margin": float(bottom_margin),
