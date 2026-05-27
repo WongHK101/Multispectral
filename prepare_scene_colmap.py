@@ -646,12 +646,182 @@ def sanity_check_overlap(model_dir: Path, gps_by_basename: dict):
     model_names = read_image_names(model_dir)
     if not model_names:
         log_warn("Could not read image names from selected model; skip overlap check.")
-        return
+        return {"model_image_count": 0, "gps_overlap_count": 0}
     bases = [os.path.basename(n) for n in model_names]
     overlap = sum(1 for b in bases if b in gps_by_basename)
     log_info(f"Selected model images: {len(bases)}; images-with-GPS(overlap by basename): {overlap}")
     if overlap < 3:
         log_warn("Overlap < 3; model_aligner likely fails (min_common_images default is 3).")
+    return {"model_image_count": len(bases), "gps_overlap_count": overlap}
+
+
+def _lla_to_local_enu(lat: float, lon: float, alt: float, lat0: float, lon0: float, alt0: float) -> np.ndarray:
+    """Approximate WGS84 lat/lon/alt as a local ENU frame in meters."""
+    meters_per_deg_lat = 111320.0
+    meters_per_deg_lon = 111320.0 * max(1e-9, math.cos(math.radians(lat0)))
+    return np.asarray(
+        [
+            (float(lon) - float(lon0)) * meters_per_deg_lon,
+            (float(lat) - float(lat0)) * meters_per_deg_lat,
+            float(alt) - float(alt0),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _estimate_similarity_umeyama(source_xyz: np.ndarray, target_xyz: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Estimate target ~= scale * R * source + t."""
+    source_xyz = np.asarray(source_xyz, dtype=np.float64)
+    target_xyz = np.asarray(target_xyz, dtype=np.float64)
+    if source_xyz.shape != target_xyz.shape or source_xyz.ndim != 2 or source_xyz.shape[1] != 3:
+        raise ValueError(f"Invalid similarity inputs: source={source_xyz.shape}, target={target_xyz.shape}")
+    if source_xyz.shape[0] < 3:
+        raise ValueError("At least 3 matched camera centers are required for similarity alignment.")
+
+    src_mean = source_xyz.mean(axis=0)
+    dst_mean = target_xyz.mean(axis=0)
+    src_centered = source_xyz - src_mean
+    dst_centered = target_xyz - dst_mean
+    src_var = float(np.mean(np.sum(src_centered * src_centered, axis=1)))
+    if src_var <= 0:
+        raise ValueError("Degenerate source camera centers; cannot estimate similarity.")
+
+    cov = (dst_centered.T @ src_centered) / source_xyz.shape[0]
+    u, singular_values, vt = np.linalg.svd(cov)
+    d = np.eye(3)
+    if np.linalg.det(u @ vt) < 0:
+        d[-1, -1] = -1
+    rot = u @ d @ vt
+    scale = float(np.sum(singular_values * np.diag(d)) / src_var)
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError(f"Invalid estimated alignment scale: {scale}")
+    trans = dst_mean - scale * rot @ src_mean
+    return scale, rot, trans
+
+
+def write_gps_ref_images(model_dir: Path, gps_by_basename: dict, output_path: Path) -> int:
+    rows = []
+    for image_name in read_image_names(model_dir):
+        base = os.path.basename(image_name)
+        if base not in gps_by_basename:
+            continue
+        lat, lon, alt = gps_by_basename[base]
+        rows.append(f"{image_name} {float(lat):.12f} {float(lon):.12f} {float(alt):.6f}\n")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("".join(rows), encoding="utf-8")
+    log_info(f"Wrote GPS reference image file for georegistration: {output_path} rows={len(rows)}")
+    return len(rows)
+
+
+def custom_sim3_georegister_model(
+    input_model: Path,
+    output_model: Path,
+    gps_by_basename: dict,
+) -> dict:
+    """Write a WGS84-derived local ENU-aligned COLMAP model using matched EXIF/RTK priors."""
+    from utils.read_write_model import (  # local import keeps normal COLMAP conversion startup light
+        Image,
+        Point3D,
+        qvec2rotmat,
+        read_model,
+        rotmat2qvec,
+        write_model,
+    )
+
+    cameras, images, points3d = read_model(str(input_model), ext="")
+    if cameras is None:
+        raise RuntimeError(f"Could not read COLMAP model: {input_model}")
+
+    matched = []
+    for image_id, image in images.items():
+        base = os.path.basename(image.name)
+        if base not in gps_by_basename:
+            continue
+        r_cw = qvec2rotmat(image.qvec)
+        center = -r_cw.T @ image.tvec
+        lat, lon, alt = gps_by_basename[base]
+        matched.append((image_id, center, (float(lat), float(lon), float(alt))))
+    if len(matched) < 3:
+        raise RuntimeError(f"Insufficient GPS/RTK priors for custom Sim3 alignment: {len(matched)}")
+
+    llas = np.asarray([m[2] for m in matched], dtype=np.float64)
+    lat0, lon0, alt0 = llas.mean(axis=0)
+    source = np.asarray([m[1] for m in matched], dtype=np.float64)
+    target = np.asarray([_lla_to_local_enu(*m[2], lat0, lon0, alt0) for m in matched], dtype=np.float64)
+    scale, rot, trans = _estimate_similarity_umeyama(source, target)
+
+    transformed_centers = scale * (rot @ source.T).T + trans
+    residual = np.linalg.norm(transformed_centers - target, axis=1)
+
+    new_images = {}
+    for image_id, image in images.items():
+        r_cw = qvec2rotmat(image.qvec)
+        r_new = r_cw @ rot.T
+        t_new = scale * image.tvec - r_new @ trans
+        q_new = rotmat2qvec(r_new)
+        new_images[image_id] = Image(
+            id=image.id,
+            qvec=q_new.astype(np.float64),
+            tvec=t_new.astype(np.float64),
+            camera_id=image.camera_id,
+            name=image.name,
+            xys=image.xys,
+            point3D_ids=image.point3D_ids,
+        )
+
+    new_points3d = {}
+    for point_id, point in points3d.items():
+        xyz_new = scale * (rot @ point.xyz) + trans
+        new_points3d[point_id] = Point3D(
+            id=point.id,
+            xyz=xyz_new.astype(np.float64),
+            rgb=point.rgb,
+            error=point.error,
+            image_ids=point.image_ids,
+            point2D_idxs=point.point2D_idxs,
+        )
+
+    if output_model.exists():
+        shutil.rmtree(output_model)
+    output_model.mkdir(parents=True, exist_ok=True)
+    write_model(cameras, new_images, new_points3d, str(output_model), ext=".bin")
+    write_model(cameras, new_images, new_points3d, str(output_model), ext=".txt")
+
+    aligned_centers = np.asarray([-(qvec2rotmat(im.qvec).T @ im.tvec) for im in new_images.values()], dtype=np.float64)
+    points_xyz = np.asarray([p.xyz for p in new_points3d.values()], dtype=np.float64) if new_points3d else np.empty((0, 3))
+    summary = {
+        "backend": "custom_sim3",
+        "coordinate_frame": "local_enu_from_wgs84_pose_priors",
+        "enu_origin_lat_lon_alt": [float(lat0), float(lon0), float(alt0)],
+        "matched_registered_images": int(len(matched)),
+        "estimated_scale": float(scale),
+        "estimated_rotation": rot.tolist(),
+        "estimated_translation": trans.tolist(),
+        "alignment_error_m": {
+            "mean": float(residual.mean()),
+            "median": float(np.median(residual)),
+            "min": float(residual.min()),
+            "max": float(residual.max()),
+            "p90": float(np.percentile(residual, 90)),
+            "p95": float(np.percentile(residual, 95)),
+        },
+        "target_enu_extent_xyz": (target.max(axis=0) - target.min(axis=0)).tolist(),
+        "aligned_camera_extent_xyz": (aligned_centers.max(axis=0) - aligned_centers.min(axis=0)).tolist(),
+        "aligned_camera_min_xyz": aligned_centers.min(axis=0).tolist(),
+        "aligned_camera_max_xyz": aligned_centers.max(axis=0).tolist(),
+        "aligned_points3d_count": int(len(new_points3d)),
+    }
+    if len(points_xyz):
+        summary.update({
+            "aligned_points3d_min_xyz": points_xyz.min(axis=0).tolist(),
+            "aligned_points3d_max_xyz": points_xyz.max(axis=0).tolist(),
+            "aligned_points3d_extent_xyz": (points_xyz.max(axis=0) - points_xyz.min(axis=0)).tolist(),
+        })
+    (output_model / "georegistration_alignment_summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return summary
 
 def ensure_3dgs_sparse_layout(root: Path) -> Path:
     """Normalize COLMAP output layout for 3DGS.
@@ -950,8 +1120,44 @@ def main():
         help="Extra arguments appended to COLMAP image_registrator.",
     )
 
-    parser.add_argument("--use_model_aligner", action="store_true")
-    parser.add_argument("--model_aligner_args", default="")
+    parser.add_argument(
+        "--georegistration_mode",
+        choices=["auto", "force", "off"],
+        default="auto",
+        help=(
+            "WGS84 pose-prior alignment policy. auto (default) runs the selected "
+            "georegistration backend when enough EXIF/RTK GPS priors overlap the selected "
+            "sparse model, and falls back to the unaligned COLMAP model if priors are "
+            "missing or alignment fails. force requires alignment to succeed. off preserves "
+            "the historical local-COLMAP mode."
+        ),
+    )
+    parser.add_argument(
+        "--min_georegistration_overlap",
+        type=int,
+        default=3,
+        help="Minimum registered model images with EXIF/RTK GPS priors required before auto georegistration is attempted.",
+    )
+    parser.add_argument(
+        "--georegistration_backend",
+        choices=["custom_sim3", "colmap_model_aligner"],
+        default="custom_sim3",
+        help=(
+            "Georegistration backend. custom_sim3 writes a local ENU COLMAP sparse model by fitting "
+            "registered camera centers to WGS84 EXIF/RTK priors. colmap_model_aligner uses COLMAP's "
+            "model_aligner command."
+        ),
+    )
+    parser.add_argument(
+        "--use_model_aligner",
+        action="store_true",
+        help="Legacy alias for --georegistration_mode force.",
+    )
+    parser.add_argument(
+        "--model_aligner_args",
+        default="--ref_is_gps 1 --alignment_type enu --alignment_max_error 30.0",
+        help="Arguments appended to COLMAP model_aligner when WGS84/ENU georegistration is attempted.",
+    )
 
     parser.add_argument("--resize", action="store_true")
 
@@ -1036,46 +1242,102 @@ def main():
     best_model = select_best_sparse_model(sparse_root)
 
     gps_map = populate_pose_priors_from_exif(db_path, input_dir, exiftool_exe=args.exiftool_executable, wgs84_code=args.wgs84_code, prior_position_std_m=args.prior_position_std_m, swap_latlon=args.swap_latlon)
-    sanity_check_overlap(best_model, gps_map)
+    georeg_overlap = sanity_check_overlap(best_model, gps_map)
 
     aligned_model_for_undistort = best_model
-    
-    if args.use_model_aligner:
+
+    georeg_mode = "force" if args.use_model_aligner else str(args.georegistration_mode)
+    georeg_status = {
+        "mode": georeg_mode,
+        "wgs84_code": int(args.wgs84_code),
+        "pose_priors_from_exif_count": len(gps_map),
+        "model_image_count": int(georeg_overlap.get("model_image_count", 0)),
+        "gps_overlap_count": int(georeg_overlap.get("gps_overlap_count", 0)),
+        "min_overlap": int(args.min_georegistration_overlap),
+        "attempted": False,
+        "succeeded": False,
+        "used_for_undistort": False,
+        "model_aligner_args": str(args.model_aligner_args),
+        "backend": str(args.georegistration_backend),
+        "aligned_model_path": "",
+        "fallback_reason": "",
+    }
+
+    enough_gps = georeg_status["gps_overlap_count"] >= int(args.min_georegistration_overlap)
+    if georeg_mode == "off":
+        georeg_status["fallback_reason"] = "georegistration_mode=off"
+        log_info("WGS84/RTK model alignment disabled; using local COLMAP sparse model.")
+    elif not enough_gps:
+        reason = (
+            f"insufficient EXIF/RTK GPS overlap for georegistration "
+            f"({georeg_status['gps_overlap_count']}/{args.min_georegistration_overlap})"
+        )
+        georeg_status["fallback_reason"] = reason
+        if georeg_mode == "force":
+            raise RuntimeError(reason)
+        log_warn(f"{reason}; falling back to local COLMAP sparse model.")
+    else:
+        if sparse_aligned.exists():
+            shutil.rmtree(sparse_aligned)
         sparse_aligned.mkdir(parents=True, exist_ok=True)
-        base_cmd = [
-            colmap_exe, "model_aligner",
-            "--input_path", str(best_model),
-            "--output_path", str(sparse_aligned),
-            "--database_path", str(db_path),
-        ]
-        user_tokens = split_args(args.model_aligner_args)
-    
-        # 1) Try user-provided args first
-        log_info("Running model_aligner:")
+        georeg_status["attempted"] = True
         try:
-            run_cmd(base_cmd + user_tokens)
-        except subprocess.CalledProcessError as e:
-            # Common failure mode when pose priors covariance is invalid or the error threshold is too strict.
-            log_warn(f"model_aligner failed (exit={getattr(e, 'returncode', None)}). Will retry with relaxed alignment_max_error.")
-    
-            # 2) Retry with alignment_max_error=0 (often treated as 'no robust threshold')
-            retry_vals = [0, 100, 300, 1000]
-            success = False
-            last_err = e
-            for v in retry_vals:
-                tokens2 = replace_alignment_max_error(user_tokens, v)
-                log_info(f"Retrying model_aligner with --alignment_max_error={v}")
+            if str(args.georegistration_backend) == "custom_sim3":
+                summary = custom_sim3_georegister_model(best_model, sparse_aligned, gps_map)
+                georeg_status["succeeded"] = True
+                georeg_status["custom_sim3_summary"] = summary
+                log_info(
+                    "Custom WGS84/ENU Sim3 alignment succeeded: "
+                    f"mean_error={summary['alignment_error_m']['mean']:.3f}m "
+                    f"median_error={summary['alignment_error_m']['median']:.3f}m "
+                    f"scale={summary['estimated_scale']:.6f}"
+                )
+            else:
+                ref_images_path = distorted_dir / "gps_ref_images.txt"
+                write_gps_ref_images(best_model, gps_map, ref_images_path)
+                base_cmd = [
+                    colmap_exe, "model_aligner",
+                    "--input_path", str(best_model),
+                    "--output_path", str(sparse_aligned),
+                    "--ref_images_path", str(ref_images_path),
+                ]
+                user_tokens = split_args(args.model_aligner_args)
+                log_info("Running WGS84/RTK COLMAP model_aligner:")
                 try:
-                    run_cmd(base_cmd + tokens2)
-                    success = True
-                    break
-                except subprocess.CalledProcessError as e2:
-                    last_err = e2
-                    continue
-            if not success:
-                raise last_err
-    
-        aligned_model_for_undistort = sparse_aligned
+                    run_cmd(base_cmd + user_tokens)
+                    georeg_status["succeeded"] = True
+                except subprocess.CalledProcessError as e:
+                    log_warn(f"model_aligner failed (exit={getattr(e, 'returncode', None)}). Will retry with relaxed alignment_max_error.")
+                    retry_vals = [100, 300, 1000]
+                    success = False
+                    last_err = e
+                    for v in retry_vals:
+                        tokens2 = replace_alignment_max_error(user_tokens, v)
+                        log_info(f"Retrying model_aligner with --alignment_max_error={v}")
+                        try:
+                            run_cmd(base_cmd + tokens2)
+                            success = True
+                            break
+                        except subprocess.CalledProcessError as e2:
+                            last_err = e2
+                            continue
+                    georeg_status["succeeded"] = success
+                    if not success:
+                        raise last_err
+                export_model_as_txt(colmap_exe, sparse_aligned)
+        except Exception as e:
+            reason = f"WGS84/RTK georegistration failed: {e}"
+            georeg_status["fallback_reason"] = reason
+            georeg_status["succeeded"] = False
+            if georeg_mode == "force":
+                raise
+            log_warn(f"{reason}; falling back to local COLMAP sparse model.")
+
+        if georeg_status["succeeded"]:
+            aligned_model_for_undistort = sparse_aligned
+            georeg_status["used_for_undistort"] = True
+            georeg_status["aligned_model_path"] = str(sparse_aligned)
+            log_info(f"WGS84/RTK model alignment succeeded; undistorting from: {sparse_aligned}")
 
     raw_sfm_audit = {
         "protocol": "all_images_sfm",
@@ -1093,6 +1355,7 @@ def main():
         "test_localization_missing_count": None,
         "post_registration_ba_applied": False,
         "triangulation_extended_with_test": False,
+        "georegistration": georeg_status,
     }
 
     if args.register_images_after_mapper:

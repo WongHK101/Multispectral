@@ -298,6 +298,10 @@ def _ensure_rgb_colmap(repo_root: Path, rgb_scene_root: Path, args, sfm_lists: d
             "--sift_matching_max_num_matches", str(args.sift_matching_max_num_matches),
             "--prior_position_std_m", str(args.prior_position_std_m),
             "--wgs84_code", str(args.wgs84_code),
+            "--georegistration_mode", str(args.georegistration_mode),
+            "--min_georegistration_overlap", str(args.min_georegistration_overlap),
+            "--georegistration_backend", str(args.georegistration_backend),
+            "--model_aligner_args", str(args.model_aligner_args),
         ]
         if sfm_lists and str(args.raw_sfm_protocol).strip().lower() == "train_only_register_test":
             cmd += [
@@ -665,6 +669,34 @@ def main() -> None:
     )
     ap.add_argument("--prior_position_std_m", type=float, default=1.0)
     ap.add_argument("--wgs84_code", type=int, default=0)
+    ap.add_argument(
+        "--georegistration_mode",
+        choices=["auto", "force", "off"],
+        default="auto",
+        help=(
+            "WGS84/RTK sparse-model alignment policy for raw RGB COLMAP. "
+            "auto (default) attempts the selected georegistration backend when enough "
+            "EXIF/RTK pose priors exist, then falls back to the local COLMAP frame if priors "
+            "are missing or alignment fails. force requires alignment. off keeps the "
+            "historical local-frame behavior."
+        ),
+    )
+    ap.add_argument("--min_georegistration_overlap", type=int, default=3)
+    ap.add_argument(
+        "--georegistration_backend",
+        choices=["custom_sim3", "colmap_model_aligner"],
+        default="custom_sim3",
+        help=(
+            "Backend for WGS84/RTK georegistration. custom_sim3 fits registered camera centers "
+            "to EXIF/RTK pose priors and writes a local ENU sparse model; colmap_model_aligner "
+            "delegates to COLMAP model_aligner."
+        ),
+    )
+    ap.add_argument(
+        "--model_aligner_args",
+        default="--ref_is_gps 1 --alignment_type enu --alignment_max_error 30.0",
+        help="Arguments appended to COLMAP model_aligner when WGS84/RTK georegistration is attempted.",
+    )
     ap.add_argument("--sparse_source", default="", help="Optional existing sparse/0 to seed the prepared RGB scene only.")
     ap.add_argument("--protocol_split", default="", help="Optional frozen split_v1.json copied into sparse/0 before training.")
     ap.add_argument("--auto_render", action="store_true", default=False)
