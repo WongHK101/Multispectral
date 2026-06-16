@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List
@@ -8,6 +9,10 @@ from typing import Dict, Iterable, List
 import numpy as np
 import torch
 import torchvision
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from gaussian_renderer import render
 from scene.cameras import MiniCam
