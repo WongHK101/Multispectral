@@ -244,8 +244,19 @@ def _build_index_vertex(reference_payload: Dict[str, object], rgb_values: np.nda
     return out
 
 
+def _parse_csv_names(value: str, valid_names: List[str]) -> List[str]:
+    if value is None or str(value).strip().lower() in ("", "all", "*"):
+        return list(valid_names)
+    requested = [item.strip().lower() for item in str(value).split(",") if item.strip()]
+    invalid = sorted(set(requested) - set(valid_names))
+    if invalid:
+        raise ValueError(f"Invalid product names {invalid}; valid names are {valid_names}")
+    return requested
+
+
 def build_products(model_dirs: Dict[str, Path], iterations: Dict[str, int], out_root: Path, savi_l: float,
-                   eps: float, require_opacity_match: bool, tol: float) -> None:
+                   eps: float, require_opacity_match: bool, tol: float,
+                   false_color_names: List[str] = None, index_names: List[str] = None) -> None:
     payloads = {band: _extract_model_payload(model_dir, iterations.get(band)) for band, model_dir in model_dirs.items()}
     _assert_topology_consistency(payloads, require_opacity_match=require_opacity_match, tol=tol)
 
@@ -255,7 +266,9 @@ def build_products(model_dirs: Dict[str, Path], iterations: Dict[str, int], out_
     out_iter = int(ref_payload["iteration"])
 
     out_root.mkdir(parents=True, exist_ok=True)
-    for product_name, mapping in FALSE_COLOR_PRODUCTS.items():
+    selected_false_color = list(FALSE_COLOR_PRODUCTS.keys()) if false_color_names is None else list(false_color_names)
+    for product_name in selected_false_color:
+        mapping = FALSE_COLOR_PRODUCTS[product_name]
         vertex_out = _build_false_color_vertex(ref_payload, payloads, mapping)
         _write_product_model(
             out_root / product_name,
@@ -283,7 +296,9 @@ def build_products(model_dirs: Dict[str, Path], iterations: Dict[str, int], out_
         "osavi": (nir - red) / (nir + red + 0.16 + eps),
     }
 
-    for name, values in indices.items():
+    selected_indices = list(indices.keys()) if index_names is None else list(index_names)
+    for name in selected_indices:
+        values = indices[name]
         gray01 = np.clip((values + 1.0) * 0.5, 0.0, 1.0)
         gray_rgb = np.repeat(gray01[:, None], 3, axis=1)
         pseudo_rgb = _make_colormap(gray01)
@@ -338,9 +353,15 @@ def main() -> None:
     ap.add_argument("--eps", type=float, default=1e-6)
     ap.add_argument("--require_opacity_match", type=str, default="true")
     ap.add_argument("--tol", type=float, default=1e-6)
+    ap.add_argument("--skip_false_color", action="store_true", help="Only build spectral-index products.")
+    ap.add_argument("--false_color_names", default="all", help="Comma-separated false-color product names or 'all'.")
+    ap.add_argument("--index_names", default="all", help="Comma-separated index names among ndvi,ndre,gndvi,savi,osavi or 'all'.")
     args = ap.parse_args()
 
     require_opacity_match = str(args.require_opacity_match).strip().lower() not in ("0", "false", "no", "off")
+    false_color_names = [] if args.skip_false_color else _parse_csv_names(args.false_color_names, list(FALSE_COLOR_PRODUCTS.keys()))
+    valid_index_names = ["ndvi", "ndre", "gndvi", "savi", "osavi"]
+    index_names = _parse_csv_names(args.index_names, valid_index_names)
     build_products(
         model_dirs={
             "G": Path(args.g_model_dir).resolve(),
@@ -359,15 +380,15 @@ def main() -> None:
         eps=float(args.eps),
         require_opacity_match=require_opacity_match,
         tol=float(args.tol),
+        false_color_names=false_color_names,
+        index_names=index_names,
     )
     print(json.dumps({
         "out_root": str(Path(args.out_root).resolve()),
-        "products": list(FALSE_COLOR_PRODUCTS.keys()) + [
-            "ndvi_gray", "ndvi_pseudocolor",
-            "ndre_gray", "ndre_pseudocolor",
-            "gndvi_gray", "gndvi_pseudocolor",
-            "savi_gray", "savi_pseudocolor",
-            "osavi_gray", "osavi_pseudocolor",
+        "products": false_color_names + [
+            product
+            for name in index_names
+            for product in (f"{name}_gray", f"{name}_pseudocolor")
         ],
     }, indent=2))
 
