@@ -377,6 +377,7 @@ def _render_single_band_grid(
     row_height: float,
     bottom_margin: float,
     panel_gap_px: int,
+    hide_legend_note: bool,
 ) -> Dict[str, Any]:
     ref_root = ref_manifest_path.parent
     rows = []
@@ -527,7 +528,7 @@ def _render_single_band_grid(
         left_px = 76
         right_px = 24
         top_px = 78
-        bottom_px = 270
+        bottom_px = 210 if bool(hide_legend_note) else 270
         panel_w_px = (fig_w_px - left_px - right_px - (n_cols - 1) * gap_px) / float(n_cols)
         panel_h_px = panel_w_px * (float(panel_src_h) / float(panel_src_w))
         block_h_px = n_rows * panel_h_px + (n_rows - 1) * gap_px
@@ -628,14 +629,15 @@ def _render_single_band_grid(
         fontsize=legend_fontsize,
     )
 
-    fig.text(
-        0.5,
-        legend_note_y,
-        "Error = (D_method - D_mesh) / D_mesh; maps are clipped to +/-20%. Black pixels are invalid or outside mesh/method support.",
-        ha="center",
-        va="center",
-        fontsize=legend_fontsize,
-    )
+    if not bool(hide_legend_note):
+        fig.text(
+            0.5,
+            legend_note_y,
+            "Error = (D_method - D_mesh) / D_mesh; maps are clipped to +/-20%. Black pixels are invalid or outside mesh/method support.",
+            ha="center",
+            va="center",
+            fontsize=legend_fontsize,
+        )
 
     png_path = out_dir / f"{grid_prefix}.png"
     pdf_path = out_dir / f"{grid_prefix}.pdf"
@@ -707,6 +709,7 @@ def _render_single_band_grid(
             "bottom_margin": float(bottom_margin),
             "panel_gap_px": int(panel_gap_px),
             "exact_gap_mode": bool(exact_gap_mode),
+            "hide_legend_note": bool(hide_legend_note),
             "legend_bar_y": float(legend_bar_y),
             "legend_note_y": float(legend_note_y),
         },
@@ -872,6 +875,7 @@ def visualize(args: argparse.Namespace) -> None:
         row_height=float(args.row_height),
         bottom_margin=float(args.bottom_margin),
         panel_gap_px=int(args.panel_gap_px),
+        hide_legend_note=bool(args.hide_legend_note),
     )
 
 
@@ -904,6 +908,7 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             "row_height": float(args.row_height),
             "bottom_margin": float(args.bottom_margin),
             "panel_gap_px": int(args.panel_gap_px),
+            "hide_legend_note": bool(args.hide_legend_note),
         },
         "mms_rgb_substitute_band": str(args.mms_rgb_substitute_band).upper(),
         "depth_range_source": str(args.depth_range_source),
@@ -950,6 +955,7 @@ def visualize_multiband(args: argparse.Namespace) -> None:
             row_height=float(args.row_height),
             bottom_margin=float(args.bottom_margin),
             panel_gap_px=int(args.panel_gap_px),
+            hide_legend_note=bool(args.hide_legend_note),
         )
         all_manifest_records["per_band_outputs"][band] = result
 
@@ -996,6 +1002,7 @@ def _argparser() -> argparse.ArgumentParser:
     v.add_argument("--row_height", type=float, default=1.28)
     v.add_argument("--bottom_margin", type=float, default=0.135)
     v.add_argument("--panel_gap_px", type=int, default=0, help="If >0, place all image panels with this exact pixel gap.")
+    v.add_argument("--hide_legend_note", action="store_true", help="Hide the long explanatory note below the colorbars.")
     v.add_argument("--grid_prefix", default="depth_visual_grid_10views_core5_with_legend")
     v.add_argument("--stats_filename", default="depth_visual_stats.csv")
     v.add_argument("--manifest_filename", default="depth_visual_manifest.json")
@@ -1021,6 +1028,7 @@ def _argparser() -> argparse.ArgumentParser:
     vb.add_argument("--row_height", type=float, default=1.28)
     vb.add_argument("--bottom_margin", type=float, default=0.135)
     vb.add_argument("--panel_gap_px", type=int, default=0, help="If >0, place all image panels with this exact pixel gap.")
+    vb.add_argument("--hide_legend_note", action="store_true", help="Hide the long explanatory note below the colorbars.")
     vb.set_defaults(func=visualize_multiband)
     return parser
 

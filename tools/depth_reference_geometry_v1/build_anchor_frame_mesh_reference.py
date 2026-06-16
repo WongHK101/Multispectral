@@ -122,6 +122,136 @@ def _pca_delaunay_mesh(
     }
 
 
+def _heightfield_mesh(
+    points: np.ndarray,
+    *,
+    grid_long: int,
+    crop_low: float,
+    crop_high: float,
+    padding_ratio: float,
+    min_points_per_cell: int,
+    max_height_jump: float | None,
+    auto_jump_quantile: float,
+    auto_jump_scale: float,
+) -> Dict[str, Any]:
+    points = np.asarray(points, dtype=np.float64)
+    lo = np.quantile(points, crop_low, axis=0)
+    hi = np.quantile(points, crop_high, axis=0)
+    pad = padding_ratio * float(np.linalg.norm(hi - lo))
+    keep = np.all((points >= lo - pad) & (points <= hi + pad), axis=1)
+    points = points[keep]
+    if points.shape[0] < 4:
+        raise RuntimeError(f"Too few points after crop: {points.shape[0]}")
+
+    mean = points.mean(axis=0)
+    centered = points - mean
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    axes = vh[:3]
+    uvh = centered @ axes.T
+    uv = uvh[:, :2]
+    height = uvh[:, 2]
+
+    uv_min = uv.min(axis=0)
+    uv_max = uv.max(axis=0)
+    span = np.maximum(uv_max - uv_min, 1.0e-9)
+    long_span = float(np.max(span))
+    cell = long_span / float(max(4, grid_long))
+    nx = int(np.ceil(span[0] / cell)) + 1
+    ny = int(np.ceil(span[1] / cell)) + 1
+    nx = max(nx, 2)
+    ny = max(ny, 2)
+
+    ij = np.floor((uv - uv_min) / cell).astype(np.int64)
+    ij[:, 0] = np.clip(ij[:, 0], 0, nx - 1)
+    ij[:, 1] = np.clip(ij[:, 1], 0, ny - 1)
+    flat = ij[:, 1] * nx + ij[:, 0]
+
+    order = np.argsort(flat, kind="mergesort")
+    flat_sorted = flat[order]
+    heights_sorted = height[order]
+    unique, starts, counts = np.unique(flat_sorted, return_index=True, return_counts=True)
+
+    grid_h = np.full((ny, nx), np.nan, dtype=np.float64)
+    grid_count = np.zeros((ny, nx), dtype=np.int32)
+    for cell_id, start, count in zip(unique, starts, counts):
+        if int(count) < min_points_per_cell:
+            continue
+        y = int(cell_id // nx)
+        x = int(cell_id % nx)
+        grid_h[y, x] = float(np.median(heights_sorted[start : start + count]))
+        grid_count[y, x] = int(count)
+
+    valid = np.isfinite(grid_h)
+    if int(np.count_nonzero(valid)) < 4:
+        raise RuntimeError(f"Too few occupied cells after binning: {int(np.count_nonzero(valid))}")
+
+    if max_height_jump is None or max_height_jump <= 0:
+        diffs: List[np.ndarray] = []
+        dh = np.abs(grid_h[:, 1:] - grid_h[:, :-1])
+        mask = np.isfinite(dh)
+        if np.any(mask):
+            diffs.append(dh[mask])
+        dv = np.abs(grid_h[1:, :] - grid_h[:-1, :])
+        mask = np.isfinite(dv)
+        if np.any(mask):
+            diffs.append(dv[mask])
+        if diffs:
+            all_diffs = np.concatenate(diffs)
+            jump_limit = float(np.quantile(all_diffs, auto_jump_quantile) * auto_jump_scale)
+        else:
+            jump_limit = float("inf")
+    else:
+        jump_limit = float(max_height_jump)
+
+    vert_id = np.full((ny, nx), -1, dtype=np.int64)
+    vertices: List[np.ndarray] = []
+    for y in range(ny):
+        for x in range(nx):
+            if not valid[y, x]:
+                continue
+            u = uv_min[0] + (float(x) + 0.5) * cell
+            v = uv_min[1] + (float(y) + 0.5) * cell
+            h = grid_h[y, x]
+            xyz = mean + axes[0] * u + axes[1] * v + axes[2] * h
+            vert_id[y, x] = len(vertices)
+            vertices.append(xyz)
+
+    faces: List[List[int]] = []
+    for y in range(ny - 1):
+        for x in range(nx - 1):
+            ids = [vert_id[y, x], vert_id[y, x + 1], vert_id[y + 1, x], vert_id[y + 1, x + 1]]
+            if any(idx < 0 for idx in ids):
+                continue
+            hs = np.array([grid_h[y, x], grid_h[y, x + 1], grid_h[y + 1, x], grid_h[y + 1, x + 1]], dtype=np.float64)
+            if float(np.max(hs) - np.min(hs)) > jump_limit:
+                continue
+            faces.append([int(ids[0]), int(ids[1]), int(ids[2])])
+            faces.append([int(ids[1]), int(ids[3]), int(ids[2])])
+
+    if not faces:
+        raise RuntimeError("Heightfield mesh produced no faces after jump filtering")
+
+    return {
+        "points": np.asarray(vertices, dtype=np.float64),
+        "faces": np.asarray(faces, dtype=np.int32),
+        "audit": {
+            "input_points_after_crop": int(np.count_nonzero(keep)),
+            "occupied_cells": int(np.count_nonzero(valid)),
+            "used_vertices": int(len(vertices)),
+            "faces": int(len(faces)),
+            "grid_long": int(grid_long),
+            "grid_shape_xy": [int(nx), int(ny)],
+            "cell_size": float(cell),
+            "min_points_per_cell": int(min_points_per_cell),
+            "max_height_jump": float(jump_limit),
+            "crop_quantile_low": float(crop_low),
+            "crop_quantile_high": float(crop_high),
+            "padding_ratio": float(padding_ratio),
+            "pca_axes": axes.tolist(),
+        },
+    }
+
+
 def _load_cameras_json_views(
     cameras_json: Path,
     *,
@@ -336,6 +466,66 @@ def _cmd_pca_from_points(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_heightfield_from_points(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    points_path = Path(args.points_ply).resolve()
+    points = load_ply_points_xyz(points_path)
+    result = _heightfield_mesh(
+        points,
+        grid_long=int(args.grid_long),
+        crop_low=float(args.crop_low),
+        crop_high=float(args.crop_high),
+        padding_ratio=float(args.padding_ratio),
+        min_points_per_cell=int(args.min_points_per_cell),
+        max_height_jump=float(args.max_height_jump) if args.max_height_jump > 0 else None,
+        auto_jump_quantile=float(args.auto_jump_quantile),
+        auto_jump_scale=float(args.auto_jump_scale),
+    )
+    mesh_path = out_dir / "reference_mesh_heightfield.ply"
+    support_path = out_dir / "reference_support_heightfield.ply"
+    _write_mesh(mesh_path, result["points"], result["faces"])
+    if args.support_points_mode == "input":
+        _write_vertex_only_ply_like(points_path, support_path, points)
+    else:
+        _write_vertex_only_ply_like(points_path, support_path, result["points"])
+
+    if args.views_from_reference:
+        views = list(load_json(Path(args.views_from_reference).resolve())["views"])
+        image_names_source = str(Path(args.views_from_reference).resolve())
+    else:
+        image_names = _image_names_from_reference(Path(args.image_names_from_reference).resolve())
+        views = _load_cameras_json_views(
+            Path(args.cameras_json).resolve(),
+            image_names=image_names,
+            width_scale=float(args.width_scale),
+            height_scale=float(args.height_scale),
+        )
+        image_names_source = str(Path(args.image_names_from_reference).resolve())
+
+    _render_reference(
+        scene_name=str(args.scene_name),
+        out_dir=out_dir,
+        mesh_path=mesh_path,
+        support_points_path=support_path,
+        views=views,
+        variant="heightfield_mesh_in_target_frame_v1",
+        build_audit={
+            "scene_name": str(args.scene_name),
+            "points_ply": str(points_path),
+            "cameras_json": str(Path(args.cameras_json).resolve()) if args.cameras_json else "",
+            "image_names_from_reference": image_names_source,
+            "mesh_audit": result["audit"],
+            "reference_mesh_backend": "heightfield_from_points",
+            "support_points_mode": str(args.support_points_mode),
+            "distance_unit": str(args.distance_unit),
+            "scale_mode": str(args.scale_mode),
+        },
+        support_radius_px=int(args.support_radius_px),
+        support_depth_tolerance=float(args.support_depth_tolerance),
+    )
+
+
 def _argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build mesh-reference depth manifests in the method/probe frame.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -369,6 +559,30 @@ def _argparser() -> argparse.ArgumentParser:
     p.add_argument("--support_radius_px", type=int, default=2)
     p.add_argument("--support_depth_tolerance", type=float, default=0.10)
     p.set_defaults(func=_cmd_pca_from_points)
+
+    h = sub.add_parser("heightfield_from_points")
+    h.add_argument("--scene_name", required=True)
+    h.add_argument("--points_ply", required=True)
+    h.add_argument("--out_dir", required=True)
+    h.add_argument("--views_from_reference", default="")
+    h.add_argument("--cameras_json", default="")
+    h.add_argument("--image_names_from_reference", default="")
+    h.add_argument("--width_scale", type=float, default=0.5)
+    h.add_argument("--height_scale", type=float, default=0.5)
+    h.add_argument("--grid_long", type=int, default=420)
+    h.add_argument("--crop_low", type=float, default=0.01)
+    h.add_argument("--crop_high", type=float, default=0.99)
+    h.add_argument("--padding_ratio", type=float, default=0.03)
+    h.add_argument("--min_points_per_cell", type=int, default=3)
+    h.add_argument("--max_height_jump", type=float, default=0.0)
+    h.add_argument("--auto_jump_quantile", type=float, default=0.95)
+    h.add_argument("--auto_jump_scale", type=float, default=3.0)
+    h.add_argument("--support_points_mode", choices=["heightfield", "input"], default="heightfield")
+    h.add_argument("--support_radius_px", type=int, default=2)
+    h.add_argument("--support_depth_tolerance", type=float, default=0.10)
+    h.add_argument("--distance_unit", default="scene_units")
+    h.add_argument("--scale_mode", default="target_frame")
+    h.set_defaults(func=_cmd_heightfield_from_points)
     return parser
 
 
