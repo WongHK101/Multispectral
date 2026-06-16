@@ -18,6 +18,22 @@ FALSE_COLOR_PRODUCTS = {
     "false_color_nir_re_g": ("NIR", "RE", "G"),
 }
 
+INDEX_PSEUDOCOLOR_COLORMAP = "ColorBrewer RdYlGn"
+INDEX_PSEUDOCOLOR_INPUT_RANGE = [-1.0, 1.0]
+INDEX_PSEUDOCOLOR_STOPS = np.array([
+    [0.00, 0.6471, 0.0000, 0.1490],
+    [0.10, 0.8431, 0.1882, 0.1529],
+    [0.20, 0.9569, 0.4275, 0.2627],
+    [0.30, 0.9922, 0.6824, 0.3804],
+    [0.40, 0.9961, 0.8784, 0.5451],
+    [0.50, 1.0000, 1.0000, 0.7490],
+    [0.60, 0.8510, 0.9373, 0.5451],
+    [0.70, 0.6510, 0.8510, 0.4157],
+    [0.80, 0.4000, 0.7412, 0.3882],
+    [0.90, 0.1020, 0.5961, 0.3137],
+    [1.00, 0.0000, 0.4078, 0.2157],
+], dtype=np.float32)
+
 
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,22 +181,15 @@ def _assert_topology_consistency(models: Dict[str, Dict[str, object]], require_o
 
 
 def _make_colormap(values: np.ndarray) -> np.ndarray:
-    stops = np.array([
-        [0.00, 0.20, 0.16, 0.34],
-        [0.35, 0.68, 0.45, 0.16],
-        [0.50, 0.95, 0.90, 0.25],
-        [0.70, 0.26, 0.63, 0.25],
-        [1.00, 0.08, 0.39, 0.14],
-    ], dtype=np.float32)
     values = np.clip(values, 0.0, 1.0)
     rgb = np.empty((values.shape[0], 3), dtype=np.float32)
     for c in range(3):
-        rgb[:, c] = np.interp(values, stops[:, 0], stops[:, c + 1])
+        rgb[:, c] = np.interp(values, INDEX_PSEUDOCOLOR_STOPS[:, 0], INDEX_PSEUDOCOLOR_STOPS[:, c + 1])
     return rgb
 
 
 def _write_product_model(out_dir: Path, out_iter: int, reference_model_dir: Path, reference_vertex,
-                         vertex_out, text_mode: bool) -> None:
+                         vertex_out, text_mode: bool, product_metadata: Dict[str, object] = None) -> None:
     point_cloud_dir = out_dir / "point_cloud" / f"iteration_{out_iter}"
     point_cloud_dir.mkdir(parents=True, exist_ok=True)
     PlyData([PlyElement.describe(vertex_out, "vertex")], text=text_mode).write(str(point_cloud_dir / "point_cloud.ply"))
@@ -199,6 +208,8 @@ def _write_product_model(out_dir: Path, out_iter: int, reference_model_dir: Path
         "out_iter": out_iter,
         "gaussian_count": int(len(reference_vertex)),
     }
+    if product_metadata:
+        summary.update(product_metadata)
     _atomic_write_text(out_dir / "product_summary.json", json.dumps(summary, indent=2), encoding="utf-8")
 
 
@@ -246,7 +257,19 @@ def build_products(model_dirs: Dict[str, Path], iterations: Dict[str, int], out_
     out_root.mkdir(parents=True, exist_ok=True)
     for product_name, mapping in FALSE_COLOR_PRODUCTS.items():
         vertex_out = _build_false_color_vertex(ref_payload, payloads, mapping)
-        _write_product_model(out_root / product_name, out_iter, ref_model_dir, ref_payload["vertex"], vertex_out, getattr(ref_payload["ply"], "text", False))
+        _write_product_model(
+            out_root / product_name,
+            out_iter,
+            ref_model_dir,
+            ref_payload["vertex"],
+            vertex_out,
+            getattr(ref_payload["ply"], "text", False),
+            product_metadata={
+                "product_type": "false_color",
+                "band_mapping": list(mapping),
+                "visualization_only": True,
+            },
+        )
 
     nir = payloads["NIR"]["dc_value"]
     red = payloads["R"]["dc_value"]
@@ -266,8 +289,38 @@ def build_products(model_dirs: Dict[str, Path], iterations: Dict[str, int], out_
         pseudo_rgb = _make_colormap(gray01)
         gray_vertex = _build_index_vertex(ref_payload, gray_rgb)
         pseudo_vertex = _build_index_vertex(ref_payload, pseudo_rgb)
-        _write_product_model(out_root / f"{name}_gray", out_iter, ref_model_dir, ref_payload["vertex"], gray_vertex, getattr(ref_payload["ply"], "text", False))
-        _write_product_model(out_root / f"{name}_pseudocolor", out_iter, ref_model_dir, ref_payload["vertex"], pseudo_vertex, getattr(ref_payload["ply"], "text", False))
+        _write_product_model(
+            out_root / f"{name}_gray",
+            out_iter,
+            ref_model_dir,
+            ref_payload["vertex"],
+            gray_vertex,
+            getattr(ref_payload["ply"], "text", False),
+            product_metadata={
+                "product_type": "spectral_index_gray",
+                "index_name": name.upper(),
+                "index_input_range": INDEX_PSEUDOCOLOR_INPUT_RANGE,
+                "display_mapping": "gray01 = clip((index + 1) * 0.5, 0, 1)",
+                "visualization_only": True,
+            },
+        )
+        _write_product_model(
+            out_root / f"{name}_pseudocolor",
+            out_iter,
+            ref_model_dir,
+            ref_payload["vertex"],
+            pseudo_vertex,
+            getattr(ref_payload["ply"], "text", False),
+            product_metadata={
+                "product_type": "spectral_index_pseudocolor",
+                "index_name": name.upper(),
+                "index_input_range": INDEX_PSEUDOCOLOR_INPUT_RANGE,
+                "display_mapping": "gray01 = clip((index + 1) * 0.5, 0, 1)",
+                "pseudocolor_colormap": INDEX_PSEUDOCOLOR_COLORMAP,
+                "pseudocolor_low_mid_high": ["red: low index", "yellow: near zero", "green: high index"],
+                "visualization_only": True,
+            },
+        )
 
 
 def main() -> None:
