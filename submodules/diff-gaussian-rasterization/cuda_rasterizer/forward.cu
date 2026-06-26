@@ -285,8 +285,13 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ invdepth,
+	float* __restrict__ metric_depth_packet,
+	const float numerical_support_floor,
+	const float normalization_epsilon,
+	const float variance_clamp_tolerance)
 {
+	(void)normalization_epsilon;
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -318,6 +323,10 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
+	float accumulated_alpha = 0.0f;
+	float weighted_camera_z_sum = 0.0f;
+	float weighted_camera_z_second_moment = 0.0f;
+	float weighted_inverse_camera_z_sum = 0.0f;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -371,8 +380,17 @@ renderCUDA(
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
+			float camera_z = depths[collected_id[j]];
+			float weight = alpha * T;
 			if(invdepth)
-			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
+				expected_invdepth += (1 / camera_z) * weight;
+			if(metric_depth_packet)
+			{
+				accumulated_alpha += weight;
+				weighted_camera_z_sum += weight * camera_z;
+				weighted_camera_z_second_moment += weight * camera_z * camera_z;
+				weighted_inverse_camera_z_sum += weight / camera_z;
+			}
 
 			T = test_T;
 
@@ -393,6 +411,40 @@ renderCUDA(
 
 		if (invdepth)
 		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
+
+		if (metric_depth_packet)
+		{
+			const int plane_size = H * W;
+			const float nan_value = nanf("");
+			metric_depth_packet[0 * plane_size + pix_id] = accumulated_alpha;
+			metric_depth_packet[1 * plane_size + pix_id] = weighted_camera_z_sum;
+			metric_depth_packet[2 * plane_size + pix_id] = weighted_camera_z_second_moment;
+			metric_depth_packet[3 * plane_size + pix_id] = weighted_inverse_camera_z_sum;
+			if (accumulated_alpha <= numerical_support_floor)
+			{
+				metric_depth_packet[4 * plane_size + pix_id] = nan_value;
+				metric_depth_packet[5 * plane_size + pix_id] = nan_value;
+				metric_depth_packet[6 * plane_size + pix_id] = nan_value;
+				metric_depth_packet[7 * plane_size + pix_id] = nan_value;
+				metric_depth_packet[8 * plane_size + pix_id] = 0.0f;
+			}
+			else
+			{
+				const float expected_camera_z = weighted_camera_z_sum / accumulated_alpha;
+				const float expected_inverse_camera_z = weighted_inverse_camera_z_sum / accumulated_alpha;
+				float harmonic_camera_z = nan_value;
+				if (weighted_inverse_camera_z_sum > 0.0f)
+					harmonic_camera_z = accumulated_alpha / weighted_inverse_camera_z_sum;
+				float variance = weighted_camera_z_second_moment / accumulated_alpha - expected_camera_z * expected_camera_z;
+				if (variance < 0.0f && variance >= -variance_clamp_tolerance)
+					variance = 0.0f;
+				metric_depth_packet[4 * plane_size + pix_id] = expected_camera_z;
+				metric_depth_packet[5 * plane_size + pix_id] = expected_inverse_camera_z;
+				metric_depth_packet[6 * plane_size + pix_id] = harmonic_camera_z;
+				metric_depth_packet[7 * plane_size + pix_id] = variance;
+				metric_depth_packet[8 * plane_size + pix_id] = 1.0f;
+			}
+		}
 	}
 }
 
@@ -409,7 +461,11 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* depths,
-	float* depth)
+	float* depth,
+	float* metric_depth_packet,
+	float numerical_support_floor,
+	float normalization_epsilon,
+	float variance_clamp_tolerance)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -423,7 +479,11 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		depths, 
-		depth);
+		depth,
+		metric_depth_packet,
+		numerical_support_floor,
+		normalization_epsilon,
+		variance_clamp_tolerance);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

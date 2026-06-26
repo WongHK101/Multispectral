@@ -15,7 +15,20 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(
+    viewpoint_camera,
+    pc : GaussianModel,
+    pipe,
+    bg_color : torch.Tensor,
+    scaling_modifier = 1.0,
+    separate_sh = False,
+    override_color = None,
+    use_trained_exp=False,
+    return_metric_depth_packet=False,
+    numerical_support_floor=1e-6,
+    normalization_epsilon=1e-12,
+    variance_clamp_tolerance=1e-6,
+):
     """
     Render the scene. 
     
@@ -46,7 +59,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        antialiasing=pipe.antialiasing,
+        return_metric_depth_packet=return_metric_depth_packet,
+        numerical_support_floor=float(numerical_support_floor),
+        normalization_epsilon=float(normalization_epsilon),
+        variance_clamp_tolerance=float(variance_clamp_tolerance),
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -87,8 +104,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    metric_depth_packet = None
     if separate_sh:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_outputs = rasterizer(
             means3D = means3D,
             means2D = means2D,
             dc = dc,
@@ -99,7 +117,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     else:
-        rendered_image, radii, depth_image = rasterizer(
+        raster_outputs = rasterizer(
             means3D = means3D,
             means2D = means2D,
             shs = shs,
@@ -108,6 +126,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
+    if return_metric_depth_packet:
+        rendered_image, radii, depth_image, metric_depth_packet = raster_outputs
+    else:
+        rendered_image, radii, depth_image = raster_outputs
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
@@ -124,5 +146,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "radii": radii,
         "depth" : depth_image
         }
+    if return_metric_depth_packet:
+        out["metric_depth_packet"] = metric_depth_packet
     
     return out

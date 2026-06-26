@@ -62,7 +62,11 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* depths,
-		float* depth);
+		float* depth,
+		float* metric_depth_packet,
+		float numerical_support_floor,
+		float normalization_epsilon,
+		float variance_clamp_tolerance);
 }
 
 
