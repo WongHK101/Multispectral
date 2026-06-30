@@ -22,3 +22,17 @@ _remote_backups_*/
 *.bak_*
 *.codex_sync_*
 check_minima_autodl.py
+/_machine_local/
+/outputs/
+/runs/
+/checkpoints/
+/AGENTS.md
+/WORKLOG.md
+/PROJECT_TASK_CHECKLIST.md
+_sync_backups_*/
+sync_backups_*/
+.pytest_cache/
+build/
+*.egg-info/
+*.so
+*.pyd
