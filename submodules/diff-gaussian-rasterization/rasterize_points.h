@@ -36,9 +36,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& campos,
 	const bool prefiltered,
 	const bool antialiasing,
-	const bool return_metric_depth_packet,
-	const float numerical_support_floor,
-	const float normalization_epsilon,
+	const bool return_expected_camera_z_packet,
+	const float opacity_epsilon,
 	const float variance_clamp_tolerance,
 	const bool debug);
 

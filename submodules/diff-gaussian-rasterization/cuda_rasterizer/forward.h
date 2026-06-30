@@ -63,9 +63,8 @@ namespace FORWARD
 		float* out_color,
 		float* depths,
 		float* depth,
-		float* metric_depth_packet,
-		float numerical_support_floor,
-		float normalization_epsilon,
+		float* expected_camera_z_packet,
+		float opacity_epsilon,
 		float variance_clamp_tolerance);
 }
 

@@ -24,9 +24,8 @@ def render(
     separate_sh = False,
     override_color = None,
     use_trained_exp=False,
-    return_metric_depth_packet=False,
-    numerical_support_floor=1e-6,
-    normalization_epsilon=1e-12,
+    return_expected_camera_z_packet=False,
+    opacity_epsilon=1e-6,
     variance_clamp_tolerance=1e-6,
 ):
     """
@@ -60,9 +59,8 @@ def render(
         prefiltered=False,
         debug=pipe.debug,
         antialiasing=pipe.antialiasing,
-        return_metric_depth_packet=return_metric_depth_packet,
-        numerical_support_floor=float(numerical_support_floor),
-        normalization_epsilon=float(normalization_epsilon),
+        return_expected_camera_z_packet=return_expected_camera_z_packet,
+        opacity_epsilon=float(opacity_epsilon),
         variance_clamp_tolerance=float(variance_clamp_tolerance),
     )
 
@@ -104,7 +102,7 @@ def render(
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    metric_depth_packet = None
+    expected_camera_z_packet = None
     if separate_sh:
         raster_outputs = rasterizer(
             means3D = means3D,
@@ -126,8 +124,8 @@ def render(
             scales = scales,
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
-    if return_metric_depth_packet:
-        rendered_image, radii, depth_image, metric_depth_packet = raster_outputs
+    if return_expected_camera_z_packet:
+        rendered_image, radii, depth_image, expected_camera_z_packet = raster_outputs
     else:
         rendered_image, radii, depth_image = raster_outputs
         
@@ -146,7 +144,7 @@ def render(
         "radii": radii,
         "depth" : depth_image
         }
-    if return_metric_depth_packet:
-        out["metric_depth_packet"] = metric_depth_packet
+    if return_expected_camera_z_packet:
+        out["expected_camera_z_packet"] = expected_camera_z_packet
     
     return out

@@ -77,25 +77,24 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.campos,
             raster_settings.prefiltered,
             raster_settings.antialiasing,
-            raster_settings.return_metric_depth_packet,
-            raster_settings.numerical_support_floor,
-            raster_settings.normalization_epsilon,
+            raster_settings.return_expected_camera_z_packet,
+            raster_settings.opacity_epsilon,
             raster_settings.variance_clamp_tolerance,
             raster_settings.debug
         )
 
         # Invoke C++/CUDA rasterizer
-        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, metric_depth_packet = _C.rasterize_gaussians(*args)
-        ctx.mark_non_differentiable(metric_depth_packet)
+        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, expected_camera_z_packet = _C.rasterize_gaussians(*args)
+        ctx.mark_non_differentiable(expected_camera_z_packet)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, opacities, geomBuffer, binningBuffer, imgBuffer)
-        return color, radii, invdepths, metric_depth_packet
+        return color, radii, invdepths, expected_camera_z_packet
 
     @staticmethod
-    def backward(ctx, grad_out_color, _, grad_out_depth, grad_out_metric_depth_packet):
+    def backward(ctx, grad_out_color, _, grad_out_depth, grad_out_expected_camera_z_packet):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -159,9 +158,8 @@ class GaussianRasterizationSettings(NamedTuple):
     prefiltered : bool
     debug : bool
     antialiasing : bool
-    return_metric_depth_packet : bool = False
-    numerical_support_floor : float = 1e-6
-    normalization_epsilon : float = 1e-12
+    return_expected_camera_z_packet : bool = False
+    opacity_epsilon : float = 1e-6
     variance_clamp_tolerance : float = 1e-6
 
 class GaussianRasterizer(nn.Module):
@@ -203,7 +201,7 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
-        color, radii, invdepths, metric_depth_packet = rasterize_gaussians(
+        color, radii, invdepths, expected_camera_z_packet = rasterize_gaussians(
             means3D,
             means2D,
             shs,
@@ -214,7 +212,7 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp,
             raster_settings, 
         )
-        if raster_settings.return_metric_depth_packet:
-            return color, radii, invdepths, metric_depth_packet
+        if raster_settings.return_expected_camera_z_packet:
+            return color, radii, invdepths, expected_camera_z_packet
         return color, radii, invdepths
 

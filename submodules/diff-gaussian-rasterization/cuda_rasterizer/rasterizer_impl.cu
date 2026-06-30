@@ -217,10 +217,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,
 	float* out_color,
 	float* depth,
-	float* metric_depth_packet,
-	bool return_metric_depth_packet,
-	float numerical_support_floor,
-	float normalization_epsilon,
+	float* expected_camera_z_packet,
+	bool return_expected_camera_z_packet,
+	float opacity_epsilon,
 	float variance_clamp_tolerance,
 	bool antialiasing,
 	int* radii,
@@ -341,9 +340,8 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color,
 		geomState.depths,
 		depth,
-		return_metric_depth_packet ? metric_depth_packet : nullptr,
-		numerical_support_floor,
-		normalization_epsilon,
+		return_expected_camera_z_packet ? expected_camera_z_packet : nullptr,
+		opacity_epsilon,
 		variance_clamp_tolerance), debug)
 
 	return num_rendered;
