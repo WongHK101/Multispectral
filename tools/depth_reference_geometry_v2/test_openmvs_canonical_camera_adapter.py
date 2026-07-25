@@ -484,7 +484,7 @@ def test_validator_semantics_and_negative_cases() -> dict[str, Any]:
     return results
 
 
-def test_actual_road_fingerprint(path: Path) -> dict[str, Any]:
+def actual_road_fingerprint(path: Path) -> dict[str, Any]:
     record = load_umgs_canonical_camera(path, expected_target="DJI_20260602165038_0001_D.JPG", expected_width=1200, expected_height=869)
     cam_points = np.array(
         [
@@ -544,7 +544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_test("validator_semantics_and_negative_cases", test_validator_semantics_and_negative_cases, results)
     if args.road_fingerprint:
         road_path = Path(args.road_fingerprint)
-        run_test("actual_road_fingerprint_projection", lambda: test_actual_road_fingerprint(road_path), results)
+        run_test("actual_road_fingerprint_projection", lambda: actual_road_fingerprint(road_path), results)
     else:
         results.append({"test": "actual_road_fingerprint_projection", "status": "skipped", "reason": "no --road-fingerprint provided"})
         print("SKIP actual_road_fingerprint_projection")
