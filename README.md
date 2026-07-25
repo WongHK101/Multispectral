@@ -13,6 +13,33 @@ The current mainline supports:
 
 The repository includes the current multispectral training pipeline, raw-scene rectification workflow, protocol-freezing utilities, product export, and offline evaluation scripts.
 
+## Repository Scope and Local Workbench
+
+This parent repository tracks the reusable UMGS/SpectralIndexGS algorithm,
+runtime modules, protocol utilities, and reproducibility-critical evaluation
+code. It intentionally does not version datasets, trained models, experiment
+outputs, manuscript assets, downloaded third-party checkouts, transfer caches,
+or one-off diagnostic/figure-generation scripts.
+
+Local one-off scripts and historical helpers belong under:
+
+```text
+_local_workbench/
+```
+
+That directory is ignored by this repository. Manuscript and submission assets
+belong under:
+
+```text
+AuthorKit27/
+```
+
+The parent repository also ignores `AuthorKit27/`. A manuscript directory
+inside it may still be initialized and pushed as an independent nested Git
+repository. Always run manuscript Git commands from the manuscript directory
+(or with `git -C <manuscript-dir> ...`); do not add it to this parent repository
+or convert it to a submodule unless that is an explicit project decision.
+
 ## 1. What Is Included
 
 The main entry points are:

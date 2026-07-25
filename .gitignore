@@ -36,3 +36,23 @@ build/
 *.egg-info/
 *.so
 *.pyd
+
+# Parent-repository boundary: manuscript/submission assets are managed by a
+# separate nested repository and must never be staged in Multispectral.
+/AuthorKit27/
+/AAAI-camera/
+
+# Local-only one-off scripts, audits, downloaded dependencies, caches, and
+# historical recovery packets. Preserve them on disk but keep them out of the
+# core algorithm repository.
+/_local_workbench/
+/cleanup_audits/
+/external/
+/literature_review/
+/tmp/
+/transfer_cache/
+/worktrees/
+/P0R1_20260723_FAILED_SORT_ORDER/
+/UMGS_P0_AUTHORITY_RECOVERY_20260723_v1/
+/%MULTISPEC_LOG%
+/.agents/
