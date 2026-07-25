@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List
 
@@ -36,6 +37,16 @@ def _capture_key(path: Path, channel: str) -> str | None:
     if not m:
         return None
     return f"{m.group('stem')}_{m.group('frame')}"
+
+
+def _frame_id(path: Path, channel: str) -> str | None:
+    """Return the camera frame counter without assuming equal sensor timestamps."""
+    name = path.name
+    if channel == "D":
+        m = RGB_FRAME_RE.match(name)
+    else:
+        m = MS_FRAME_RE.match(name)
+    return m.group("frame") if m else None
 
 
 def _flat_channel_files(input_root: Path, channel: str) -> List[Path]:
@@ -95,17 +106,50 @@ def _normalize_uint16_png(img: Image.Image) -> Image.Image:
     return Image.fromarray(out, mode="I;16")
 
 
-def _convert_tiff_to_png(src: Path, dst: Path) -> Dict[str, object]:
+def _convert_tiff_to_png(
+    src: Path,
+    dst: Path,
+    compress_level: int = 6,
+    backend: str = "pil",
+) -> Dict[str, object]:
+    if backend == "opencv":
+        import cv2
+
+        arr = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            raise RuntimeError(f"OpenCV could not read {src}")
+        if arr.ndim != 2 or arr.dtype != np.uint16:
+            raise ValueError(f"Expected uint16 single-channel TIFF, got shape={arr.shape} dtype={arr.dtype}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(
+            str(dst),
+            arr,
+            [cv2.IMWRITE_PNG_COMPRESSION, int(compress_level)],
+        ):
+            raise RuntimeError(f"OpenCV could not write {dst}")
+        return {
+            "src": str(src),
+            "dst": str(dst),
+            "src_mode": str(arr.dtype),
+            "src_size": [int(arr.shape[1]), int(arr.shape[0])],
+            "dst_mode": "uint16",
+            "png_compress_level": int(compress_level),
+            "image_backend": "opencv",
+        }
+    if backend != "pil":
+        raise ValueError(f"Unsupported image backend: {backend}")
     with Image.open(src) as img:
         png = _normalize_uint16_png(img)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        png.save(dst, format="PNG")
+        png.save(dst, format="PNG", compress_level=int(compress_level))
         return {
             "src": str(src),
             "dst": str(dst),
             "src_mode": str(img.mode),
             "src_size": [int(img.size[0]), int(img.size[1])],
             "dst_mode": str(png.mode),
+            "png_compress_level": int(compress_level),
+            "image_backend": "pil",
         }
 
 
@@ -133,6 +177,36 @@ def _copy_gps_metadata(src: Path, dst: Path, exiftool_cmd: str) -> Dict[str, obj
     }
 
 
+def _prepare_file_job(job: tuple[str, str, str, str, bool, int, str]) -> tuple[str, str, str | None, dict, bool]:
+    src_text, dst_dir_text, channel, link_mode, force_copy_d, png_compress_level, image_backend = job
+    src = Path(src_text)
+    dst_dir = Path(dst_dir_text)
+    cap_key = _capture_key(src, channel)
+    ext = src.suffix.lower()
+    if ext in {".tif", ".tiff"}:
+        dst = dst_dir / f"{src.stem}.png"
+        rec = _convert_tiff_to_png(
+            src,
+            dst,
+            compress_level=png_compress_level,
+            backend=image_backend,
+        )
+        rec["action"] = "convert_tiff_to_png"
+        converted = True
+    else:
+        dst = dst_dir / src.name
+        materialize_mode = "copy" if channel == "D" and force_copy_d else link_mode
+        action = _link_or_copy(src, dst, materialize_mode)
+        rec = {
+            "src": str(src),
+            "dst": str(dst),
+            "action": action,
+            "requested_link_mode": link_mode,
+        }
+        converted = False
+    return str(src), str(dst), cap_key, rec, converted
+
+
 def prepare_input(
     input_root: Path,
     output_root: Path,
@@ -141,6 +215,9 @@ def prepare_input(
     overwrite: bool,
     gps_copy_from_band: str | None = None,
     exiftool_cmd: str = "exiftool",
+    max_workers: int = 1,
+    png_compress_level: int = 6,
+    image_backend: str = "pil",
 ) -> Dict[str, object]:
     input_root = input_root.resolve()
     output_root = output_root.resolve()
@@ -157,6 +234,9 @@ def prepare_input(
         "output_root": str(output_root),
         "channels": channels,
         "link_mode": link_mode,
+        "max_workers": int(max_workers),
+        "png_compress_level": int(png_compress_level),
+        "image_backend": str(image_backend),
         "conversion_policy": {
             "tiff_to_png": True,
             "png_mode": "uint16_preserve_range",
@@ -171,6 +251,8 @@ def prepare_input(
     total_converted = 0
     total_linked = 0
     source_index: Dict[str, Dict[str, Path]] = {}
+    source_frame_index: Dict[str, Dict[str, Path]] = {}
+    ambiguous_source_frames: Dict[str, set[str]] = {}
     output_index: Dict[str, Dict[str, Path]] = {}
     for channel in channels:
         src_dir = input_root / channel
@@ -190,6 +272,8 @@ def prepare_input(
         dst_dir = output_root / channel
         dst_dir.mkdir(parents=True, exist_ok=True)
         source_index[channel] = {}
+        source_frame_index[channel] = {}
+        ambiguous_source_frames[channel] = set()
         output_index[channel] = {}
 
         ch_info = {
@@ -204,38 +288,51 @@ def prepare_input(
         if not files:
             log_warn(f"No files found in channel directory: {src_dir}")
 
-        for src in files:
-            cap_key = _capture_key(src, channel)
-            if cap_key is not None:
-                source_index[channel][cap_key] = src
-            ext = src.suffix.lower()
-            if ext in {".tif", ".tiff"}:
-                dst = dst_dir / f"{src.stem}.png"
-                rec = _convert_tiff_to_png(src, dst)
-                rec["action"] = "convert_tiff_to_png"
+        workers = max(1, int(max_workers))
+        jobs = [
+            (
+                str(src),
+                str(dst_dir),
+                channel,
+                link_mode,
+                gps_copy_from_band is not None,
+                int(png_compress_level),
+                str(image_backend),
+            )
+            for src in files
+        ]
+        if workers == 1:
+            prepared = map(_prepare_file_job, jobs)
+        else:
+            executor = ProcessPoolExecutor(max_workers=workers)
+            prepared = executor.map(_prepare_file_job, jobs)
+
+        try:
+            for src_text, dst_text, cap_key, rec, converted in prepared:
+                src = Path(src_text)
+                dst = Path(dst_text)
+                if cap_key is not None:
+                    source_index[channel][cap_key] = src
+                    output_index[channel][cap_key] = dst
+                frame_id = _frame_id(src, channel)
+                if frame_id is not None:
+                    previous = source_frame_index[channel].get(frame_id)
+                    if previous is not None and previous != src:
+                        source_frame_index[channel].pop(frame_id, None)
+                        ambiguous_source_frames[channel].add(frame_id)
+                    elif frame_id not in ambiguous_source_frames[channel]:
+                        source_frame_index[channel][frame_id] = src
                 summary["records"].append(rec)
-                ch_info["num_converted_tiff"] += 1
-                total_converted += 1
                 ch_info["output_files"].append(dst.name)
-            else:
-                dst = dst_dir / src.name
-                materialize_mode = link_mode
-                if channel == "D" and gps_copy_from_band is not None:
-                    # D outputs are edited by exiftool when GPS is migrated, so they
-                    # must be independent files rather than hardlinks to raw data.
-                    materialize_mode = "copy"
-                action = _link_or_copy(src, dst, materialize_mode)
-                summary["records"].append({
-                    "src": str(src),
-                    "dst": str(dst),
-                    "action": action,
-                    "requested_link_mode": link_mode,
-                })
-                ch_info["num_linked_or_copied"] += 1
-                total_linked += 1
-                ch_info["output_files"].append(dst.name)
-            if cap_key is not None:
-                output_index[channel][cap_key] = dst
+                if converted:
+                    ch_info["num_converted_tiff"] += 1
+                    total_converted += 1
+                else:
+                    ch_info["num_linked_or_copied"] += 1
+                    total_linked += 1
+        finally:
+            if workers != 1:
+                executor.shutdown(wait=True)
 
         summary["per_channel"][channel] = ch_info
         log_info(
@@ -252,10 +349,19 @@ def prepare_input(
                 f"gps_copy_from_band={gps_copy_from_band!r} is not present in channels={channels!r}"
             )
         migrated = 0
+        frame_fallback = 0
         missing_source = 0
         missing_target = 0
         for cap_key, dst_d in sorted(output_index["D"].items()):
             src_band = source_index[gps_copy_from_band].get(cap_key)
+            pairing_mode = "exact_capture_key"
+            if src_band is None:
+                frame_id = _frame_id(dst_d, "D")
+                if frame_id is not None and frame_id not in ambiguous_source_frames[gps_copy_from_band]:
+                    src_band = source_frame_index[gps_copy_from_band].get(frame_id)
+                    if src_band is not None:
+                        pairing_mode = "unique_frame_fallback"
+                        frame_fallback += 1
             if src_band is None:
                 missing_source += 1
                 log_warn(f"Missing GPS source for capture={cap_key} band={gps_copy_from_band}")
@@ -267,19 +373,22 @@ def prepare_input(
             rec = _copy_gps_metadata(src_band, dst_d, exiftool_cmd=exiftool_cmd)
             rec["capture_key"] = cap_key
             rec["gps_source_band"] = gps_copy_from_band
+            rec["pairing_mode"] = pairing_mode
             summary["gps_copy_records"].append(rec)
             migrated += 1
         summary["gps_copy_summary"] = {
             "enabled": True,
             "gps_source_band": gps_copy_from_band,
             "num_migrated": migrated,
+            "num_unique_frame_fallback": frame_fallback,
             "num_missing_source": missing_source,
             "num_missing_target": missing_target,
             "exiftool_cmd": exiftool_cmd,
         }
         log_info(
             f"Copied GPS metadata from {gps_copy_from_band} to D: "
-            f"migrated={migrated} missing_source={missing_source} missing_target={missing_target}"
+            f"migrated={migrated} frame_fallback={frame_fallback} "
+            f"missing_source={missing_source} missing_target={missing_target}"
         )
     else:
         summary["gps_copy_summary"] = {
@@ -335,6 +444,25 @@ def main() -> None:
         default="exiftool",
         help="Executable used for GPS metadata migration when --gps_copy_from_band is set.",
     )
+    ap.add_argument(
+        "--max_workers",
+        type=int,
+        default=1,
+        help="Number of independent image preparations to run concurrently (default: 1).",
+    )
+    ap.add_argument(
+        "--png_compress_level",
+        type=int,
+        choices=range(10),
+        default=6,
+        help="Lossless PNG compression level, 0-9 (default: 6).",
+    )
+    ap.add_argument(
+        "--image_backend",
+        choices=["pil", "opencv"],
+        default="pil",
+        help="Lossless TIFF/PNG I/O backend (default: pil).",
+    )
     args = ap.parse_args()
 
     channels = [c.strip() for c in str(args.channels).split(",") if c.strip()]
@@ -344,8 +472,15 @@ def main() -> None:
         channels=channels,
         link_mode=str(args.link_mode),
         overwrite=bool(args.overwrite),
-        gps_copy_from_band=(str(args.gps_copy_from_band).strip() or None),
+        gps_copy_from_band=(
+            str(args.gps_copy_from_band).strip()
+            if args.gps_copy_from_band is not None
+            else None
+        ),
         exiftool_cmd=str(args.exiftool_cmd),
+        max_workers=int(args.max_workers),
+        png_compress_level=int(args.png_compress_level),
+        image_backend=str(args.image_backend),
     )
 
 

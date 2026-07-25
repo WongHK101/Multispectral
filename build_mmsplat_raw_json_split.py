@@ -56,6 +56,58 @@ def _load_eval_d_names_from_cameras(cameras_json: Path) -> List[str]:
     return names
 
 
+def _load_split_d_names(split_json: Path) -> Tuple[List[str], List[str], dict]:
+    payload = json.loads(split_json.read_text(encoding="utf-8"))
+    train_rows = payload.get("train", [])
+    test_rows = payload.get("test", payload.get("eval", []))
+    if not isinstance(train_rows, list) or not isinstance(test_rows, list):
+        raise RuntimeError(f"Expected train/test lists in {split_json}")
+
+    def image_names(rows: List[object], label: str) -> List[str]:
+        names: List[str] = []
+        for row in rows:
+            if isinstance(row, dict):
+                value = row.get("image_name")
+            else:
+                value = row
+            if not value:
+                raise RuntimeError(f"Malformed {label} row in {split_json}: {row!r}")
+            names.append(str(value))
+        if len(names) != len(set(names)):
+            raise RuntimeError(f"Duplicate {label} image names in {split_json}")
+        return names
+
+    train_names = image_names(train_rows, "train")
+    test_names = image_names(test_rows, "test")
+    overlap = sorted(set(train_names) & set(test_names))
+    if overlap:
+        raise RuntimeError(f"Train/test overlap in {split_json}: {overlap[:8]}")
+    declared_train = payload.get("train_count")
+    declared_test = payload.get("test_count")
+    declared_total = payload.get("total_count")
+    if declared_train is not None and int(declared_train) != len(train_names):
+        raise RuntimeError(
+            f"train_count mismatch in {split_json}: declared={declared_train} actual={len(train_names)}"
+        )
+    if declared_test is not None and int(declared_test) != len(test_names):
+        raise RuntimeError(
+            f"test_count mismatch in {split_json}: declared={declared_test} actual={len(test_names)}"
+        )
+    if declared_total is not None and int(declared_total) != len(train_names) + len(test_names):
+        raise RuntimeError(
+            f"total_count mismatch in {split_json}: declared={declared_total} "
+            f"actual={len(train_names) + len(test_names)}"
+        )
+    metadata = {
+        "schema": payload.get("schema"),
+        "scene_id": payload.get("scene_id"),
+        "split_name": payload.get("split_name"),
+        "declared_train_sha256": payload.get("train_sha256"),
+        "declared_test_sha256": payload.get("test_sha256"),
+    }
+    return train_names, test_names, metadata
+
+
 def _group_key(path: Path, group_mode: str) -> str | None:
     tokens = _capture_tokens(path)
     if tokens is None:
@@ -116,6 +168,7 @@ def build_split(
     raw_root: Path,
     cameras_json: Path | None,
     eval_hold: int | None,
+    split_json: Path | None,
     out_json: Path,
     audit_json: Path | None,
     group_mode: str,
@@ -123,21 +176,37 @@ def build_split(
     complete = _collect_complete_groups(raw_root, group_mode=group_mode)
     if not complete:
         raise RuntimeError(f"No complete D/MS_G/MS_R/MS_RE/MS_NIR groups found under {raw_root}")
-    if cameras_json is not None:
+    split_metadata = None
+    explicit_train_d_names: set[str] | None = None
+    if split_json is not None:
+        train_d_names, test_d_names, split_metadata = _load_split_d_names(split_json)
+        explicit_train_d_names = set(train_d_names)
+        eval_d_names = set(test_d_names)
+        eval_source = f"benchmark_split_json:{split_json}"
+    elif cameras_json is not None:
         eval_d_names = set(_load_eval_d_names_from_cameras(cameras_json))
         eval_source = f"cameras_json:{cameras_json}"
     elif eval_hold is not None:
         eval_d_names = set(_eval_d_names_from_hold(complete, eval_hold=eval_hold))
         eval_source = f"llffhold:{eval_hold}"
     else:
-        raise RuntimeError("Either cameras_json or eval_hold must be provided.")
+        raise RuntimeError("One of split_json, cameras_json, or eval_hold must be provided.")
 
     missing_eval = sorted(eval_d_names - {row["d_name"] for row in complete})
     if missing_eval:
         raise RuntimeError(
-            f"{len(missing_eval)} eval D images from {cameras_json} are not present as complete groups under {raw_root}. "
+            f"{len(missing_eval)} eval D images from {eval_source} are not present as complete groups under {raw_root}. "
             f"First missing: {missing_eval[:8]}"
         )
+    if explicit_train_d_names is not None:
+        present_d_names = {row["d_name"] for row in complete}
+        missing_train = sorted(explicit_train_d_names - present_d_names)
+        unexpected = sorted(present_d_names - explicit_train_d_names - eval_d_names)
+        if missing_train or unexpected:
+            raise RuntimeError(
+                f"Benchmark split/raw mismatch under {raw_root}: "
+                f"missing_train={missing_train[:8]} unexpected={unexpected[:8]}"
+            )
 
     train_entries: List[str] = []
     eval_entries: List[str] = []
@@ -167,6 +236,8 @@ def build_split(
     audit = {
         "raw_root": str(raw_root),
         "cameras_json": str(cameras_json) if cameras_json is not None else "",
+        "split_json": str(split_json) if split_json is not None else "",
+        "split_metadata": split_metadata,
         "eval_hold": int(eval_hold) if eval_hold is not None else None,
         "eval_source": eval_source,
         "output_json": str(out_json),
@@ -196,6 +267,10 @@ def main() -> None:
     )
     ap.add_argument("--raw_root", required=True, help="Flat raw directory containing D and MS_* files.")
     group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--split_json",
+        help="Frozen UAV-MultiSpec3D split_v1.json containing exact train/test D image names.",
+    )
     group.add_argument("--cameras_json", help="Reference E3 Model_*/cameras.json listing eval D views.")
     group.add_argument("--eval_hold", type=int, help="Use legacy llffhold on lexicographically sorted D names.")
     ap.add_argument("--out_json", required=True, help="Strict json-list split output path.")
@@ -212,6 +287,7 @@ def main() -> None:
         raw_root=Path(args.raw_root).resolve(),
         cameras_json=Path(args.cameras_json).resolve() if args.cameras_json else None,
         eval_hold=args.eval_hold,
+        split_json=Path(args.split_json).resolve() if args.split_json else None,
         out_json=Path(args.out_json).resolve(),
         audit_json=Path(args.audit_json).resolve() if args.audit_json else None,
         group_mode=args.group_mode,
