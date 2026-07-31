@@ -78,9 +78,12 @@ def build_minima_matcher(
 
 
 def _prepare_minima_imports(minima_root: str | Path) -> Path:
-    root = Path(minima_root).resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"MINIMA root does not exist: {root}")
+    raw_root = str(minima_root).strip()
+    if not raw_root:
+        raise ValueError("MINIMA root must be provided explicitly.")
+    root = Path(raw_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"MINIMA root directory does not exist: {root}")
     _append_sys_path(root)
     _append_sys_path(root / "third_party" / "RoMa_minima")
     return root
@@ -90,7 +93,7 @@ class MinimaMatcherBridge:
     def __init__(
         self,
         backend: str = "roma",
-        minima_root: str | Path = r"G:\2DSOTA\MINIMA",
+        minima_root: str | Path = r"",
         device: str = "cuda",
         ckpt: str = "",
         roma_size: str = "large",

@@ -2,7 +2,7 @@
 """Validate a canonical OpenMVS triangle render packet.
 
 This validator checks only camera/raster/support semantics for a canonical
-OpenMVS triangle-rendered proxy. It does not compute OpenMVS/UMGS/DA3
+OpenMVS triangle-rendered proxy. It does not compute cross-proxy
 alignment metrics and does not make geometry-accuracy claims.
 """
 

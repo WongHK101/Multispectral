@@ -20,7 +20,7 @@ from tools.depth_reference_geometry_v2.validate_umgs_expected_camera_z_single_pa
 
 
 EXPECTED = {
-    "scene": "maize_02_20260526_1658",
+    "scene": "synthetic_scene",
     "target": "DJI_20260526170850_0001_D.JPG",
     "checkpoint": "c" * 64,
     "camera": "a" * 64,

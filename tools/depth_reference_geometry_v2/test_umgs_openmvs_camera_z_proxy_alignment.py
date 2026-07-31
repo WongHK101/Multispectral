@@ -15,8 +15,8 @@ import numpy as np
 import evaluate_umgs_openmvs_camera_z_proxy_alignment as ev
 
 
-SCENE = "road_01_20260602_1648_40m"
-TARGET = "DJI_20260602165038_0001_D.JPG"
+SCENE = "synthetic_scene"
+TARGET = "DJI_20260101000000_0001_D.JPG"
 CHECKPOINT_SHA = "e3c79257692ca8197e208560d2e001c54bbdef4425d39a4fc11c0301b9d3394a"
 UMGS_RUNTIME_SHA = "d06a2331199c2ef44773d31c4cdabcf40cefa054d1206655a7ad1e93bf7753ed"
 OPENMVS_RUNTIME_SHA = "a964ce1af9e92449ae48e4cb8e6d1acfd0240d9bd105efa88a3782ac6f3f93e0"
@@ -82,10 +82,10 @@ def make_runtime_manifest(path: Path, repo_root: Path) -> tuple[str, dict[str, s
     src_dir = repo_root / "synthetic_sources"
     src_dir.mkdir(parents=True, exist_ok=True)
     evaluator = src_dir / "evaluate_umgs_openmvs_camera_z_proxy_alignment.py"
-    control = src_dir / "openmvs_da3_overlap_corrected.py"
+    control = src_dir / "proxy_alignment_metrics.py"
     evaluator.write_text("synthetic evaluator\n", encoding="utf-8")
-    control.write_text("synthetic corrected control\n", encoding="utf-8")
-    shas = {"evaluator": sha256(evaluator), "negative_control_source": sha256(control)}
+    control.write_text("synthetic proxy metric source\n", encoding="utf-8")
+    shas = {"evaluator": sha256(evaluator), "metric_source": sha256(control)}
     write_json(
         path,
         {
@@ -94,7 +94,7 @@ def make_runtime_manifest(path: Path, repo_root: Path) -> tuple[str, dict[str, s
             "environment": {"python": "synthetic", "numpy": np.__version__, "scipy": ev.scipy.__version__},
             "sources": [
                 {"role": "evaluator", "repo_relative_path": str(evaluator.relative_to(repo_root)), "sha256": shas["evaluator"]},
-                {"role": "negative_control_source", "repo_relative_path": str(control.relative_to(repo_root)), "sha256": shas["negative_control_source"]},
+                {"role": "metric_source", "repo_relative_path": str(control.relative_to(repo_root)), "sha256": shas["metric_source"]},
             ],
         },
     )
@@ -181,9 +181,9 @@ def make_case(
 
     fingerprint = root / "fingerprint.json"
     fp_file_sha, fp_payload_sha = make_fingerprint(fingerprint, image_width=shape[1], image_height=shape[0])
-    runtime_manifest = root / "layer2_runtime_source_manifest.json"
+    runtime_manifest = root / "proxy_runtime_source_manifest.json"
     runtime_manifest_sha, runtime_source_shas = make_runtime_manifest(runtime_manifest, root)
-    frame_decision = root / "ROAD0001_FRAME_SCALE_CORRESPONDENCE_DECISION.json"
+    frame_decision = root / "frame_scale_correspondence_decision.json"
     frame_decision_sha = make_frame_decision(frame_decision, shape, fp_file_sha, fp_payload_sha)
 
     umgs_manifest = root / "umgs_manifest.json"
@@ -274,8 +274,8 @@ def make_case(
         openmvs_core_sha256=CORE_SHA,
         frame_scale_decision_json=frame_decision,
         frame_scale_decision_sha256=frame_decision_sha,
-        layer2_runtime_source_manifest=runtime_manifest,
-        layer2_runtime_source_manifest_sha256=runtime_manifest_sha,
+        runtime_source_manifest=runtime_manifest,
+        runtime_source_manifest_sha256=runtime_manifest_sha,
         expected_scene=SCENE,
         expected_target=TARGET,
         expected_height=shape[0],
@@ -575,21 +575,21 @@ def test_insufficient_shared_control_support_not_evaluated() -> None:
         assert "true_core_metrics_on_shared" not in out
 
 
-def test_control_source_sha_mismatch_fails() -> None:
+def test_metric_source_sha_mismatch_fails() -> None:
     with tempfile.TemporaryDirectory() as td:
         args = make_case(Path(td), umgs_z=base_grid(), openmvs_z=base_grid())
-        args.layer2_runtime_source_manifest_sha256 = sha256(args.layer2_runtime_source_manifest)
-        m = json.loads(args.layer2_runtime_source_manifest.read_text(encoding="utf-8"))
+        args.runtime_source_manifest_sha256 = sha256(args.runtime_source_manifest)
+        m = json.loads(args.runtime_source_manifest.read_text(encoding="utf-8"))
         for row in m["sources"]:
-            if row["role"] == "negative_control_source":
+            if row["role"] == "metric_source":
                 row["sha256"] = "bad"
-        write_json(args.layer2_runtime_source_manifest, m)
-        args.layer2_runtime_source_manifest_sha256 = sha256(args.layer2_runtime_source_manifest)
+        write_json(args.runtime_source_manifest, m)
+        args.runtime_source_manifest_sha256 = sha256(args.runtime_source_manifest)
         out = ev.evaluate(args)
         assert out["input_status"] == "input_hash_mismatch"
 
 
-def test_corrected_core_metrics_match_direct_calls() -> None:
+def test_proxy_core_metrics_match_direct_calls() -> None:
     with tempfile.TemporaryDirectory() as td:
         ref = base_grid()
         args = make_case(Path(td), umgs_z=ref, openmvs_z=ref)
@@ -603,8 +603,8 @@ def test_corrected_core_metrics_match_direct_calls() -> None:
         control_z, control_valid = ev.deterministic_shuffle(umgs_z, umgs_valid)
         control_mask = ev.build_primary_mask(control_z, control_valid, openmvs_z, openmvs_valid)
         shared = true_mask & control_mask
-        gd = ev.corrected.reference_high_gradient_domain(openmvs_z, shared)
-        direct = ev.corrected.metrics_on_mask(openmvs_z, umgs_z, shared, gradient_domain=gd)
+        gd = ev.proxy_metrics.reference_high_gradient_domain(openmvs_z, shared)
+        direct = ev.proxy_metrics.metrics_on_mask(openmvs_z, umgs_z, shared, gradient_domain=gd)
         assert out["true_core_metrics_on_shared"]["openmvs_denominated_relative_camera_z_disagreement_median"] == direct["absrel_median"]
         assert out["true_core_metrics_on_shared"]["high_gradient_cosine_median"] == direct["high_gradient_cosine_median"]
 
@@ -636,8 +636,8 @@ def test_exact_future_command_parser_smoke_passes() -> None:
             "--openmvs-core-sha256", args.openmvs_core_sha256,
             "--frame-scale-decision-json", str(args.frame_scale_decision_json),
             "--frame-scale-decision-sha256", args.frame_scale_decision_sha256,
-            "--layer2-runtime-source-manifest", str(args.layer2_runtime_source_manifest),
-            "--layer2-runtime-source-manifest-sha256", args.layer2_runtime_source_manifest_sha256,
+            "--runtime-source-manifest", str(args.runtime_source_manifest),
+            "--runtime-source-manifest-sha256", args.runtime_source_manifest_sha256,
             "--expected-scene", args.expected_scene,
             "--expected-target", args.expected_target,
             "--expected-height", str(args.expected_height),
@@ -666,7 +666,7 @@ def test_formal_runtime_manifest_schema_passes() -> None:
     with tempfile.TemporaryDirectory() as td:
         args = make_case(Path(td), umgs_z=base_grid(), openmvs_z=base_grid())
         checks = []
-        ev.verify_layer2_runtime_manifest(args.layer2_runtime_source_manifest, args.layer2_runtime_source_manifest_sha256, checks)
+        ev.verify_runtime_source_manifest(args.runtime_source_manifest, args.runtime_source_manifest_sha256, checks)
         assert any(row["check"] == "runtime_source_manifest_has_evaluator" and row["status"] == "pass" for row in checks)
 
 
@@ -682,10 +682,10 @@ def test_formal_frame_scale_decision_schema_passes() -> None:
 def test_runtime_manifest_old_wrong_field_names_fail() -> None:
     with tempfile.TemporaryDirectory() as td:
         args = make_case(Path(td), umgs_z=base_grid(), openmvs_z=base_grid())
-        m = json.loads(args.layer2_runtime_source_manifest.read_text(encoding="utf-8"))
+        m = json.loads(args.runtime_source_manifest.read_text(encoding="utf-8"))
         m["files"] = [{"role": row["role"], "path": row["repo_relative_path"], "sha256": row["sha256"]} for row in m.pop("sources")]
-        write_json(args.layer2_runtime_source_manifest, m)
-        args.layer2_runtime_source_manifest_sha256 = sha256(args.layer2_runtime_source_manifest)
+        write_json(args.runtime_source_manifest, m)
+        args.runtime_source_manifest_sha256 = sha256(args.runtime_source_manifest)
         out = ev.evaluate(args)
         assert out["input_status"] == "input_hash_mismatch"
 
@@ -772,8 +772,8 @@ def test_preflight_only_passes_without_metrics_or_support_count() -> None:
             "--openmvs-core-sha256", args.openmvs_core_sha256,
             "--frame-scale-decision-json", str(args.frame_scale_decision_json),
             "--frame-scale-decision-sha256", args.frame_scale_decision_sha256,
-            "--layer2-runtime-source-manifest", str(args.layer2_runtime_source_manifest),
-            "--layer2-runtime-source-manifest-sha256", args.layer2_runtime_source_manifest_sha256,
+            "--runtime-source-manifest", str(args.runtime_source_manifest),
+            "--runtime-source-manifest-sha256", args.runtime_source_manifest_sha256,
             "--expected-scene", args.expected_scene,
             "--expected-target", args.expected_target,
             "--expected-height", str(args.expected_height),
@@ -820,8 +820,8 @@ def test_output_directory_guard_refuses_overwrite() -> None:
             "--openmvs-core-sha256", args.openmvs_core_sha256,
             "--frame-scale-decision-json", str(args.frame_scale_decision_json),
             "--frame-scale-decision-sha256", args.frame_scale_decision_sha256,
-            "--layer2-runtime-source-manifest", str(args.layer2_runtime_source_manifest),
-            "--layer2-runtime-source-manifest-sha256", args.layer2_runtime_source_manifest_sha256,
+            "--runtime-source-manifest", str(args.runtime_source_manifest),
+            "--runtime-source-manifest-sha256", args.runtime_source_manifest_sha256,
             "--expected-scene", args.expected_scene,
             "--expected-target", args.expected_target,
             "--expected-height", str(args.expected_height),
@@ -864,8 +864,8 @@ TESTS = [
     test_wrong_array_dtype_fails,
     test_wrong_barycentric_shape_fails,
     test_insufficient_shared_control_support_not_evaluated,
-    test_control_source_sha_mismatch_fails,
-    test_corrected_core_metrics_match_direct_calls,
+    test_metric_source_sha_mismatch_fails,
+    test_proxy_core_metrics_match_direct_calls,
     test_exact_future_command_parser_smoke_passes,
     test_frame_scale_decision_file_missing_or_wrong_sha_fails,
     test_formal_runtime_manifest_schema_passes,

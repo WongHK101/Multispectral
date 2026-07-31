@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2023, Inria
- * GRAPHDECO research group, XXXX
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
  * This software is free for non-commercial, research and evaluation use 
@@ -230,8 +230,6 @@ __global__ void computeCov2DCUDA(int P,
 	float dL_dc_yy = 0;
 	if(antialiasing)
 	{
-		// XXXX*y+-+z%5E2%29%2F%28%28x%2Bw%29*%28y%2Bw%29+-+z%5E2%29%29+%2Fdx
-		// XXXX*y+-+z%5E2%29%2F%28%28x%2Bw%29*%28y%2Bw%29+-+z%5E2%29%29+%2Fdz
 		const float x = c_xx;
 		const float y = c_yy;
 		const float z = c_xy;

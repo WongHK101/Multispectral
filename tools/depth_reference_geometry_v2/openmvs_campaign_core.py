@@ -688,14 +688,13 @@ def make_numeric_qualification_gates(all_image_audit: dict[str, Any]) -> dict[st
             "synthetic_rasterizer_topology_tests",
             "camera_depth_physical_semantics",
             "topology_engineering_constraints",
-            "maize02_all_image_openmvs_formal_audit",
+            "source_only_openmvs_formal_audit",
         ],
         "forbidden_after_freeze": [
-            "maize_source_image_only_result",
-            "papaya_legacy_agreement",
-            "road_or_wogan_success_rate",
-            "da3_result",
-            "umgs_or_baseline_ranking",
+            "target_method_result",
+            "scene_specific_legacy_result",
+            "external_neural_proxy_result",
+            "method_ranking",
         ],
         "finite_geometry": {
             "minimum_vertex_count": 1000,
@@ -744,8 +743,8 @@ def make_numeric_qualification_gates(all_image_audit: dict[str, Any]) -> dict[st
         "diagnostic_only_fields": [
             "dense_to_mesh distance if no dense cloud is available",
             "human visual assessment",
-            "DA3 overlap",
-            "legacy Papaya agreement",
+            "external proxy overlap",
+            "legacy scene-specific agreement",
         ],
     }
     gates["sha256"] = sha256_json_payload({k: v for k, v in gates.items() if k != "sha256"})

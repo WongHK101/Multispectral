@@ -12,8 +12,8 @@ authors = [{name = "Rahul Goel"}]
 dependencies = ["torch>=2.0.0"]
 
 [project.urls]
-Homepage = "XXXX"
-Repository = "XXXX"
+Homepage = "https://github.com/rahul-goel/fused-ssim"
+Repository = "https://github.com/rahul-goel/fused-ssim"
 
 [tool.setuptools]
 packages = ["fused_ssim"]

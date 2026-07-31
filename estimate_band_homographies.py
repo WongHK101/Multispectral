@@ -718,7 +718,7 @@ def estimate_band_homographies(
     rectification_stability_max_reject_ratio: float = 0.25,
     rectification_backend: str = "minima",
     minima_method: str = "roma",
-    minima_root: str = r"G:\2DSOTA\MINIMA",
+    minima_root: str = r"",
     minima_device: str = "cuda",
     minima_ckpt: str = "",
     minima_roma_size: str = "large",
@@ -815,10 +815,15 @@ def estimate_band_homographies(
     }
     band_list = _parse_bands(bands)
 
+    applied_transform_mode = (
+        str(rectification_global_mode)
+        if bool(rectification_enable_residual_refine)
+        else "quality_weighted_framewise_homography_aggregate"
+    )
     payload = {
         "version": 6,
         "rectification_method": "minima_assisted_global_homography",
-        "transform_mode": rectification_global_mode,
+        "transform_mode": applied_transform_mode,
         "target_plane_root": str((prepared_root / "RGB").resolve()),
         "input_dynamic_range": input_dynamic_range,
         "radiometric_mode": radiometric_mode,
@@ -890,7 +895,7 @@ def main() -> None:
 
     ap.add_argument("--rectification_backend", default="minima", choices=["minima"])
     ap.add_argument("--minima_method", default="roma", choices=["roma", "xoftr"])
-    ap.add_argument("--minima_root", default=r"G:\2DSOTA\MINIMA")
+    ap.add_argument("--minima_root", default=r"")
     ap.add_argument("--minima_device", default="cuda")
     ap.add_argument("--minima_ckpt", default="")
     ap.add_argument("--minima_roma_size", default="large", choices=["large", "tiny"])

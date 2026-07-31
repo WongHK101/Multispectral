@@ -1,6 +1,6 @@
 #
 # Copyright (C) 2023, Inria
-# GRAPHDECO research group, XXXX
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
@@ -108,7 +108,7 @@ class ModelParams(ParamGroup):
                 "help": "Input modality kind for the current scene or transfer target.",
             },
             "target_band": {
-                "help": "Target scalar band name, e.g. G, R, RE, NIR, or thermal for legacy runs.",
+                "help": "Target scalar band name, e.g. G, R, RE, or NIR.",
             },
             "single_band_mode": {
                 "explicit_bool": True,
@@ -116,7 +116,7 @@ class ModelParams(ParamGroup):
             },
             "single_band_replicate_to_rgb": {
                 "explicit_bool": True,
-                "help": "Replicate scalar-band supervision into a 3-channel RGB carrier for legacy renderer compatibility.",
+                "help": "Replicate scalar-band supervision into the renderer's 3-channel carrier.",
             },
             "input_dynamic_range": {
                 "choices": ["uint8", "uint16", "float"],

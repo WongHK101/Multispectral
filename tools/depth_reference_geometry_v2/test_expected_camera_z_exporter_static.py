@@ -424,4 +424,4 @@ if __name__ == "__main__":
     test_public_renderer_interface_is_opt_in_and_not_metric_named()
     test_parser_requires_runtime_binary_binding_arguments()
     test_rasterizer_python_binding_is_opt_in()
-    print("expected-camera-z exporter A0 guard static tests passed")
+    print("expected-camera-z exporter guard static tests passed")

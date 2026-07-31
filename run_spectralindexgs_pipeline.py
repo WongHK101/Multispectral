@@ -12,7 +12,7 @@ from pathlib import Path
 from build_rectified_band_dataset import build_rectified_band_dataset
 from build_spectral_products import build_products
 from estimate_band_homographies import estimate_band_homographies
-from prepare_m3m_multispectral import prepare_m3m_dataset
+from prepare_m3m_multispectral import _assert_disjoint_roots, prepare_m3m_dataset
 from qa_rectification import run_rectification_qa
 from utils.minima_bridge import check_backend_available
 
@@ -558,7 +558,7 @@ def _optional_render(repo_root: Path, rectified_root: Path, out_root: Path, args
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run the SpectralIndexGS rectified-band pipeline without touching the legacy thermal pipeline.")
+    ap = argparse.ArgumentParser(description="Run the UMGS rectified-band reconstruction pipeline.")
     ap.add_argument("--raw_root", required=True, help="Raw M3M dataset root.")
     ap.add_argument("--prepared_root", required=True, help="Prepared raw scene root.")
     ap.add_argument("--rectified_root", default="", help="Optional rectified scene root. Defaults to prepared_root.")
@@ -597,7 +597,7 @@ def main() -> None:
     ap.add_argument("--rectification_enable_residual_refine", type=str, default="false")
 
     ap.add_argument("--minima_method", default="roma", choices=["roma", "xoftr"])
-    ap.add_argument("--minima_root", default=r"G:\2DSOTA\MINIMA")
+    ap.add_argument("--minima_root", default=r"")
     ap.add_argument("--minima_device", default="cuda")
     ap.add_argument("--minima_ckpt", default="")
     ap.add_argument("--minima_roma_size", default="large", choices=["large", "tiny"])
@@ -624,7 +624,7 @@ def main() -> None:
     ap.add_argument("--to_step", type=int, default=len(STEP_NAMES))
     ap.add_argument("--link_mode", default="hardlink", choices=["copy", "hardlink", "symlink"])
     ap.add_argument("--rgb_iter", type=int, default=30000)
-    ap.add_argument("--band_iter", type=int, default=40000)
+    ap.add_argument("--band_iter", type=int, default=60000)
     ap.add_argument("--rgb_res", type=int, default=8)
     ap.add_argument("--band_res", type=int, default=8)
     ap.add_argument("--input_dynamic_range", default="uint16", choices=["uint8", "uint16", "float"])
@@ -718,6 +718,9 @@ def main() -> None:
     prepared_root = Path(args.prepared_root).resolve()
     rectified_root = Path(args.rectified_root).resolve() if args.rectified_root else prepared_root
     out_root = Path(args.out_root).resolve()
+    _assert_disjoint_roots(raw_root, prepared_root)
+    _assert_disjoint_roots(raw_root, rectified_root)
+    _assert_disjoint_roots(raw_root, out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     rectified_root.mkdir(parents=True, exist_ok=True)
     if not args.rectification_config:

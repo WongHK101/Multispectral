@@ -1,8 +1,7 @@
-"""Validate one UMGS expected-camera-z packet export.
+"""Validate the schema, identities, and numeric invariants of one packet.
 
-This validator is for A1-Q single-export qualification. It reuses the A0
-numeric tolerance semantics for one packet only, and does not check
-repeatability, RGB compatibility, OpenMVS/DA3 alignment, or method ranking.
+This single-export validator does not perform repeatability, RGB compatibility,
+cross-proxy alignment, or method ranking.
 """
 
 from __future__ import annotations
@@ -236,7 +235,7 @@ def validate_packet_dir(args: argparse.Namespace) -> dict[str, Any]:
     }
     passed = all(bool(row["passed"]) for row in checks)
     return {
-        "scope": "single-packet exporter qualification only; no repeatability, RGB compatibility, OpenMVS/DA3 comparison, or method ranking",
+        "scope": "single-packet exporter qualification only; no repeatability, RGB compatibility, cross-proxy comparison, or method ranking",
         "passed": bool(passed),
         "tolerances": tol,
         "npz_path": str(npz_path),

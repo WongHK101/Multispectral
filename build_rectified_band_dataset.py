@@ -162,6 +162,12 @@ def build_rectified_band_dataset(prepared_root: Path,
         _clear_scene_root(rect_scene_root)
         _copy_rgb_sparse_to_scene(rgb_scene_root, rect_scene_root)
 
+        if "rectification_method" not in config or "transform_mode" not in config:
+            raise KeyError(
+                "Homography config must record rectification_method and transform_mode; "
+                f"refusing an ambiguous fallback: {homography_json}"
+            )
+
         scene_manifest = {
             "scene_name": f"{band}_rectified",
             "scene_root": str(rect_scene_root),
@@ -171,9 +177,9 @@ def build_rectified_band_dataset(prepared_root: Path,
             "modality_kind": "band",
             "target_band": band,
             "carrier_mode": "replicated_scalar_rgb",
-            "rectification_method": config.get("rectification_method", "fixed_homography_ecc"),
+            "rectification_method": str(config["rectification_method"]),
             "global_homography_ref": str(homography_json),
-            "transform_mode": str(config.get("transform_mode", "legacy_fixed_h")),
+            "transform_mode": str(config["transform_mode"]),
             "images": [],
         }
 

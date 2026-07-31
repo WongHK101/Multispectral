@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Render OpenMVS mesh depth under a frozen UMGS canonical camera.
 
-This is a preparation-stage adapter for Road-0001 canonical OpenMVS rerender.
-It intentionally avoids the previous COLMAP max-width camera path:
+This preparation-stage adapter renders an OpenMVS mesh directly under an
+explicitly bound UMGS camera. It intentionally avoids any independent COLMAP
+camera-resize path:
 
 * no ``view_from_colmap(..., max_width=1200)`` call;
-* no crop, resize, or resample of an existing 870-row depth artifact;
+* no crop, resize, or resample of a pre-existing depth artifact;
 * no modification or re-export of the OpenMVS mesh.
 
 The adapter treats the UMGS expected-camera fingerprint as the authoritative

@@ -45,7 +45,7 @@ REQUIRED_RUNTIME_SOURCE_PATHS = [
     "submodules/diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.cu",
     "tools/depth_reference_geometry_v2/export_umgs_expected_camera_z_packet.py",
 ]
-DEFAULT_A0_TOLERANCES = {
+DEFAULT_PACKET_TOLERANCES = {
     "identity_rtol": 1e-5,
     "identity_atol": 1e-6,
     "repeatability_rtol": 1e-6,
@@ -183,9 +183,8 @@ def verify_heldout_manifest(args: argparse.Namespace) -> dict[str, Any]:
             "sha256": sha256_file(split_manifest),
             "schema": split_data.get("schema", "") if isinstance(split_data, dict) else "",
             "split": split,
-            "authoritative_a0_split_statement": (
-                "The current train/test files, bound by explicit SHA256 values, are the authoritative A0 execution split. "
-                "The historical materialization summary contains stale embedded split hashes and is retained only as provenance."
+            "authoritative_split_statement": (
+                "The train/test files bound by explicit SHA256 values are the execution split for this packet."
             ),
             "train_file": str(train_file),
             "train_file_expected_sha256": str(args.train_file_sha256),
@@ -680,8 +679,8 @@ def export_expected_camera_z_packet(args: argparse.Namespace) -> dict[str, Any]:
             "rgb_enabled_path": str(rgb_enabled_path),
             "rgb_enabled_sha256": sha256_file(rgb_enabled_path),
             "max_abs_rgb_delta": max_abs_delta,
-            "pass_threshold": DEFAULT_A0_TOLERANCES["rgb_compatibility_max_abs_delta"],
-            "passed": bool(max_abs_delta <= DEFAULT_A0_TOLERANCES["rgb_compatibility_max_abs_delta"]),
+            "pass_threshold": DEFAULT_PACKET_TOLERANCES["rgb_compatibility_max_abs_delta"],
+            "passed": bool(max_abs_delta <= DEFAULT_PACKET_TOLERANCES["rgb_compatibility_max_abs_delta"]),
         }
 
     metadata = {
@@ -716,7 +715,7 @@ def export_expected_camera_z_packet(args: argparse.Namespace) -> dict[str, Any]:
         },
         "opacity_epsilon": float(args.opacity_epsilon),
         "variance_clamp_tolerance": float(args.variance_clamp_tolerance),
-        "a0_tolerances": DEFAULT_A0_TOLERANCES,
+        "validation_tolerances": DEFAULT_PACKET_TOLERANCES,
         "rgb_compatibility": rgb_compatibility,
         "exact_command": " ".join(os.sys.argv),
         "python_executable": os.sys.executable,
@@ -740,7 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", required=True, help="Exact model/run path; checkpoint must be under this path.")
     parser.add_argument("--scene", required=True)
     parser.add_argument("--target", required=True)
-    parser.add_argument("--run-label", required=True, help="Explicit run label, e.g. a0_repeat_1.")
+    parser.add_argument("--run-label", required=True, help="Explicit run label, e.g. repeat_1.")
     parser.add_argument("--output", required=True, help="New isolated output directory; must be empty if it exists.")
     parser.add_argument("--camera-manifest", required=True)
     parser.add_argument("--camera-manifest-sha256", required=True)

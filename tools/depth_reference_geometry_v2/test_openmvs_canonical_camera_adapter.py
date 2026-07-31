@@ -80,7 +80,7 @@ def assert_close(a: np.ndarray, b: np.ndarray, *, atol: float, label: str) -> No
         raise AssertionError(f"{label} mismatch: max_abs={np.nanmax(np.abs(a-b))}, a={a}, b={b}")
 
 
-def test_centered_synthetic_camera() -> dict[str, Any]:
+def check_centered_synthetic_camera() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as td:
         fp = Path(td) / "fingerprint.json"
         make_fingerprint(fp, width=100, height=80)
@@ -98,7 +98,7 @@ def test_centered_synthetic_camera() -> dict[str, Any]:
         }
 
 
-def test_off_axis_projection_matches_full_projection() -> dict[str, Any]:
+def check_off_axis_projection_matches_full_projection() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as td:
         fp = Path(td) / "fingerprint.json"
         make_fingerprint(fp, width=120, height=90)
@@ -119,7 +119,7 @@ def test_off_axis_projection_matches_full_projection() -> dict[str, Any]:
         return {"max_abs_delta": float(np.max(np.abs(xy_view - xy_full))), "point_count": int(points.shape[0])}
 
 
-def test_orientation_and_sign() -> dict[str, Any]:
+def check_orientation_and_sign() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as td:
         fp = Path(td) / "fingerprint.json"
         make_fingerprint(fp, width=100, height=80)
@@ -153,7 +153,7 @@ def test_orientation_and_sign() -> dict[str, Any]:
         }
 
 
-def test_synthetic_triangle_raster() -> dict[str, Any]:
+def check_synthetic_triangle_raster() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as td:
         fp = Path(td) / "fingerprint.json"
         make_fingerprint(fp, width=80, height=60)
@@ -181,10 +181,10 @@ def test_synthetic_triangle_raster() -> dict[str, Any]:
         return {"valid_pixel_count": int(valid.sum()), "median_depth": float(np.nanmedian(result.depth[valid]))}
 
 
-def test_principal_point_policy_changes_raster_hit_pattern() -> dict[str, Any]:
+def check_principal_point_policy_changes_raster_hit_pattern() -> dict[str, Any]:
     with tempfile.TemporaryDirectory() as td:
         fp = Path(td) / "fingerprint.json"
-        # Even width and odd height match Road parity: 1200 x 869.
+        # Exercise an even-width, odd-height raster.
         make_fingerprint(fp, width=120, height=87)
         record = load_umgs_canonical_camera(fp, expected_width=120, expected_height=87)
 
@@ -237,7 +237,7 @@ def test_principal_point_policy_changes_raster_hit_pattern() -> dict[str, Any]:
         }
 
 
-def test_old_path_rejection() -> dict[str, Any]:
+def check_old_path_rejection() -> dict[str, Any]:
     source = Path(__file__).with_name("render_openmvs_canonical_camera.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     calls: list[str] = []
@@ -389,7 +389,7 @@ def run_validator_case_with_mutation(mutate: Callable[[SimpleNamespace, dict[str
         return validate_render_packet(args)
 
 
-def test_validator_semantics_and_negative_cases() -> dict[str, Any]:
+def check_validator_semantics_and_negative_cases() -> dict[str, Any]:
     results: dict[str, str] = {}
     with tempfile.TemporaryDirectory() as td:
         args, manifest, paths = make_validator_case(Path(td))
@@ -484,7 +484,7 @@ def test_validator_semantics_and_negative_cases() -> dict[str, Any]:
     return results
 
 
-def actual_road_fingerprint(path: Path) -> dict[str, Any]:
+def check_external_camera_fingerprint(path: Path) -> dict[str, Any]:
     record = load_umgs_canonical_camera(path, expected_target="DJI_20260602165038_0001_D.JPG", expected_width=1200, expected_height=869)
     cam_points = np.array(
         [
@@ -501,8 +501,8 @@ def actual_road_fingerprint(path: Path) -> dict[str, Any]:
     cam_from_payload = camera_space_from_fingerprint_row(world_points, record.world_view_row)
     xy_view = project_points_with_camera_view(world_points, record.view)
     xy_full = project_points_with_fingerprint_full_proj(world_points, record.payload)
-    assert_close(cam_from_payload, cam_points, atol=5e-5, label="actual Road camera-space")
-    assert_close(xy_view, xy_full, atol=PROJECTION_ATOL, label="actual Road projection")
+    assert_close(cam_from_payload, cam_points, atol=5e-5, label="external camera-space")
+    assert_close(xy_view, xy_full, atol=PROJECTION_ATOL, label="external projection")
     return {
         "fingerprint_file": str(path),
         "fingerprint_sha256": sha256_file(path),
@@ -518,6 +518,37 @@ def actual_road_fingerprint(path: Path) -> dict[str, Any]:
     }
 
 
+# Pytest entry points deliberately return ``None``.  The corresponding
+# ``check_*`` helpers retain diagnostic dictionaries for the standalone test
+# runner below.
+def test_centered_synthetic_camera() -> None:
+    check_centered_synthetic_camera()
+
+
+def test_off_axis_projection_matches_full_projection() -> None:
+    check_off_axis_projection_matches_full_projection()
+
+
+def test_orientation_and_sign() -> None:
+    check_orientation_and_sign()
+
+
+def test_synthetic_triangle_raster() -> None:
+    check_synthetic_triangle_raster()
+
+
+def test_principal_point_policy_changes_raster_hit_pattern() -> None:
+    check_principal_point_policy_changes_raster_hit_pattern()
+
+
+def test_old_path_rejection() -> None:
+    check_old_path_rejection()
+
+
+def test_validator_semantics_and_negative_cases() -> None:
+    check_validator_semantics_and_negative_cases()
+
+
 def run_test(name: str, func: Callable[[], dict[str, Any]], results: list[dict[str, Any]]) -> None:
     payload = func()
     row = {"test": name, "status": "pass", **payload}
@@ -527,7 +558,7 @@ def run_test(name: str, func: Callable[[], dict[str, Any]], results: list[dict[s
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--road-fingerprint", default="")
+    parser.add_argument("--camera-fingerprint", default="")
     parser.add_argument("--summary-json", default="")
     return parser.parse_args(argv)
 
@@ -535,19 +566,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     results: list[dict[str, Any]] = []
-    run_test("centered_synthetic_camera", test_centered_synthetic_camera, results)
-    run_test("off_axis_projection_matches_full_projection", test_off_axis_projection_matches_full_projection, results)
-    run_test("orientation_and_sign", test_orientation_and_sign, results)
-    run_test("synthetic_triangle_raster", test_synthetic_triangle_raster, results)
-    run_test("principal_point_policy_changes_raster_hit_pattern", test_principal_point_policy_changes_raster_hit_pattern, results)
-    run_test("old_path_rejection", test_old_path_rejection, results)
-    run_test("validator_semantics_and_negative_cases", test_validator_semantics_and_negative_cases, results)
-    if args.road_fingerprint:
-        road_path = Path(args.road_fingerprint)
-        run_test("actual_road_fingerprint_projection", lambda: actual_road_fingerprint(road_path), results)
+    run_test("centered_synthetic_camera", check_centered_synthetic_camera, results)
+    run_test("off_axis_projection_matches_full_projection", check_off_axis_projection_matches_full_projection, results)
+    run_test("orientation_and_sign", check_orientation_and_sign, results)
+    run_test("synthetic_triangle_raster", check_synthetic_triangle_raster, results)
+    run_test("principal_point_policy_changes_raster_hit_pattern", check_principal_point_policy_changes_raster_hit_pattern, results)
+    run_test("old_path_rejection", check_old_path_rejection, results)
+    run_test("validator_semantics_and_negative_cases", check_validator_semantics_and_negative_cases, results)
+    if args.camera_fingerprint:
+        fingerprint_path = Path(args.camera_fingerprint)
+        run_test("external_camera_fingerprint_projection", lambda: check_external_camera_fingerprint(fingerprint_path), results)
     else:
-        results.append({"test": "actual_road_fingerprint_projection", "status": "skipped", "reason": "no --road-fingerprint provided"})
-        print("SKIP actual_road_fingerprint_projection")
+        results.append({"test": "external_camera_fingerprint_projection", "status": "skipped", "reason": "no --camera-fingerprint provided"})
+        print("SKIP external_camera_fingerprint_projection")
     if args.summary_json:
         write_json(Path(args.summary_json), {"status": "pass", "tests": results})
     print("ALL_OPENMVS_CANONICAL_CAMERA_ADAPTER_TESTS_PASSED")

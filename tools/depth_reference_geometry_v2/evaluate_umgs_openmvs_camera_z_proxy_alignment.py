@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """UMGS-OpenMVS camera-z proxy-alignment evaluator.
 
-V1.2 hardens the Road-0001 Layer-2 evaluator protocol. It validates all
-declared bindings before reading packet arrays for metrics, validates array
-schema/dtype before conversion, reuses the corrected OpenMVS-DA3 shuffle and
-core metric implementation, and stops without metrics when support gates fail.
-It also provides a preflight-only mode that validates production bindings and
-array schemas without constructing masks, controls, or metrics.
+The evaluator validates all declared bindings before reading packet arrays for
+metrics, validates array schema and dtype before conversion, and stops without
+metrics when a support gate fails.  The true branch and a deterministic
+shuffle control are evaluated on exactly the same pixel support and reference-
+defined high-gradient domain.  ``--preflight-only`` validates production
+bindings and array schemas without constructing masks, controls, or metrics.
 
 The output is proxy disagreement/agreement only. It is not geometry ground
 truth, physical accuracy, or surface-depth validation.
@@ -33,24 +33,24 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    import openmvs_da3_overlap_corrected as corrected
+    import proxy_alignment_metrics as proxy_metrics
 except Exception as exc:  # pragma: no cover
-    raise SystemExit(f"failed_to_import_corrected_overlap_protocol: {exc}") from exc
+    raise SystemExit(f"failed_to_import_proxy_alignment_metrics: {exc}") from exc
 
 
 SCHEMA = "umgs_openmvs_camera_z_proxy_alignment_v1_2"
-RUNTIME_MANIFEST_SCHEMA = "road0001_layer2_runtime_source_manifest_v1_2"
-FRAME_SCALE_DECISION_SCHEMA = "road0001_frame_scale_correspondence_decision_v1_2"
-CONTROL_PROTOCOL_STATUS = "existing_corrected_negative_control_reused"
-CONTROL_SOURCE = "tools/depth_reference_geometry_v2/openmvs_da3_overlap_corrected.py"
+RUNTIME_MANIFEST_SCHEMA = "umgs_proxy_runtime_source_manifest_v1_2"
+FRAME_SCALE_DECISION_SCHEMA = "umgs_frame_scale_correspondence_decision_v1_2"
+CONTROL_PROTOCOL_STATUS = "deterministic_shuffle_control_enabled"
+CONTROL_SOURCE = "tools/depth_reference_geometry_v2/proxy_alignment_metrics.py"
 EVALUATOR_SOURCE = "tools/depth_reference_geometry_v2/evaluate_umgs_openmvs_camera_z_proxy_alignment.py"
 
-SHUFFLE_SEED = int(corrected.SHUFFLE_SEED)
-METRIC_COMPARE_EPS = float(corrected.METRIC_COMPARE_EPS)
-MIN_TRUE_PIXELS = int(corrected.MIN_TRUE_PIXELS)
-MIN_TRUE_COVERAGE = float(corrected.MIN_TRUE_COVERAGE)
-MIN_SHARED_PIXELS = int(corrected.MIN_SHARED_PIXELS)
-MIN_SHARED_COVERAGE = float(corrected.MIN_SHARED_COVERAGE)
+SHUFFLE_SEED = int(proxy_metrics.SHUFFLE_SEED)
+METRIC_COMPARE_EPS = float(proxy_metrics.METRIC_COMPARE_EPS)
+MIN_TRUE_PIXELS = int(proxy_metrics.MIN_TRUE_PIXELS)
+MIN_TRUE_COVERAGE = float(proxy_metrics.MIN_TRUE_COVERAGE)
+MIN_SHARED_PIXELS = int(proxy_metrics.MIN_SHARED_PIXELS)
+MIN_SHARED_COVERAGE = float(proxy_metrics.MIN_SHARED_COVERAGE)
 
 UMGS_DTYPES = {
     "accumulated_opacity": np.dtype("float32"),
@@ -160,15 +160,17 @@ def compare_fingerprints(umgs_fp: dict[str, Any], openmvs_fp: dict[str, Any], ch
     check_equal("fingerprint_payload_colmap_id", op.get("colmap_id"), up.get("colmap_id"), checks)
 
 
-def verify_layer2_runtime_manifest(path: Path, expected_sha: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
-    verify_file_sha("layer2_runtime_source_manifest", path, expected_sha, checks)
+def verify_runtime_source_manifest(path: Path, expected_sha: str, checks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Verify the evaluator and metric-helper source identities."""
+
+    verify_file_sha("runtime_source_manifest", path, expected_sha, checks)
     manifest = json_load(path)
-    check_equal("layer2_runtime_manifest_schema", manifest.get("schema"), RUNTIME_MANIFEST_SCHEMA, checks)
+    check_equal("runtime_source_manifest_schema", manifest.get("schema"), RUNTIME_MANIFEST_SCHEMA, checks)
     repo_root_value = manifest.get("repo_root")
-    check_true("layer2_runtime_manifest_has_repo_root", isinstance(repo_root_value, str) and bool(repo_root_value), checks, repo_root=repo_root_value)
+    check_true("runtime_source_manifest_has_repo_root", isinstance(repo_root_value, str) and bool(repo_root_value), checks, repo_root=repo_root_value)
     sources = manifest.get("sources")
     if not isinstance(sources, list) or not sources:
-        raise ProtocolError("input_hash_mismatch", "layer2 runtime manifest has no sources")
+        raise ProtocolError("input_hash_mismatch", "runtime source manifest has no sources")
     repo_root = Path(repo_root_value)
     roles = set()
     for entry in sources:
@@ -182,7 +184,7 @@ def verify_layer2_runtime_manifest(path: Path, expected_sha: str, checks: list[d
         p = repo_root / rel
         verify_file_sha(f"runtime_source_{role}", p, sha, checks)
     check_true("runtime_source_manifest_has_evaluator", "evaluator" in roles, checks, roles=sorted(roles))
-    check_true("runtime_source_manifest_has_negative_control_source", "negative_control_source" in roles, checks, roles=sorted(roles))
+    check_true("runtime_source_manifest_has_metric_source", "metric_source" in roles, checks, roles=sorted(roles))
     return manifest
 
 
@@ -297,7 +299,7 @@ def validate_bindings(args: argparse.Namespace) -> tuple[dict[str, Any], dict[st
     verify_file_sha("umgs_manifest", args.umgs_manifest, args.umgs_manifest_sha256, checks)
     verify_file_sha("openmvs_npz", args.openmvs_npz, args.openmvs_npz_sha256, checks)
     verify_file_sha("openmvs_manifest", args.openmvs_manifest, args.openmvs_manifest_sha256, checks)
-    verify_layer2_runtime_manifest(args.layer2_runtime_source_manifest, args.layer2_runtime_source_manifest_sha256, checks)
+    verify_runtime_source_manifest(args.runtime_source_manifest, args.runtime_source_manifest_sha256, checks)
 
     umgs_manifest = json_load(args.umgs_manifest)
     openmvs_manifest = json_load(args.openmvs_manifest)
@@ -417,12 +419,12 @@ def descriptive_native_metrics(umgs_z: np.ndarray, openmvs_z: np.ndarray, mask: 
 
 
 def deterministic_shuffle(depth: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    shuffled_depth, shuffled_valid = corrected.branch_native(depth, valid, "shuffle")
+    shuffled_depth, shuffled_valid = proxy_metrics.branch_native(depth, valid, "shuffle")
     return shuffled_depth, np.asarray(shuffled_valid, dtype=bool)
 
 
-def corrected_core_metrics(openmvs_z: np.ndarray, candidate_z: np.ndarray, shared_mask: np.ndarray, gradient_domain: Any) -> dict[str, Any]:
-    raw = corrected.metrics_on_mask(openmvs_z, candidate_z, shared_mask, gradient_domain=gradient_domain)
+def proxy_core_metrics(openmvs_z: np.ndarray, candidate_z: np.ndarray, shared_mask: np.ndarray, gradient_domain: Any) -> dict[str, Any]:
+    raw = proxy_metrics.metrics_on_mask(openmvs_z, candidate_z, shared_mask, gradient_domain=gradient_domain)
     return {
         "openmvs_denominated_relative_camera_z_disagreement_median": raw.get("absrel_median"),
         "openmvs_denominated_relative_camera_z_disagreement_p90": raw.get("absrel_p90"),
@@ -433,7 +435,7 @@ def corrected_core_metrics(openmvs_z: np.ndarray, candidate_z: np.ndarray, share
         "high_gradient_pixels": raw.get("high_gradient_pixels"),
         "gradient_local_valid_pixels": raw.get("gradient_local_valid_pixels"),
         "gradient_erosion_rule": raw.get("gradient_erosion_rule"),
-        "corrected_source_fields": {
+        "source_fields": {
             "relative": "absrel_median",
             "spearman": "spearman",
             "high_gradient": "high_gradient_cosine_median",
@@ -608,7 +610,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "control_shared_support_status": control_shared_status,
             "metric_status": "metrics_valid",
             "interpretation_status": "not_evaluated",
-            "inconclusive_reason": "negative_control_not_approved",
+            "inconclusive_reason": "deterministic_control_disabled",
             "binding_checks": binding_checks,
             "support_counts": support_block,
             "true_descriptive_metrics": true_descriptive,
@@ -616,9 +618,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "not_ground_truth": True,
         }
 
-    shared_gd = corrected.reference_high_gradient_domain(openmvs_z, shared_mask)
-    true_core = corrected_core_metrics(openmvs_z, umgs_z, shared_mask, shared_gd)
-    control_core = corrected_core_metrics(openmvs_z, control_z, shared_mask, shared_gd)
+    shared_gd = proxy_metrics.reference_high_gradient_domain(openmvs_z, shared_mask)
+    true_core = proxy_core_metrics(openmvs_z, umgs_z, shared_mask, shared_gd)
+    control_core = proxy_core_metrics(openmvs_z, control_z, shared_mask, shared_gd)
     comparisons = compare_core(true_core, control_core)
     valid_core = sum(1 for v in comparisons.values() if v != "invalid")
     metric_status = "metrics_valid" if valid_core >= 2 else "metric_inconclusive"
@@ -700,8 +702,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--openmvs-core-sha256", required=True)
     p.add_argument("--frame-scale-decision-json", type=Path, required=True)
     p.add_argument("--frame-scale-decision-sha256", required=True)
-    p.add_argument("--layer2-runtime-source-manifest", type=Path, required=True)
-    p.add_argument("--layer2-runtime-source-manifest-sha256", required=True)
+    p.add_argument("--runtime-source-manifest", type=Path, required=True)
+    p.add_argument("--runtime-source-manifest-sha256", required=True)
     p.add_argument("--expected-scene", required=True)
     p.add_argument("--expected-target", required=True)
     p.add_argument("--expected-height", type=int, required=True)

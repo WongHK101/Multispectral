@@ -22,6 +22,26 @@ BAND_TO_RAW_SCENE = {
 }
 
 
+def _assert_disjoint_roots(raw_root: Path, out_root: Path) -> tuple[Path, Path]:
+    """Reject output locations that could overwrite or contaminate raw data."""
+
+    raw_resolved = raw_root.expanduser().resolve()
+    out_resolved = out_root.expanduser().resolve()
+    if raw_resolved == out_resolved:
+        raise ValueError("raw_root and out_root must be different directories")
+    if out_resolved in raw_resolved.parents:
+        raise ValueError(
+            f"out_root must not contain raw_root: out_root={out_resolved}, "
+            f"raw_root={raw_resolved}"
+        )
+    if raw_resolved in out_resolved.parents:
+        raise ValueError(
+            f"out_root must not be inside raw_root: out_root={out_resolved}, "
+            f"raw_root={raw_resolved}"
+        )
+    return raw_resolved, out_resolved
+
+
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +151,7 @@ def _scan_groups(raw_root: Path) -> Dict[str, Dict[str, Path]]:
 
 def prepare_m3m_dataset(raw_root: Path, out_root: Path, link_mode: str = "hardlink",
                         sparse_source: Optional[Path] = None, exiftool_executable: str = "exiftool") -> Dict[str, object]:
+    raw_root, out_root = _assert_disjoint_roots(raw_root, out_root)
     groups = _scan_groups(raw_root)
     if not groups:
         raise FileNotFoundError(f"No DJI M3M frame groups found under: {raw_root}")
