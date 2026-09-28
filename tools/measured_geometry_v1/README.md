@@ -1,0 +1,89 @@
+# UMGS measured-geometry CPU adaptation
+
+This directory prepares the Road/3K + 5K measured-geometry revision. It does
+not train, render, score real depth, fit Sim(3), access a server, or authorize a
+GPU run. Existing UMGS proxy outputs and the GS-GCP release remain unchanged.
+
+## Implemented boundaries
+
+- `preflight.py` verifies an externally pinned GS-GCP source snapshot and
+  release root, then invokes the unchanged v1.3 release interface. It preserves
+  every canonical row, distinguishes formal rows, recomputes raw projections,
+  checks camera/pose record hashes, and checks actual local raw JPEG hashes,
+  RGB dimensions and EXIF metadata. The camera inputs are authenticated embedded
+  release records, **not** live renderer camera evidence. Full RGB matrix decode
+  and the renderer-camera binding are explicitly pending.
+- `camera_bridge.py` implements explicit projection/normalization algebra.
+  Graphdeco `((ndc+1)*size-1)/2` and mesh-proxy `(ndc+1)*size/2` are distinct
+  conventions, not string aliases. Their half-pixel relation is tested; existing
+  proxy artifacts are not resampled or declared incorrect. Pose identity must
+  be independently established before using intrinsic ray mapping.
+- Model normalization is inverted from recorded scale/rotation/translation,
+  never fitted to checkpoints or LiDAR. Returning raw moments to source units
+  requires A, M1, M2 and H. Missing H cannot be reconstructed from M1.
+- `contracts.py` inspects authenticated NPZ/NPY headers only. A schema/dtype/
+  shape pass is not a packet/ref numeric pass or formal qualification. Legacy
+  six-field UMGS v1 packets cannot be silently promoted to metric packet v2.
+- `method_recipe.py` distinguishes resolved joint-gradient, non-RGB isolated,
+  and neural-color settings without importing Nerfstudio. This is a mechanism
+  check, not certification that a recipe reproduces a paper. RGB gradients and
+  densification can still change support in an isolation configuration.
+- The CLI hides CUDA and blocks GPU imports, network connections and external
+  child execution. It has **no** `--execute` or automatic resume option. Explicit
+  user notification and fresh resource/protocol checks are required later.
+
+The local profile is deliberately not committed: it contains machine-specific
+paths, reference-manifest SHA, externally pinned release-root SHA and raw roots.
+The reference bundle is built outside the source repository by the reference
+project's own builder; reference source is not copied into the training repo.
+`common_full_sfm`, split, sampling, aggregation and geographic transforms are
+not redefined here. A future adapter must bind its own complete inputs before
+calling the reference evaluator.
+
+## Local CPU commands
+
+Run from the Multispectral repository with Python and NumPy/Pillow available:
+
+`requirements-cpu.txt` records the separate Python 3.12 CPU environment used
+for the local checks and optional frozen-reference synthetic smoke. Do not
+install it into a training environment. It contains no torch/CUDA dependencies.
+
+```text
+python -B -m unittest tools.measured_geometry_v1.test_cpu_adapters -v
+python -B -m tools.measured_geometry_v1.preflight --profile LOCAL_PROFILE.json --output NEW_REPORT.json
+```
+
+The preflight refuses an existing output or an output inside a release/raw/
+reference root. A successful return means `PASS_CPU_INPUT_ADAPTATION_ONLY`;
+the report always says `formal_ready=false` and records pending GPU evidence.
+
+Profile fields:
+
+```json
+{
+  "reference_root": "/path/to/GS-GCP-evaluation-reference",
+  "reference_manifest_sha256": "<64 lowercase hex characters>",
+  "release_root": "/path/to/gcp_manual_annotations_v1_3_0",
+  "release_root_record_sha256": "<64 lowercase hex characters>",
+  "release_payload_root_sha256": "<64 lowercase hex characters>",
+  "raw_roots": {
+    "gcp_3000_20260602": "/path/to/3k/raw",
+    "gcp_5000_20260602": "/path/to/5k/raw"
+  }
+}
+```
+
+This is a profile shape example, not a runnable frozen configuration. No private
+credentials, datasets, checkpoints, downloaded methods or outputs belong here.
+
+## Remaining qualification
+
+1. Explicit user GPU availability/authorization; do not interrupt another job.
+2. Actual old checkpoint and source/SfM/split/resolution identity, not just paths
+   in a historical manifest. The four self-collected proxy extensions are reuse
+   only. Withdrawn external scenes are excluded.
+3. Independently reviewed SIG/neural-MS recipe, permission and dependencies.
+4. Renderer matrix/ray/native pixel parity and metric packet v2 accumulators,
+   including numeric packet/ref consistency on real exports.
+5. GCP/LiDAR protocol binding and independent metric recomputation. No new
+   scientific gate is inferred from a CPU-only synthetic test.
