@@ -28,6 +28,11 @@ GPU run. Existing UMGS proxy outputs and the GS-GCP release remain unchanged.
   and neural-color settings without importing Nerfstudio. This is a mechanism
   check, not certification that a recipe reproduces a paper. RGB gradients and
   densification can still change support in an isolation configuration.
+- `campaign.py` prepares the approved six-scene ledger: ten new pipelines,
+  eighteen paired UMGS/JO/neural-MS rows, two core-scene SIG rows, and two
+  RGB-anchor rows. It validates hash-bound result receipts without computing
+  metrics. Its start/closeout functions return decisions only, never launch
+  training or execute power commands. See [CAMPAIGN.md](CAMPAIGN.md).
 - The CLI hides CUDA and blocks GPU imports, network connections and external
   child execution. It has **no** `--execute` or automatic resume option. Explicit
   user notification and fresh resource/protocol checks are required later.
@@ -45,12 +50,16 @@ calling the reference evaluator.
 Run from the Multispectral repository with Python and NumPy/Pillow available:
 
 `requirements-cpu.txt` records the separate Python 3.12 CPU environment used
-for the local checks and optional frozen-reference synthetic smoke. Do not
-install it into a training environment. It contains no torch/CUDA dependencies.
+for checks and optional frozen-reference synthetic smoke. It may be installed
+directly on the execution server in a new isolated environment with no inherited
+training packages. Do not install it into an existing training environment.
+It contains no torch/CUDA dependencies. Download/build receipts and wheel
+hashes belong in machine-local evidence, not in this repository.
 
 ```text
-python -B -m unittest tools.measured_geometry_v1.test_cpu_adapters -v
+python -B -m unittest tools.measured_geometry_v1.test_cpu_adapters tools.measured_geometry_v1.test_campaign -v
 python -B -m tools.measured_geometry_v1.preflight --profile LOCAL_PROFILE.json --output NEW_REPORT.json
+python -B -m tools.measured_geometry_v1.campaign prepare --campaign_id umgs_tgrs_example --output_dir NEW_PREPARATION_DIRECTORY
 ```
 
 The preflight refuses an existing output or an output inside a release/raw/
@@ -80,10 +89,17 @@ credentials, datasets, checkpoints, downloaded methods or outputs belong here.
 
 1. Explicit user GPU availability/authorization; do not interrupt another job.
 2. Actual old checkpoint and source/SfM/split/resolution identity, not just paths
-   in a historical manifest. The four self-collected proxy extensions are reuse
-   only. Withdrawn external scenes are excluded.
+   in a historical manifest. Old UMGS/JO outputs from the five self-collected
+   scenes are reuse candidates after audit; neural-color MS-Splatting has a new
+   pipeline for all six scenes. SIG remains a two-core-scene mechanism check.
+   Withdrawn external scenes are excluded.
 3. Independently reviewed SIG/neural-MS recipe, permission and dependencies.
 4. Renderer matrix/ray/native pixel parity and metric packet v2 accumulators,
    including numeric packet/ref consistency on real exports.
 5. GCP/LiDAR protocol binding and independent metric recomputation. No new
    scientific gate is inferred from a CPU-only synthetic test.
+
+Installing dependencies does not qualify a renderer, its kernels, a method's
+paper recipe or the metric-depth adapter. Those gates remain explicit. The
+GS-GCP quarter-resolution experiment contract is a separate project and is not
+implicitly applied to these multispectral pipelines.
