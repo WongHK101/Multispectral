@@ -127,9 +127,12 @@ def validate_request(config):
         raise ValueError("Unreviewed method identity")
     if config["expected_host"] != platform.node():
         raise ValueError("Unexpected server hostname")
-    expected_packages = {"torch": "2.8.0+cu128", "gsplat": "1.4.0", "nerfstudio": "1.1.5"}
+    expected_packages = {"torch": "2.8.0", "gsplat": "1.4.0", "nerfstudio": "1.1.5"}
     if config["runtime_packages"] != expected_packages or not config["runtime_source_files"]:
         raise ValueError("Unbound or different native runtime")
+    if config["torch_build"] != {"version": "2.8.0+cu128", "cuda": "12.8",
+                                 "git_version": "a1cb3cc05d46d198467bebbb6e8fba50a325d4e7"}:
+        raise ValueError("Unbound PyTorch build; package metadata is not the CUDA build version")
 
 
 def parent(config_path, expected_sha):
@@ -214,10 +217,15 @@ def child(config_path, expected_sha):
     from .native_kernel_smoke import gsplat_synthetic
     try:
         import mmsplat.mmsplat_model as model
+        import torch
+        build = {"version": torch.__version__, "cuda": torch.version.cuda, "git_version": torch.version.git_version}
+        if build != cfg["torch_build"]:
+            raise ValueError("Actual PyTorch build mismatch")
         if Path(model.__file__).resolve() != Path(cfg["method_root"]).resolve() / "mmsplat/mmsplat_model.py":
             raise ValueError("Unexpected imported method path")
         result = gsplat_synthetic(reference=reference)
         result["runtime_packages"] = cfg["runtime_packages"]
+        result["torch_build"] = build
         result["runtime_source_files"] = cfg["runtime_source_files"]
         check_source(cfg["method_root"], cfg["method_commit"])
     except Exception as exc:

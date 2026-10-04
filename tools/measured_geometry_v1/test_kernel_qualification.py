@@ -48,7 +48,9 @@ class QualificationExecutorTests(unittest.TestCase):
             "method_commit": "9e7e128821c84c823edf6597e6817777cbd69df6", "expected_host": platform.node(),
             "method_root": "synthetic_method", "orchestration_root": "synthetic_orchestrator",
             "orchestration_manifest_sha256": "a"*64,
-            "runtime_packages": {"torch": "2.8.0+cu128", "gsplat": "1.4.0", "nerfstudio": "1.1.5"},
+            "runtime_packages": {"torch": "2.8.0", "gsplat": "1.4.0", "nerfstudio": "1.1.5"},
+            "torch_build": {"version": "2.8.0+cu128", "cuda": "12.8",
+                            "git_version": "a1cb3cc05d46d198467bebbb6e8fba50a325d4e7"},
             "runtime_source_files": [{"path": "synthetic", "sha256": "a"*64}],
             "request": {"scene": CORE[0], "method": "ms_splatting_neural", "stage": "GPU_QUALIFICATION",
                 "operation": "kernel_packet_parity", "output_class": "nonformal_qualification_only",
@@ -60,6 +62,13 @@ class QualificationExecutorTests(unittest.TestCase):
         cfg["request"]["max_iterations"] = 1
         with self.assertRaises(ValueError):
             kernel.validate_request(cfg)
+
+    def test_package_version_and_cuda_build_are_separate(self):
+        for key, value in (("version", "2.8.0"), ("cuda", "12.6"), ("git_version", "0"*40)):
+            cfg = self.config()
+            cfg["torch_build"][key] = value
+            with self.assertRaises(ValueError):
+                kernel.validate_request(cfg)
         cfg = self.config()
         cfg["runtime_packages"]["gsplat"] = "2.0.0"
         with self.assertRaises(ValueError):
