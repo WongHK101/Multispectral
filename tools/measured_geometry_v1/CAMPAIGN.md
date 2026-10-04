@@ -48,12 +48,15 @@ bound gate reports, and a fresh resource/ownership snapshot. Snapshots older
 than 30 seconds, future timestamps, unknown ownership, foreign work or pending
 transfers reject the decision. Recheck immediately before launching anything.
 
-GPU qualification itself remains staged: approved CPU contract tests permit
-only the specifically authorized GPU smoke; real packet/reference and camera
-checks must pass before formal evaluation and dependent new training. A missing
-real-export result cannot be replaced by a CPU header-only PASS. This module
-does not bootstrap or bypass that supervised qualification workflow, and all
-generated command bindings remain pending until its evidence exists.
+`qualification_start_decision` is a separate pure gate for the first bounded
+Road-only GPU smoke, not the full campaign gate. It requires bound CPU camera,
+source/recipe, environment and adapter reports plus the user's GPU notification
+and fresh idle ownership evidence. Its operations are limited to native kernel
+packet parity, model save/reload and method-step smoke, at most 100 iterations
+and 1,800 seconds within the remaining 24 GPU-hour batch ceiling. The executor
+must enforce the deadline. No formal result or full training approval follows
+from this decision. A CPU-only synthetic PASS cannot stand in for the real
+packet/camera qualification required by `gpu_start_decision`.
 
 ## Result receipts
 

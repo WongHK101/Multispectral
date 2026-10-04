@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from .native_moments import (RAW_NAMES, graphdeco_live_outputs, gsplat_live_feature_outputs,
-                             validate_raw_moments)
+                             validate_raw_moments, source_unit_wire)
 
 
 class NativeMomentTests(unittest.TestCase):
@@ -55,6 +55,20 @@ class NativeMomentTests(unittest.TestCase):
     def test_legacy_packet_with_no_same_call_h_is_not_accepted(self):
         with self.assertRaises(ValueError):
             graphdeco_live_outputs(np.zeros((6, 2, 3), np.float32), None)
+
+    def test_normalized_moments_explicit_float32_wire(self):
+        converted, record = source_unit_wire(self.raw, 2)
+        for i, factor in enumerate((1, .5, .25, 2)):
+            key = RAW_NAMES[i]
+            self.assertEqual(converted[key].dtype, np.float32)
+            np.testing.assert_array_equal(converted[key], self.raw[key] * factor)
+        self.assertEqual(record["unit_scale_applications"], 1)
+        self.assertEqual(record["backprojection_pose_domain"], "source_model")
+
+    def test_wire_overflow_and_bad_scale_fail(self):
+        for scale in (0, -1, np.nan, 1e-30):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                source_unit_wire(self.raw, scale)
 
 
 if __name__ == "__main__":

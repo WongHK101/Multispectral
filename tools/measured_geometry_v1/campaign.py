@@ -35,6 +35,10 @@ REQUIRED_GATES = (
     "input_identity", "split_and_shared_sfm", "method_recipe", "environment",
     "camera_ray_and_normalization", "metric_packet_and_reference", "gcp_lidar_protocol",
 )
+QUALIFICATION_CPU_GATES = (
+    "road_input_and_pixel_chain", "source_and_recipe", "environment_cpu_import",
+    "native_adapter_cpu_tests",
+)
 RECEIPT_STATUSES = {"COMPLETE", "PARTIAL", "FAILED", "BLOCKED"}
 
 
@@ -99,6 +103,7 @@ def validate_plan(envelope):
 
 
 def gpu_start_decision(envelope, authorization, gate_evidence, resource_snapshot, *, now):
+    """Full experimental execution, not the preliminary GPU qualification."""
     plan = validate_plan(envelope)
     reasons = []
     if (authorization.get("campaign_id") != plan["campaign_id"]
@@ -119,6 +124,47 @@ def gpu_start_decision(envelope, authorization, gate_evidence, resource_snapshot
             reasons.append(f"gate_report_unbound:{gate}")
     reasons.extend(_resource_reasons(resource_snapshot, now, gpu_start=True))
     return {"allowed": not reasons, "reasons": reasons, "child_launched": False}
+
+
+def qualification_start_decision(envelope, authorization, evidence, snapshot, request, *, now):
+    """Bounded first-GPU checks; never pretend real packet gates already passed."""
+    plan = validate_plan(envelope)
+    reasons = []
+    if (authorization.get("campaign_id") != plan["campaign_id"]
+            or authorization.get("plan_sha256") != envelope["plan_sha256"]
+            or authorization.get("explicit_user_gpu_available") is not True):
+        reasons.append("explicit_matching_user_gpu_notification_missing")
+    try:
+        _hash(authorization.get("user_message_evidence_sha256"))
+    except ValueError:
+        reasons.append("user_notification_evidence_missing")
+    for key in QUALIFICATION_CPU_GATES:
+        row = evidence.get(key, {})
+        if row.get("status") != "PASS":
+            reasons.append("qualification_cpu_gate_not_passed:" + key)
+        try:
+            _hash(row.get("verified_report_sha256"))
+        except ValueError:
+            reasons.append("qualification_report_unbound:" + key)
+    if (request.get("scene") != CORE[0] or request.get("method") not in
+            {"umgs", "jo", "sig_mechanism", "ms_splatting_neural", "rgb_anchor"}
+            or request.get("stage") != "GPU_QUALIFICATION"
+            or request.get("operation") not in {"kernel_packet_parity", "model_save_reload", "method_step_smoke"}
+            or request.get("output_class") != "nonformal_qualification_only"):
+        reasons.append("out_of_qualification_scope")
+    seconds, iterations = request.get("max_gpu_seconds"), request.get("max_iterations")
+    if type(seconds) is not int or not 0 < seconds <= 1800:
+        reasons.append("invalid_qualification_deadline")
+    if type(iterations) is not int or not 0 <= iterations <= 100:
+        reasons.append("invalid_qualification_iteration_limit")
+    remaining = request.get("gpu_budget_seconds_remaining")
+    if (type(remaining) not in (int, float) or not math.isfinite(remaining)
+            or type(seconds) is not int or remaining < seconds or remaining > 24 * 3600):
+        reasons.append("qualification_outside_remaining_batch_budget")
+    reasons.extend(_resource_reasons(snapshot, now, gpu_start=True))
+    return {"allowed": not reasons, "reasons": reasons, "child_launched": False,
+            "full_experiment_authorized": False, "gpu_packet_qualification_passed": False,
+            "deadline_enforcement_required_in_executor": True}
 
 
 def _resource_reasons(snapshot, now, *, gpu_start):

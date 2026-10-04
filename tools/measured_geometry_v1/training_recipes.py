@@ -28,6 +28,7 @@ def recipe(method):
         "camera_optimizer_rgb": {"mode": "off"}, "camera_optimizer_ms": {"mode": "off"},
         "ssim_lambda": .2, "use_scale_regularization": True,
         "opacity_correction_flag": False,
+        "use_neighbouring_features": False, "use_cosine_features": False,
     }
     manager = {"delay_channels": [*SPECTRAL, "30000"], "channel_oversampling": [],
                "channel_size": ["D", "3", *SPECTRAL, "1"], "equal_channel_sampling": True,

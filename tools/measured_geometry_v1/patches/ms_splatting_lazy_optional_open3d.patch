@@ -1,0 +1,28 @@
+diff --git a/mmsplat/mmsplat_model.py b/mmsplat/mmsplat_model.py
+index 132865c..0c3aefd 100644
+--- a/mmsplat/mmsplat_model.py
++++ b/mmsplat/mmsplat_model.py
+@@ -8,7 +8,6 @@ import time
+ from pathlib import Path
+ import torch
+ import numpy as np
+-import open3d.ml.torch as ml3d
+ 
+ from gsplat.rendering import rasterization
+ 
+@@ -423,6 +422,8 @@ class MMSplatModel(Model):
+         feature_input_dim = self.config.feature_input_dim + additional_input_dim
+ 
+         if self.config.mlp_type == "standard" and (self.config.use_neighbouring_features or self.config.use_cosine_features):
++            import open3d.ml.torch as ml3d
++
+             self.k = self.config.knn_size
+             self.knnsearch = ml3d.layers.KNNSearch(return_distances=True)
+             self.knn_index_reshape = None
+@@ -1412,4 +1413,4 @@ class MMSplatModel(Model):
+         distances, indices = nn_model.kneighbors(x_np)
+ 
+         # Exclude the point itself from the result and return
+-        return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)
+\ No newline at end of file
++        return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)

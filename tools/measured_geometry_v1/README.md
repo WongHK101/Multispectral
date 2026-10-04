@@ -1,8 +1,10 @@
 # UMGS measured-geometry CPU adaptation
 
-This directory prepares the Road/3K + 5K measured-geometry revision. It does
-not train, render, score real depth, fit Sim(3), access a server, or authorize a
-GPU run. Existing UMGS proxy outputs and the GS-GCP release remain unchanged.
+This directory prepares the Road/3K + 5K measured-geometry revision. Its CPU
+commands do not train, render, score real depth, fit Sim(3), access a server,
+or authorize a GPU run. Explicit evaluation-only native render helpers exist
+for later supervised GPU qualification. Existing UMGS proxy outputs and the
+GS-GCP release remain unchanged.
 
 ## Implemented boundaries
 
@@ -41,6 +43,22 @@ GPU run. Existing UMGS proxy outputs and the GS-GCP release remain unchanged.
   gsplat uses a zero-background feature render [1,z,z*z,1/z]. Neither path
   manufactures missing H from an archived packet. Array tests are synthetic,
   not CUDA or real-packet qualification.
+- `source_unit_wire` converts all four raw moments from method-normalized to
+  source-model units, then explicitly quantizes once to the packet float32
+  wire dtype. It does not convert to survey coordinates or fit a scale.
+- `raster_weight_reference.py` provides separate scalar diagnostic oracles for
+  the native Graphdeco and gsplat alpha caps and exclusive transmittance-stop
+  rules. They are not interchangeable with a generic inclusive layer sum.
+  These tests do not emulate CUDA projection, sorting or exponential arithmetic.
+- `live_packet_adapter.py` calls the actual native renderers with evaluation-only
+  moment features. It does not load a checkpoint, select cameras, authenticate
+  inputs or launch a campaign. The caller must supply those bindings and obtain
+  GPU authorization. gsplat's regular ED/background/clamp output is bypassed;
+  raw four-feature accumulation uses RGB mode, no SH and a zero background.
+- `patches/ms_splatting_lazy_optional_open3d.patch` delays the optional Open3D
+  torch import until the upstream KNN feature branch actually requests it.
+  Both reviewed KNN flags are false. The patch changes no other source AST and
+  does not claim support for enabling those unqualified optional features.
 - Camera corner-origin coordinates and integer array indices are converted
   explicitly by `camera_to_array_intrinsics`. A half-pixel offset is applied
   only to the identified target sampling convention, never silently to the
@@ -75,7 +93,7 @@ It contains no torch/CUDA dependencies. Download/build receipts and wheel
 hashes belong in machine-local evidence, not in this repository.
 
 ```text
-python -B -m unittest tools.measured_geometry_v1.test_cpu_adapters tools.measured_geometry_v1.test_campaign tools.measured_geometry_v1.test_training_recipes tools.measured_geometry_v1.test_native_moments -v
+python -B -m unittest discover -s tools/measured_geometry_v1 -t . -v
 python -B -m tools.measured_geometry_v1.preflight --profile LOCAL_PROFILE.json --output NEW_REPORT.json
 python -B -m tools.measured_geometry_v1.campaign prepare --campaign_id umgs_tgrs_example --output_dir NEW_PREPARATION_DIRECTORY
 ```

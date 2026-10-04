@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from .contracts import FLOAT_TENSORS
+from .camera_bridge import source_unit_accumulators
 
 RAW_NAMES = FLOAT_TENSORS[:4]
 
@@ -75,3 +76,22 @@ def packet_from_reference(raw, reference):
     if report["passed"] is not True:
         raise ValueError("Frozen reference packet consistency failed")
     return packet, report
+
+
+def source_unit_wire(raw, normalization_scale):
+    """Convert all four model-unit moments once, then quantize to wire float32.
+
+    Use source-world camera poses with this output. Do not also inverse-scale
+    the resulting 3D point or merely relabel the packet units.
+    """
+    values = validate_raw_moments(raw)
+    source = source_unit_accumulators(values, normalization_scale)
+    with np.errstate(over="ignore", under="ignore"):
+        wire = {key: value.astype(np.float32) for key, value in source.items()}
+    return validate_raw_moments(wire), {
+        "conversion": "normalized_model_moments_to_source_model_moments_v1",
+        "normalization_scale": float(normalization_scale),
+        "input_dtype": "float32", "compute_dtype": "float64", "output_dtype": "float32",
+        "unit_scale_applications": 1, "backprojection_pose_domain": "source_model",
+        "already_in_survey_metres": False,
+    }

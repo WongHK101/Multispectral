@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .campaign import (CORE, METRICS, REQUIRED_GATES, closeout_decision, collect_results,
                        expected_rows, gpu_start_decision, macro_eligibility, make_plan,
-                       metric_record, ranking_record, validate_plan, write_table)
+                       metric_record, ranking_record, validate_plan, write_table,
+                       QUALIFICATION_CPU_GATES, qualification_start_decision)
 from .contracts import canonical_bytes, record_hash, sha256
 
 
@@ -87,6 +88,41 @@ class CampaignTests(unittest.TestCase):
             with self.subTest(stamp=stamp):
                 s = self.snapshot(); s["observed_at_unix"] = stamp
                 self.assertFalse(gpu_start_decision(self.plan, self.authorization(), self.gates(), s, now=100)["allowed"])
+
+    def qualification_request(self):
+        return {"scene": CORE[0], "method": "ms_splatting_neural", "stage": "GPU_QUALIFICATION",
+                "operation": "kernel_packet_parity", "output_class": "nonformal_qualification_only",
+                "max_gpu_seconds": 900, "max_iterations": 0, "gpu_budget_seconds_remaining": 86400}
+
+    def qualification_cpu(self):
+        return {g: {"status": "PASS", "verified_report_sha256": "b" * 64} for g in QUALIFICATION_CPU_GATES}
+
+    def test_short_qualification_not_circular_or_full_run_permission(self):
+        out = qualification_start_decision(self.plan, self.authorization(), self.qualification_cpu(),
+                                            self.snapshot(), self.qualification_request(), now=100)
+        self.assertTrue(out["allowed"])
+        self.assertFalse(out["full_experiment_authorized"])
+        self.assertFalse(out["gpu_packet_qualification_passed"])
+        self.assertFalse(gpu_start_decision(self.plan, self.authorization(), self.qualification_cpu(),
+                                           self.snapshot(), now=100)["allowed"])
+
+    def test_qualification_scope_budget_and_limits_rejected(self):
+        for key, value in (("scene", CORE[1]), ("operation", "formal_training"),
+                           ("output_class", "formal"), ("max_iterations", 120000),
+                           ("max_gpu_seconds", 1801), ("gpu_budget_seconds_remaining", 0),
+                           ("gpu_budget_seconds_remaining", float("nan"))):
+            req = {**self.qualification_request(), key: value}
+            with self.subTest(key=key):
+                self.assertFalse(qualification_start_decision(self.plan, self.authorization(),
+                    self.qualification_cpu(), self.snapshot(), req, now=100)["allowed"])
+
+    def test_qualification_waits_for_user_and_fresh_cpu_evidence(self):
+        for auth, gates in (({}, self.qualification_cpu()), (self.authorization(), {})):
+            self.assertFalse(qualification_start_decision(self.plan, auth, gates, self.snapshot(),
+                self.qualification_request(), now=100)["allowed"])
+        snapshot = self.snapshot(); snapshot["foreign_jobs"] = 1
+        self.assertFalse(qualification_start_decision(self.plan, self.authorization(), self.qualification_cpu(),
+            snapshot, self.qualification_request(), now=100)["allowed"])
 
     def batch(self, outcome="COMPLETED"):
         return {"campaign_id": "umgs_tgrs_test", "plan_sha256": self.plan["plan_sha256"],
