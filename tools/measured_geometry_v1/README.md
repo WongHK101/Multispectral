@@ -37,6 +37,11 @@ GS-GCP release remain unchanged.
   MS densification, scale regularization and optimizer state remain active.
   Resolved upstream CLI settings must match before execution. These recipes
   are disclosed shared-input comparisons, not recovered author-exact commands.
+- `ms_cpu_smoke.py` runs inside the isolated upstream environment with CUDA
+  hidden. It parses the actual tyro CLI, exercises the actual direction encoder
+  and 1,671-parameter decoder on CPU, and executes the pinned source's selected
+  gradient-routing/scale-regularizer AST. It never constructs a dataset, Trainer
+  or whole model. This is not evidence of CUDA/densification/training parity.
 - `native_moments.py` wires fresh same-call rasterizer outputs into the
   unchanged, externally authenticated packet-v2 reference. Graphdeco needs
   its live raw inverse-depth accumulator H as well as the six-plane output;
@@ -55,6 +60,11 @@ GS-GCP release remain unchanged.
   inputs or launch a campaign. The caller must supply those bindings and obtain
   GPU authorization. gsplat's regular ED/background/clamp output is bypassed;
   raw four-feature accumulation uses RGB mode, no SH and a zero background.
+- `native_kernel_smoke.py` prepares odd/even-grid synthetic CUDA checks for both
+  native renderers: same-call raw moments, alpha cutoff and exclusive-stop
+  boundary cases, followed by the unchanged packet/reference check. Its CPU
+  oracle tests do not execute the kernels. Calling the GPU helpers still needs
+  the separate user notice, runtime ownership/source checks and deadline.
 - `patches/ms_splatting_lazy_optional_open3d.patch` delays the optional Open3D
   torch import until the upstream KNN feature branch actually requests it.
   Both reviewed KNN flags are false. The patch changes no other source AST and
