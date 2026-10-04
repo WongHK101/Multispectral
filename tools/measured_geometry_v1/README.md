@@ -28,6 +28,24 @@ GPU run. Existing UMGS proxy outputs and the GS-GCP release remain unchanged.
   and neural-color settings without importing Nerfstudio. This is a mechanism
   check, not certification that a recipe reproduces a paper. RGB gradients and
   densification can still change support in an isolation configuration.
+- `training_recipes.py` constructs fixed JO, SIG-mechanism and neural-color
+  argument vectors without executing them. The reviewed neural decoder uses
+  8 features and a raw 3D direction: 11->32->32->7 (1,671 parameters). The
+  SIG comparison changes the non-RGB direct photometric structure gradients;
+  MS densification, scale regularization and optimizer state remain active.
+  Resolved upstream CLI settings must match before execution. These recipes
+  are disclosed shared-input comparisons, not recovered author-exact commands.
+- `native_moments.py` wires fresh same-call rasterizer outputs into the
+  unchanged, externally authenticated packet-v2 reference. Graphdeco needs
+  its live raw inverse-depth accumulator H as well as the six-plane output;
+  gsplat uses a zero-background feature render [1,z,z*z,1/z]. Neither path
+  manufactures missing H from an archived packet. Array tests are synthetic,
+  not CUDA or real-packet qualification.
+- Camera corner-origin coordinates and integer array indices are converted
+  explicitly by `camera_to_array_intrinsics`. A half-pixel offset is applied
+  only to the identified target sampling convention, never silently to the
+  frozen raw annotation decimal strings. A source-specific sidecar must bind
+  the actual historical image/calibration chain.
 - `campaign.py` prepares the approved six-scene ledger: ten new pipelines,
   eighteen paired UMGS/JO/neural-MS rows, two core-scene SIG rows, and two
   RGB-anchor rows. It validates hash-bound result receipts without computing
@@ -57,7 +75,7 @@ It contains no torch/CUDA dependencies. Download/build receipts and wheel
 hashes belong in machine-local evidence, not in this repository.
 
 ```text
-python -B -m unittest tools.measured_geometry_v1.test_cpu_adapters tools.measured_geometry_v1.test_campaign -v
+python -B -m unittest tools.measured_geometry_v1.test_cpu_adapters tools.measured_geometry_v1.test_campaign tools.measured_geometry_v1.test_training_recipes tools.measured_geometry_v1.test_native_moments -v
 python -B -m tools.measured_geometry_v1.preflight --profile LOCAL_PROFILE.json --output NEW_REPORT.json
 python -B -m tools.measured_geometry_v1.campaign prepare --campaign_id umgs_tgrs_example --output_dir NEW_PREPARATION_DIRECTORY
 ```
@@ -93,7 +111,8 @@ credentials, datasets, checkpoints, downloaded methods or outputs belong here.
    scenes are reuse candidates after audit; neural-color MS-Splatting has a new
    pipeline for all six scenes. SIG remains a two-core-scene mechanism check.
    Withdrawn external scenes are excluded.
-3. Independently reviewed SIG/neural-MS recipe, permission and dependencies.
+3. Actual CLI-resolution and environment checks for the reviewed SIG/neural-MS
+   recipe, together with the pinned source/license identity.
 4. Renderer matrix/ray/native pixel parity and metric packet v2 accumulators,
    including numeric packet/ref consistency on real exports.
 5. GCP/LiDAR protocol binding and independent metric recomputation. No new

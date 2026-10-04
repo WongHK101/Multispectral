@@ -69,6 +69,21 @@ def projection_to_pinhole(projection_row, width, height, *, convention):
                    (p[2, 1] + 1) * height / 2 + offset)
 
 
+def camera_to_array_intrinsics(camera, *, sampling_convention):
+    """Expose a camera projection in array-index coordinates, exactly once.
+
+    gsplat 1.4 projects with K in corner-origin coordinates and samples at
+    (j+.5, i+.5). Graphdeco's ndc2Pix already produces index coordinates.
+    This operation says nothing about how historical raw clicks were stored.
+    """
+    if sampling_convention == "camera_corner_origin_samples_at_half_v1":
+        return Pinhole(camera.width, camera.height, camera.fx, camera.fy,
+                       camera.cx - .5, camera.cy - .5)
+    if sampling_convention == "array_index_integer_samples_v1":
+        return camera
+    raise ValueError("Unknown raster sampling convention; aliases are not evidence")
+
+
 def map_rays(source, target, source_pixels, *, coordinate_atol=1e-12, angle_atol=1e-7):
     """Pure intrinsic mapping. Caller must independently prove image/pose identity."""
     if min(coordinate_atol, angle_atol) <= 0 or not np.isfinite([coordinate_atol, angle_atol]).all():

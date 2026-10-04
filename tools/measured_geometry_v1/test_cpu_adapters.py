@@ -14,7 +14,8 @@ from unittest.mock import patch
 import numpy as np
 
 from .camera_bridge import (Pinhole, compare_poses, inverse_dataparser_points,
-                            map_rays, projection_to_pinhole, source_unit_accumulators)
+                            map_rays, projection_to_pinhole, source_unit_accumulators,
+                            camera_to_array_intrinsics)
 from .contracts import (FLOAT_TENSORS, PACKET_SCHEMA, PRIMARY_TENSOR, canonical_bytes,
                         read_json, read_npz_headers, safe_member, sha256,
                         validate_packet_headers, verify_source_snapshot)
@@ -22,6 +23,28 @@ from .method_recipe import channel_delays, inspect_resolved_recipe, verify_train
 
 
 class CameraTests(unittest.TestCase):
+    def test_gsplat_corner_sample_matches_index_camera(self):
+        camera = Pinhole(707, 512, 461.25, 462.5, 353.5, 256)
+        index = camera_to_array_intrinsics(camera, sampling_convention="camera_corner_origin_samples_at_half_v1")
+        pixels = np.array([[0, 0], [17.2, 45.3], [706, 511]])
+        np.testing.assert_allclose(index.unproject(pixels), camera.unproject(pixels + .5), atol=1e-15, rtol=0)
+
+    def test_already_index_projection_is_not_offset_twice(self):
+        camera = Pinhole(707, 512, 461.25, 462.5, 353, 255.5)
+        self.assertIs(camera_to_array_intrinsics(camera, sampling_convention="array_index_integer_samples_v1"), camera)
+
+    def test_offcenter_camera_principal_point_is_preserved(self):
+        camera = Pinhole(100, 80, 60, 70, 47.2, 33.1)
+        index = camera_to_array_intrinsics(camera, sampling_convention="camera_corner_origin_samples_at_half_v1")
+        self.assertEqual((index.cx, index.cy), (46.7, 32.6))
+        self.assertNotEqual(index.cx, (camera.width-1)/2)
+
+    def test_center_token_alone_cannot_choose_projection(self):
+        camera = Pinhole(100, 80, 60, 70, 50, 40)
+        for token in ("zero_based_pixel_centers", "zero_indexed_pixel_centers", "R8"):
+            with self.subTest(token=token), self.assertRaisesRegex(ValueError, "sampling convention"):
+                camera_to_array_intrinsics(camera, sampling_convention=token)
+
     def test_graphdeco_center_is_not_corner_origin(self):
         p = np.zeros((4, 4)); p[0, 0] = 2; p[1, 1] = 3; p[2, 3] = 1
         a = projection_to_pinhole(p, 1200, 869, convention="graphdeco_ndc_index_centers_v1")
