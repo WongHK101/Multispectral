@@ -150,3 +150,14 @@ Installing dependencies does not qualify a renderer, its kernels, a method's
 paper recipe or the metric-depth adapter. Those gates remain explicit. The
 GS-GCP quarter-resolution experiment contract is a separate project and is not
 implicitly applied to these multispectral pipelines.
+### Common source geometry
+
+`common_geometry.py` binds authenticated source-camera rays to the frozen point
+roles. It calls the unmodified reference DLT and Umeyama functions, fitting only
+control targets; checkpoint survey coordinates and method/LiDAR outputs are not
+fit inputs. All methods subsequently share this transform after undoing their
+recorded normalization. View groups use source-model XY azimuth and survey-frame
+off-nadir as in the reference protocol. The held-out surface list comes from the
+actual UMGS adapter split, not another project's same-sized split. This CPU
+calibration is not a Gaussian-method geometry result or GPU qualification.
+
