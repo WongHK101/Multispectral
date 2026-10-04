@@ -173,3 +173,6 @@ only its fixed child module in an isolated environment. It records a deadline,
 console log, raw accumulator checks and packet/ref result; timeout stops only
 that child's new process group. It does not train, produce formal scores or
 authorize the remaining batch. No actual GPU run is implied by its CPU tests.
+The child explicitly uses the installed CUDA 12.8 toolkit and its own
+environment's Ninja, recording compiler hashes/versions. It does not depend on
+interactive-shell startup files or modify the server's global environment.

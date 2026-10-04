@@ -14,6 +14,27 @@ from .contracts import sha256
 
 
 class QualificationExecutorTests(unittest.TestCase):
+    def test_bound_compilers_and_environment_do_not_require_gpu(self):
+        with patch.object(kernel.subprocess, "check_output", side_effect=["nvcc release 12.8, V12.8.93", "1.13.2", "gcc 11.4", "g++ 11.4"]), \
+                patch.object(kernel, "sha256", return_value="a"*64), \
+                patch.dict(kernel.os.environ, {"PATH": "/usr/bin", "PYTHONPATH": "foreign",
+                                              "CUDA_HOME": "foreign", "NVCC_APPEND_FLAGS": "foreign"}):
+            env, tools = kernel.build_environment({"method_python": "/project/env/bin/python"}, Path("out"), "GPU-abc")
+            self.assertEqual(Path(env["CUDA_HOME"]).as_posix(), "/usr/local/cuda-12.8")
+            self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "GPU-abc")
+            self.assertEqual(env["MAX_JOBS"], "1")
+            self.assertTrue(env["PATH"].startswith(str(Path("/project/env/bin"))))
+            self.assertNotIn("PYTHONPATH", env)
+            self.assertNotIn("NVCC_APPEND_FLAGS", env)
+            self.assertEqual(set(tools), {"nvcc", "gcc", "g++", "ninja"})
+
+    def test_wrong_cuda_toolkit_fails_without_launch(self):
+        with patch.object(kernel.subprocess, "check_output", return_value="nvcc release 11.8, V11.8.89"), \
+                patch.object(kernel.subprocess, "Popen") as child:
+            with self.assertRaisesRegex(ValueError, "CUDA compiler"):
+                kernel.build_environment({"method_python": "/project/env/bin/python"}, Path("out"), "GPU-abc")
+            child.assert_not_called()
+
     def test_idle_samples_no_torch_and_no_kill(self):
         with patch.object(kernel.subprocess, "check_output", side_effect=["GPU-abc,0,0,90000\n", ""]*3), \
                 patch.object(kernel.time, "sleep"), patch.object(kernel.os, "killpg", create=True) as kill:

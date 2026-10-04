@@ -135,6 +135,29 @@ def validate_request(config):
         raise ValueError("Unbound PyTorch build; package metadata is not the CUDA build version")
 
 
+def build_environment(config, output, gpu_uuid):
+    """Bind existing 901 build tools without relying on an interactive shell PATH."""
+    cuda_home = Path("/usr/local/cuda-12.8")
+    method_bin = Path(config["method_python"]).parent
+    binaries = {"nvcc": cuda_home / "bin/nvcc", "ninja": method_bin / "ninja",
+                "gcc": Path("/usr/bin/gcc"), "g++": Path("/usr/bin/g++")}
+    records = {}
+    for name, path in binaries.items():
+        version = subprocess.check_output([str(path), "--version"], text=True, timeout=30)
+        if name == "nvcc" and "release 12.8," not in version:
+            raise ValueError("CUDA compiler differs from the bound PyTorch CUDA build")
+        records[name] = {"path": str(path), "sha256": sha256(path), "version": version}
+    env = dict(os.environ)
+    for name in ("PYTHONPATH", "LD_PRELOAD", "CUDA_PATH", "NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS"):
+        env.pop(name, None)
+    env.update(PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES=gpu_uuid,
+               CUDA_HOME=str(cuda_home), CC=str(binaries["gcc"]), CXX=str(binaries["g++"]),
+               PATH=os.pathsep.join([str(method_bin), str(cuda_home / "bin"), env.get("PATH", "")]),
+               OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1",
+               TORCH_EXTENSIONS_DIR=str(output / "build_cache"), MAX_JOBS="1")
+    return env, records
+
+
 def parent(config_path, expected_sha):
     verify_sha(config_path, expected_sha)
     cfg = read_json(config_path)
@@ -172,16 +195,12 @@ def parent(config_path, expected_sha):
     if output == allowed or not output.is_relative_to(allowed):
         raise ValueError("Qualification output must remain inside the project run root")
     output.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ)
-    for name in ("PYTHONPATH", "LD_PRELOAD"):
-        env.pop(name, None)
-    env.update(PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1", CUDA_VISIBLE_DEVICES=samples[0]["uuid"],
-               OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1",
-               TORCH_EXTENSIONS_DIR=str(output / "build_cache"), MAX_JOBS="1")
+    env, build_tools = build_environment(cfg, output, samples[0]["uuid"])
     argv = [cfg["method_python"], "-B", "-m", "tools.measured_geometry_v1.kernel_qualification",
             "--child", "--config", str(Path(config_path).resolve()), "--config_sha256", expected_sha]
     write_json_exclusive(output / "launch.json", {"decision": gate, "config_sha256": expected_sha,
         "orchestration_commit": source["git_commit"], "idle_samples": samples, "argv": argv,
+        "build_tools": build_tools, "cuda_home": env["CUDA_HOME"],
         "ownership_snapshot_sha256": cfg["ownership_snapshot"]["sha256"],
         "output_class": "nonformal_qualification_only", "full_experiments_started": False})
     run = bounded_child(argv, cwd=cfg["orchestration_root"], env=env,
