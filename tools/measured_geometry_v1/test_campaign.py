@@ -6,7 +6,8 @@ import unittest
 from pathlib import Path
 
 from .campaign import (CORE, METRICS, REQUIRED_GATES, closeout_decision, collect_results,
-                       expected_rows, gpu_start_decision, make_plan, validate_plan, write_table)
+                       expected_rows, gpu_start_decision, macro_eligibility, make_plan,
+                       metric_record, ranking_record, validate_plan, write_table)
 from .contracts import canonical_bytes, record_hash, sha256
 
 
@@ -90,13 +91,15 @@ class CampaignTests(unittest.TestCase):
     def batch(self, outcome="COMPLETED"):
         return {"campaign_id": "umgs_tgrs_test", "plan_sha256": self.plan["plan_sha256"],
                 "user_shutdown_authorization_evidence_sha256": "d" * 64,
+                "stage": "EXPERIMENT_BATCH", "gpu_authorization": self.authorization(),
                 "experiments_started_after_user_notification": True,
+                "reason": "" if outcome == "COMPLETED" else "synthetic_review_failure",
                 "outcome": outcome, "all_owned_children_stopped": True, "logs_flushed": True,
                 "evidence_saved_off_server": True, "artifact_inventory_verified": True,
                 "explicit_batch_shutdown_authorization": True}
 
     def test_completed_or_review_failure_all_allow_safe_closeout(self):
-        for outcome in ("COMPLETED", "REVIEW_FAILED", "REVIEW_TOOL_ERROR"):
+        for outcome in ("COMPLETED", "BLOCKED", "REVIEW_FAILED", "REVIEW_TOOL_ERROR"):
             with self.subTest(outcome=outcome):
                 d = closeout_decision(self.plan, self.batch(outcome), self.snapshot(), now=100)
                 self.assertEqual(d["decision"], "SHUTDOWN_ELIGIBLE_RECHECK_BEFORE_COMMAND")
@@ -104,7 +107,32 @@ class CampaignTests(unittest.TestCase):
                 self.assertTrue(d["review_failure_does_not_become_pass"])
 
     def test_preparation_must_not_shutdown(self):
-        b = self.batch(); b["experiments_started_after_user_notification"] = False
+        b = self.batch(); b.update(stage="CPU_PREPARATION", experiments_started_after_user_notification=False)
+        self.assertEqual(closeout_decision(self.plan, b, self.snapshot(), now=100)["decision"], "DO_NOT_SHUTDOWN")
+
+    def test_user_enabled_gpu_blocked_before_training_can_closeout(self):
+        b = self.batch("BLOCKED")
+        b.update(stage="GPU_QUALIFICATION", experiments_started_after_user_notification=False,
+                 reason="kernel_qualification_failed")
+        out = closeout_decision(self.plan, b, self.snapshot(), now=100)
+        self.assertEqual(out["decision"], "SHUTDOWN_ELIGIBLE_RECHECK_BEFORE_COMMAND")
+        self.assertFalse(out["power_command_executed"])
+
+    def test_qualification_does_not_claim_success_or_training(self):
+        for outcome, started in (("COMPLETED", False), ("BLOCKED", True)):
+            b = self.batch(outcome)
+            b.update(stage="GPU_QUALIFICATION", experiments_started_after_user_notification=started)
+            self.assertEqual(closeout_decision(self.plan, b, self.snapshot(), now=100)["decision"], "DO_NOT_SHUTDOWN")
+
+    def test_closeout_does_not_infer_user_gpu_authorization(self):
+        for auth in ({}, {**self.authorization(), "explicit_user_gpu_available": False},
+                     {**self.authorization(), "plan_sha256": "f" * 64},
+                     {**self.authorization(), "user_message_evidence_sha256": None}):
+            b = self.batch(); b["gpu_authorization"] = auth
+            self.assertEqual(closeout_decision(self.plan, b, self.snapshot(), now=100)["decision"], "DO_NOT_SHUTDOWN")
+
+    def test_blocked_closeout_requires_real_reason(self):
+        b = self.batch("BLOCKED"); b["reason"] = ""
         self.assertEqual(closeout_decision(self.plan, b, self.snapshot(), now=100)["decision"], "DO_NOT_SHUTDOWN")
 
     def test_shutdown_authorization_must_bind_campaign_and_message(self):
@@ -166,6 +194,104 @@ class ResultTests(unittest.TestCase):
         spec = self.save("receipt.json", r)
         self.index["receipts"] = [{**spec, "row_id": self.exp["row_id"]}]
         return collect_results(self.plan, self.index, self.root)
+
+    def reaudit(self, r):
+        audit = {"status": "PASS", "row_id": r["row_id"], "campaign_id": r["campaign_id"],
+                 "metric_record_sha256": record_hash(metric_record(r))}
+        spec = self.save("audit.json", audit)
+        r["artifacts"] = [spec]; r["independent_audit"] = spec
+        return r
+
+    def v2_receipt(self):
+        r = self.receipt()
+        r["schema"] = "umgs_tgrs_result_receipt_v2"
+        r["ranking"] = {g: ranking_record(4, 4, "f" * 64) for g in r["groups"]}
+        return self.reaudit(r)
+
+    def test_legacy_complete_is_not_automatically_ranked(self):
+        row = self.collect(self.receipt())["rows"][0]
+        self.assertEqual(row["status"], "COMPLETE")
+        self.assertFalse(any(row["metric_ranking_eligible"].values()))
+
+    def test_v2_complete_and_audited_ranking(self):
+        row = self.collect(self.v2_receipt())["rows"][0]
+        self.assertTrue(row["metric_ranking_eligible"]["gcp.rmse_3d_m"])
+
+    def test_complete_delivery_incomplete_gcp_stays_unranked(self):
+        r = self.v2_receipt()
+        r["coverage_status"] = "INCOMPLETE_VALID_RESULT"
+        r["ranking"]["gcp"] = ranking_record(4, 3, "f" * 64, reason="formal_checkpoint_coverage_incomplete")
+        row = self.collect(self.reaudit(r))["rows"][0]
+        self.assertEqual(row["status"], "COMPLETE")
+        self.assertEqual(row["ranking"]["gcp"]["status"], "INCOMPLETE_UNRANKED")
+        self.assertFalse(row["metric_ranking_eligible"]["gcp.rmse_3d_m"])
+        self.assertTrue(row["metric_ranking_eligible"]["appearance.rgb_psnr"])
+
+    def test_missing_resources_do_not_remove_verified_gcp_eligibility(self):
+        r = self.v2_receipt()
+        r.update(status="PARTIAL", reason="historical_resource_measurements_missing")
+        r["groups"]["resources"] = "PARTIAL"
+        r["ranking"]["resources"] = ranking_record(4, 0, "f" * 64, reason=r["reason"])
+        r["metrics"] = {k: v for k, v in r["metrics"].items() if not k.startswith("resources.")}
+        row = self.collect(self.reaudit(r))["rows"][0]
+        self.assertTrue(row["metric_ranking_eligible"]["gcp.rmse_3d_m"])
+        self.assertFalse(row["metric_ranking_eligible"]["resources.training_seconds"])
+
+    def test_ranking_tamper_and_legacy_rank_injection_rejected(self):
+        r = self.v2_receipt()
+        r["ranking"]["gcp"] = ranking_record(4, 3, "f" * 64, reason="incomplete")
+        with self.assertRaises(ValueError):
+            self.collect(r)
+        r = self.receipt(); r["ranking"] = {}
+        with self.assertRaises(ValueError):
+            self.collect(r)
+
+    def test_false_complete_rank_rejected_even_if_reaudited(self):
+        r = self.v2_receipt()
+        r["ranking"]["gcp"]["population_passed"] = 3
+        with self.assertRaises(ValueError):
+            self.collect(self.reaudit(r))
+
+    def test_partial_v2_metrics_still_need_reaudit(self):
+        r = self.v2_receipt()
+        r.update(status="PARTIAL", reason="partial_delivery")
+        r["metrics"]["gcp.rmse_3d_m"] = 0.1
+        with self.assertRaises(ValueError):
+            self.collect(r)
+
+    def test_blocked_before_checkpoint_does_not_require_fake_identity(self):
+        r = self.v2_receipt()
+        r.update(status="BLOCKED", reason="input_binding_failed", identity={}, metrics={},
+                 coverage_status="NOT_EVALUATED", groups={g: "NOT_RUN" for g in r["groups"]})
+        r["ranking"] = {g: ranking_record(4, 0, "f" * 64, reason="not_evaluated") for g in r["groups"]}
+        row = self.collect(self.reaudit(r))["rows"][0]
+        self.assertFalse(any(row["metric_ranking_eligible"].values()))
+
+    def test_not_evaluated_cannot_smuggle_ranked_numbers(self):
+        r = self.v2_receipt(); r["coverage_status"] = "NOT_EVALUATED"
+        with self.assertRaises(ValueError):
+            self.collect(self.reaudit(r))
+
+    def test_invalid_population_rejected(self):
+        for total, passed in ((0, 0), (4, 5), (4, -1), (True, 1), (4, 3.0)):
+            with self.subTest(total=total, passed=passed), self.assertRaises(ValueError):
+                ranking_record(total, passed, "f" * 64, reason="invalid")
+
+    def test_primary_macro_never_uses_surviving_scenes_only(self):
+        out = self.collect(self.v2_receipt())
+        self.assertFalse(macro_eligibility(out, "umgs", "gcp.rmse_3d_m")["eligible"])
+        self.assertEqual(len(macro_eligibility(out, "umgs", "appearance.rgb_psnr")["required_scenes"]), 6)
+        self.assertEqual(len(macro_eligibility(out, "sig_mechanism", "appearance.rgb_psnr")["required_scenes"]), 2)
+
+    def test_macro_needs_each_frozen_scene_and_does_not_compute_mean(self):
+        out = self.collect(self.v2_receipt())
+        metric = "appearance.rgb_psnr"
+        for row in out["rows"]:
+            if row["method"] == "umgs":
+                row["metric_ranking_eligible"][metric] = True
+        decision = macro_eligibility(out, "umgs", metric)
+        self.assertTrue(decision["eligible"])
+        self.assertFalse(decision["mean_computed"])
 
     def test_empty_table_preserves_22_pending_not_zero_metrics(self):
         out = collect_results(self.plan, self.index, self.root)

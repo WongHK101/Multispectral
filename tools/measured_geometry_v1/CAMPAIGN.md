@@ -61,7 +61,7 @@ A `umgs_tgrs_result_index_v1` binds campaign ID, plan hash and one entry per
 available result. Each entry contains `row_id`, evidence-root-relative `path`,
 `size_bytes` and `sha256`. No duplicate or out-of-scope row is accepted.
 
-A receipt uses schema `umgs_tgrs_result_receipt_v1` and binds:
+A new receipt uses schema `umgs_tgrs_result_receipt_v2` and binds:
 
 - `campaign_id`, `row_id`, `scene`, `method`, and `track`;
 - `status`: COMPLETE, PARTIAL, FAILED or BLOCKED;
@@ -71,6 +71,9 @@ A receipt uses schema `umgs_tgrs_result_receipt_v1` and binds:
 - `artifacts`: path, size and SHA records, including failure evidence;
 - `reason` for every non-complete result;
 - an explicit `coverage_status`, not a conclusion inferred from low RMSE.
+- `ranking` for each group: frozen population SHA, total, passed coverage gates,
+  disposition and exclusion reason. GCP counts formal checkpoints passing the
+  point-level coverage gate, not observations or merely finite residuals.
 
 COMPLETE additionally requires all groups to pass, every applicable summary
 metric, input/recipe/scoring-protocol/checkpoint hashes and an independently
@@ -78,8 +81,17 @@ generated audit included in the evidence. RGB anchors cannot publish spectral
 SAM. Scientific incomplete coverage may be an audited valid method result, but
 missing measurements or missing historic resource records remain PARTIAL.
 
+Delivery COMPLETE does not imply COMPLETE_RANKED. A complete delivery with an
+incomplete GCP population is INCOMPLETE_UNRANKED; its subset residuals remain
+diagnostic. Missing historical resources can leave delivery PARTIAL while an
+independently verified complete geometry track remains ranking eligible.
+`macro_eligibility` requires every predetermined scene for that method/metric;
+it never computes a surviving-scenes primary mean or mixes the two scene scopes.
+
 The independent audit binds campaign ID, row ID and SHA-256 of the canonical
-record `{identity, groups, metrics, coverage_status}`. Canonical serialization
+record `{identity, groups, metrics, coverage_status, ranking}`, including PARTIAL
+delivery. Legacy v1 receipts retain their old audit format and are always
+UNVERIFIED_UNRANKED until explicitly re-audited into v2. Canonical serialization
 is `contracts.canonical_bytes`. The collector checks this binding; it does
 not perform the independent recomputation or certify the audit author. The
 supervised workflow must pin the receipt index and its provenance separately.
@@ -99,8 +111,12 @@ REVIEW_FAILED or REVIEW_TOOL_ERROR. Neither failure becomes an audit PASS.
 The current CPU preparation is explicitly outside this shutdown authorization.
 
 `closeout_decision` requires the matching campaign/plan, separately captured
-user shutdown authorization, actual post-notification experiment start,
-authorized final outcome, stopped owned children, flushed logs, hash-verified
+GPU notification and shutdown authorization, an explicit stage and an authorized
+outcome. CPU_PREPARATION cannot close the server. GPU_QUALIFICATION can close
+after BLOCKED/REVIEW_FAILED/REVIEW_TOOL_ERROR without pretending training started.
+EXPERIMENT_BATCH requires a real post-notification experiment start, and can
+close after completion or those failures. All noncomplete outcomes need a reason.
+Both GPU stages require stopped owned children, flushed logs, hash-verified
 artifact inventory and off-server evidence backup. Live foreign/unknown jobs,
 active transfers or unverified process ownership always prevent shutdown.
 The execution operator must recheck live ownership before the real command;
