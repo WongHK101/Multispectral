@@ -150,6 +150,7 @@ Installing dependencies does not qualify a renderer, its kernels, a method's
 paper recipe or the metric-depth adapter. Those gates remain explicit. The
 GS-GCP quarter-resolution experiment contract is a separate project and is not
 implicitly applied to these multispectral pipelines.
+
 ### Common source geometry
 
 `common_geometry.py` binds authenticated source-camera rays to the frozen point
@@ -161,3 +162,14 @@ off-nadir as in the reference protocol. The held-out surface list comes from the
 actual UMGS adapter split, not another project's same-sized split. This CPU
 calibration is not a Gaussian-method geometry result or GPU qualification.
 
+### Bounded first-GPU executor
+
+`kernel_qualification.py` implements only the zero-training-iteration gsplat
+native packet smoke. Its hash-bound run config must include the user GPU notice,
+CPU reports, a fresh ownership inspection, clean method source, committed
+orchestrator snapshot, runtime versions/source files and frozen reference.
+The executor independently samples NVIDIA idle state three times and starts
+only its fixed child module in an isolated environment. It records a deadline,
+console log, raw accumulator checks and packet/ref result; timeout stops only
+that child's new process group. It does not train, produce formal scores or
+authorize the remaining batch. No actual GPU run is implied by its CPU tests.
