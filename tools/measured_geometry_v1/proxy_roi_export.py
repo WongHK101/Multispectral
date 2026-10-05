@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .contracts import read_json, record_hash, sha256, verify_sha, verify_source_snapshot
-from .ms_checkpoint_export import write_json
+from .ms_checkpoint_export import write_json, json_summary
 from .native_moments import packet_from_reference
 from .proxy_checkpoint_export import BINDING_SHA, FORWARD_SHA, WRAPPER_SHA, source_moments_with_legacy_parity
 from .proxy_roi import PROTOCOL, load_roi_manifest, validate_camera
@@ -232,6 +232,7 @@ def export(args):
         full_model_no_roi_crop=True, same_render_call_real_H=True, native_gsplat_track=False,
         legacy_six_arrays_and_numeric_valid_unchanged=True, v2_valid_does_not_replace_legacy_proxy_mask=True,
         rasterizer_early_termination='test_T < 1e-4', wall_seconds=time.monotonic()-started)
+    manifest = json_summary(manifest)
     manifest['records_root_sha256'] = record_hash(manifest)
     write_json(args.output/'export_manifest.json', manifest)
 
