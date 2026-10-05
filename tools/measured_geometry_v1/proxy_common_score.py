@@ -119,6 +119,19 @@ def score(args):
                     or m['geometry']['checkpoint_step'] != 119999 or not m['source_unchanged']
                     or m['method_specific_alignment_used'] or m['scale_shift_fit_used'] or m['sim3_used']):
                 raise ValueError("Historical JO contract mismatch")
+            joint_registry = Path(job['joint_registry']['path'])
+            verify_sha(joint_registry, job['joint_registry']['sha256'])
+            if m['registry_sha256'] != job['joint_registry']['sha256']:
+                raise ValueError("Historical JO registry mismatch")
+            joint_scene = wrapper.scene_record(wrapper.load_registry(joint_registry), job['scene'])
+            if (m['checkpoint_sha256_before'] != m['checkpoint_sha256_after']
+                    or m['checkpoint_sha256_before'] != joint_scene['checkpoint']['sha256']):
+                raise ValueError("Historical JO checkpoint identity mismatch")
+            joint_targets = unique_rows(joint_scene['targets'], 'image_name', names)
+            for target in targets:
+                t = joint_targets[target['image_name']]
+                if t['fingerprint_sha256'] != target['fingerprint_sha256'] or t['reference_packet']['sha256'] != target['reference_packet']['sha256']:
+                    raise ValueError("Historical JO reference or camera differs from common authority")
             maps[method] = unique_rows(m['packets'], 'target', names)
         else:
             if (m['schema'] != 'umgs_common_graphdeco_proxy_fresh_v2_v1' or m['method_id'] != method
@@ -150,6 +163,8 @@ def score(args):
             p = mapping[target['image_name']]
             if p['camera']['fingerprint_sha256'] != target['fingerprint_sha256'] or (p['camera']['height'], p['camera']['width']) != shape:
                 raise ValueError("Common renderer camera fingerprint mismatch")
+            if not np.array_equal(p['camera']['projection_matrix'], target['fingerprint_payload']['projection_matrix']):
+                raise ValueError("Common renderer projection matrix mismatch")
             parent = Path(manifest_records[method]['path']).parent
             if method == 'jo':
                 records[method] = dict(path=str(parent / p['packet_file']), sha256=p['packet_sha256'])
