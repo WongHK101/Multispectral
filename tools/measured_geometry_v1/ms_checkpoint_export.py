@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -88,7 +89,17 @@ def export(args):
     from .preflight import _load_reference_module
 
     reference = _load_reference_module(args.reference_root, "metric_depth_packet")
-    config, pipeline, checkpoint_path, step = eval_setup(args.config, load_step=args.step, test_mode="test")
+    # This exact locally trained checkpoint was authenticated above. Upstream
+    # omits weights_only and predates PyTorch 2.6's changed default.
+    old_load_policy = os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD")
+    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+    try:
+        config, pipeline, checkpoint_path, step = eval_setup(args.config, load_step=args.step, test_mode="test")
+    finally:
+        if old_load_policy is None:
+            os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
+        else:
+            os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = old_load_policy
     if Path(checkpoint_path).resolve() != args.checkpoint.resolve() or step != args.step:
         raise ValueError("Loader selected a different checkpoint")
     model = pipeline.model
