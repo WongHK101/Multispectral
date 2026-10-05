@@ -5,7 +5,6 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-from pyproj import Transformer
 
 from .contracts import read_json, record_hash, safe_member, sha256, verify_sha
 from .proxy_common_score import CORE_METHODS, common_masks, mask_digest, unique_rows
@@ -180,6 +179,7 @@ def qualify_reference(audit, gates, view_reports, original):
 
 
 def materialize(args):
+    from pyproj import Transformer
     if args.output.exists():
         raise FileExistsError(args.output)
     verify_sha(args.job, args.job_sha256)
