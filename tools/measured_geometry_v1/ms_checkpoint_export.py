@@ -228,7 +228,7 @@ def export(args):
 
             if split == "eval":
                 with torch.no_grad():
-                    rendered = model.get_outputs(camera)["render"].detach().cpu().numpy()
+                    rendered = model.get_outputs(camera.to(model.device))["render"].detach().cpu().numpy()
                 if rendered.shape != (height, width, 3 if channel == "D" else 1) or not np.isfinite(rendered).all():
                     raise ValueError("Appearance shape/nonfinite mismatch")
                 appearance_path = args.output / "appearance" / (Path(group["image_name"]).stem + "__" + channel + ".npy")
