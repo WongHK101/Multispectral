@@ -82,6 +82,7 @@ def export(args):
     started = time.time()
 
     import torch
+    from nerfstudio.cameras import camera_utils
     from gsplat.rendering import rasterization
     from mmsplat.util.eval_utils import eval_setup
     from mmsplat.util.utils import get_viewmat
@@ -140,6 +141,16 @@ def export(args):
         raise ValueError("Invalid recorded normalization")
     transform = np.eye(4)
     transform[:3] = t
+    # Reproduce the original batch operation, not single-matrix multiplication:
+    # float32 BLAS accumulation order is part of the actual parser construction.
+    ordered_frames = sorted(frames)
+    input_poses = torch.from_numpy(np.asarray([frames[name]["transform_matrix"] for name in ordered_frames], dtype=np.float32))
+    reproduced_poses, reproduced_transform = camera_utils.auto_orient_and_center_poses(
+        input_poses, method=meta.get("orientation_override", dm.config.dataparser.orientation_method),
+        center_method=dm.config.dataparser.center_method)
+    reproduced_poses[:, :3, 3] *= scale
+    np.testing.assert_array_equal(reproduced_transform.cpu().numpy(), t.astype(np.float32))
+    reproduced_by_path = dict(zip(ordered_frames, reproduced_poses[:, :3, :4]))
     seen = set()
     packet_rows, appearance_rows, camera_rows = [], [], []
     loaded_counts = {}
@@ -170,10 +181,7 @@ def export(args):
             expected_k = np.array([[frame["fl_x"], 0, frame["cx"]],
                                    [0, frame["fl_y"], frame["cy"]], [0, 0, 1]], dtype=np.float32)
             np.testing.assert_array_equal(k, expected_k)
-            original_pose = torch.from_numpy(np.asarray(frame["transform_matrix"], dtype=np.float32))
-            reproduced_pose = outputs.dataparser_transform.cpu() @ original_pose
-            reproduced_pose[:, 3] *= scale
-            if not torch.equal(camera.camera_to_worlds[0].cpu(), reproduced_pose[:3, :4]):
+            if not torch.equal(camera.camera_to_worlds[0].cpu(), reproduced_by_path[relative]):
                 raise ValueError("Actual parser pose is not the exact frozen float32 construction")
             native = Pinhole(width, height, float(k[0, 0]), float(k[1, 1]), float(k[0, 2]), float(k[1, 2]))
             array_k = camera_to_array_intrinsics(native, sampling_convention="camera_corner_origin_samples_at_half_v1")
