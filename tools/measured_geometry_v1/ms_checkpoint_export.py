@@ -67,6 +67,12 @@ def checkpoint_model_state(pipeline_state):
     return result
 
 
+def validate_export_counts(packet_count, appearance_count, group_count, eval_count, appearance_only):
+    expected_packets = 0 if appearance_only else group_count
+    if packet_count != expected_packets or appearance_count != eval_count:
+        raise ValueError("Incomplete export population or unexpected depth packets")
+
+
 def export(args):
     if args.output.exists():
         raise ValueError("Output exists; exports never overwrite")
@@ -80,6 +86,7 @@ def export(args):
     (args.output / "packets").mkdir()
     (args.output / "appearance").mkdir()
     started = time.time()
+    appearance_only = args.appearance_only
 
     import torch
     from nerfstudio.cameras import camera_utils
@@ -212,19 +219,20 @@ def export(args):
                 }
                 camera_record["record_sha256"] = record_hash(camera_record)
                 camera_rows.append(camera_record)
-                raw = gsplat_moments(native_rasterization=rasterization, native_get_viewmat=get_viewmat,
-                                     model=model, camera=camera)
-                wire, unit_record = source_unit_wire(raw, scale)
-                packet, comparison = packet_from_reference(wire, reference)
-                packet_path = args.output / "packets" / (Path(group["image_name"]).stem + ".npz")
-                with packet_path.open("xb") as stream:
-                    np.savez_compressed(stream, **packet)
-                packet_rows.append({"image_name": group["image_name"], "split": split,
-                    "packet": packet_path.relative_to(args.output).as_posix(), "sha256": sha256(packet_path),
-                    "bytes": packet_path.stat().st_size, "camera_record_sha256": camera_record["record_sha256"],
-                    "width": width, "height": height, "unit_conversion": unit_record,
-                    "packet_ref": json_summary(comparison)})
-                print(json.dumps({"phase": "packet", "completed": len(packet_rows), "image": group["image_name"]}), flush=True)
+                if not appearance_only:
+                    raw = gsplat_moments(native_rasterization=rasterization, native_get_viewmat=get_viewmat,
+                                         model=model, camera=camera)
+                    wire, unit_record = source_unit_wire(raw, scale)
+                    packet, comparison = packet_from_reference(wire, reference)
+                    packet_path = args.output / "packets" / (Path(group["image_name"]).stem + ".npz")
+                    with packet_path.open("xb") as stream:
+                        np.savez_compressed(stream, **packet)
+                    packet_rows.append({"image_name": group["image_name"], "split": split,
+                        "packet": packet_path.relative_to(args.output).as_posix(), "sha256": sha256(packet_path),
+                        "bytes": packet_path.stat().st_size, "camera_record_sha256": camera_record["record_sha256"],
+                        "width": width, "height": height, "unit_conversion": unit_record,
+                        "packet_ref": json_summary(comparison)})
+                    print(json.dumps({"phase": "packet", "completed": len(packet_rows), "image": group["image_name"]}), flush=True)
 
             if split == "eval":
                 with torch.no_grad():
@@ -241,8 +249,8 @@ def export(args):
                     "common_mask": group["output_masks"]["common"], "scored": False})
     if seen != set(lookup):
         raise ValueError("Missing actual parser frames")
-    if len(packet_rows) != len(manifest["groups"]) or len(appearance_rows) != loaded_counts["eval"]:
-        raise ValueError("Incomplete export population")
+    validate_export_counts(len(packet_rows), len(appearance_rows), len(manifest["groups"]),
+                           loaded_counts["eval"], appearance_only)
     write_json(args.output / "camera_records.json", camera_rows)
     result = {"schema": "umgs_ms_native_checkpoint_export_v1", "status": "EXPORTED_PENDING_SCIENTIFIC_SCORING",
         "method": args.method_id, "scene": manifest["scene_id"], "checkpoint": str(args.checkpoint),
@@ -252,8 +260,11 @@ def export(args):
         "reference": reference_identity, "data_root": str(data), "adapter_manifest_sha256": sha256(data / "manifest.json"),
         "normalization": normalization, "normalization_sha256": sha256(norm_path),
         "loaded_frame_counts": loaded_counts, "gaussian_count": int(model.gauss_params["means"].shape[0]),
-        "packet_schema": "ms_gcp_metric_depth_packet_v2", "primary_tensor": "alpha_normalized_expected_camera_z",
-        "semantics": "camera_z", "formula": "M1/A", "packet_units": "source_model_not_survey_metres",
+        "export_scope": "heldout_appearance_only" if appearance_only else "native_depth_and_heldout_appearance",
+        "packet_schema": None if appearance_only else "ms_gcp_metric_depth_packet_v2",
+        "primary_tensor": None if appearance_only else "alpha_normalized_expected_camera_z",
+        "semantics": None if appearance_only else "camera_z", "formula": None if appearance_only else "M1/A",
+        "packet_units": None if appearance_only else "source_model_not_survey_metres",
         "packet_views": packet_rows, "appearance_views": appearance_rows,
         "camera_records_sha256": sha256(args.output / "camera_records.json"),
         "wall_seconds": time.time() - started, "training_run": False, "formal_metrics_generated": False}
@@ -269,6 +280,7 @@ def main():
     for name in ("checkpoint-sha256", "method-commit", "reference-manifest-sha256", "method-id"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--step", type=int, default=119999)
+    parser.add_argument("--appearance-only", action="store_true")
     export(parser.parse_args())
 
 
