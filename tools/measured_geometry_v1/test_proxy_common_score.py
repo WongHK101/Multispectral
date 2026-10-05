@@ -1,4 +1,5 @@
 import unittest
+import json
 import numpy as np
 
 from .proxy_common_score import common_masks, complete_mean, mask_digest
@@ -43,6 +44,7 @@ class CommonProxyTests(unittest.TestCase):
         self.assertIsNone(complete_mean([1., None], 2)['value'])
         self.assertIsNone(complete_mean([1., np.nan], 2)['value'])
         self.assertEqual(complete_mean([1., 3.], 2)['value'], 2.)
+        self.assertTrue(json.loads(json.dumps(complete_mean([1., 3.], 2)))['complete'])
         with self.assertRaises(ValueError): complete_mean([1.], 2)
 
     def test_mask_digest_binds_shape_and_content(self):

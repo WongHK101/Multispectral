@@ -59,7 +59,7 @@ def mask_digest(mask):
 def complete_mean(values, expected):
     if len(values) != expected:
         raise ValueError("Target count mismatch during aggregation")
-    count = sum(v is not None and np.isfinite(v) for v in values)
+    count = int(sum(v is not None and np.isfinite(v) for v in values))
     return dict(value=float(np.mean(values)) if count == expected else None,
                 valid_target_count=int(count), expected_target_count=expected,
                 complete=count == expected)
