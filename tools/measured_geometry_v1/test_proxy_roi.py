@@ -6,7 +6,8 @@ import numpy as np
 
 from .contracts import record_hash
 from .proxy_common_score import CORE_METHODS, complete_mean
-from .proxy_roi import camera_record, qualify_reference, roi_mask, roi_common_masks, validate_camera, validate_reference
+from .proxy_roi import (camera_record, qualify_reference, roi_mask, roi_common_masks,
+    validate_camera, validate_reference, reference_camera, validate_triangle_ray_binding)
 from .proxy_roi_score import validate_packet_index
 from .test_proxy_common_score import packet
 
@@ -73,6 +74,26 @@ class RoiTests(unittest.TestCase):
         p = ref(); p['depth'] = np.ones((2, 2), np.float32)
         with self.assertRaisesRegex(ValueError, 'resizing prohibited'):
             validate_reference(p, cam())
+
+    def test_road_cannot_fall_back_to_colmap(self):
+        with self.assertRaisesRegex(ValueError, 'no COLMAP fallback'):
+            reference_camera('road', {}, None, None, '0' * 64)
+
+    def test_triangle_ray_binding_rejects_wrong_view_and_mesh(self):
+        p = ref(); y, x = np.indices((3, 4))
+        b1, b2 = (x + .5) / 8., (y + .5) / 8.
+        p['barycentric'] = np.stack([1 - b1 - b2, b1, b2], axis=-1).astype(np.float32)
+        vertices = np.array([[0., 0, 1], [8., 0, 1], [0., 8, 1]])
+        faces = np.array([[0, 1, 2]])
+        report = validate_triangle_ray_binding(p, cam(), vertices, faces)
+        self.assertEqual(report['max_error_source_model_units'], 0.)
+        self.assertEqual(len(report['samples']), 12)
+        wrong = cam(); wrong['source_c2w_opencv'][0][3] = 1.
+        wrong.pop('record_sha256'); wrong['record_sha256'] = record_hash(wrong)
+        with self.assertRaisesRegex(ValueError, 'binding mismatch'):
+            validate_triangle_ray_binding(p, wrong, vertices, faces)
+        with self.assertRaisesRegex(ValueError, 'binding mismatch'):
+            validate_triangle_ray_binding(p, cam(), vertices + [1., 0, 0], faces)
 
     def test_invalid_depth_or_barycentric(self):
         for key, value in [('depth', np.nan), ('depth', -1), ('barycentric', np.nan), ('valid', 2)]:

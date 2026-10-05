@@ -100,6 +100,58 @@ def validate_reference(packet, camera):
     return valid
 
 
+def reference_camera(scene, ref, image, camera, mesh_sha256):
+    if scene == 'road':
+        if 'fingerprint' not in ref or 'reference_provenance' not in ref:
+            raise ValueError('Road canonical fingerprint/provenance required; no COLMAP fallback')
+        result = fingerprint_camera_record(ref['fingerprint'], image.name)
+        provenance = bound_json(ref['reference_provenance'])
+        if (provenance['packet_sha256'] != ref['reference']['sha256'] or provenance['target'] != image.name
+                or provenance['mesh_ply_sha256'] != mesh_sha256
+                or provenance['fingerprint_payload_sha256'] != ref['fingerprint']['payload_sha256']
+                or provenance['method_independent'] is not True or provenance['method_specific_alignment_used']):
+            raise ValueError('Canonical reference provenance mismatch')
+        return result
+    if scene != 'five_k' or 'fingerprint' in ref:
+        raise ValueError('Unsupported reference camera source')
+    return camera_record(image, camera)
+
+
+def validate_triangle_ray_binding(packet, camera, vertices, faces):
+    """Bind a legacy cache to the actual mesh/camera, without rerendering it."""
+    valid = validate_reference(packet, camera)
+    k, pose = validate_camera(camera)
+    y, x = np.nonzero(valid)
+    selected = np.linspace(0, len(x) - 1, min(32, len(x)), dtype=int)
+    y, x = y[selected], x[selected]
+    ids = packet['triangle_id'][y, x]
+    if np.any(ids < 0) or np.any(ids >= len(faces)):
+        raise ValueError('Reference triangle outside bound mesh')
+    triangles = vertices[faces[ids]]
+    w2c = np.linalg.inv(pose)
+    triangle_camera = triangles @ w2c[:3, :3].T + w2c[:3, 3]
+    if not np.isfinite(triangle_camera).all() or np.any(triangle_camera[:, :, 2] <= 0):
+        raise ValueError('Reference triangle behind camera')
+    weights = packet['barycentric'][y, x].astype(np.float64) / triangle_camera[:, :, 2]
+    weights /= weights.sum(axis=1, keepdims=True)
+    triangle_world = (triangles * weights[:, :, None]).sum(axis=1)
+    z = packet['depth'][y, x].astype(np.float64)
+    camera_xyz = np.c_[(x + .5 - k[2]) / k[0] * z, (y + .5 - k[3]) / k[1] * z, z]
+    ray_world = camera_xyz @ pose[:3, :3].T + pose[:3, 3]
+    errors = np.linalg.norm(triangle_world - ray_world, axis=1)
+    if not np.isfinite(errors).all() or np.max(errors) >= 1e-3:
+        raise ValueError('Reference target/camera/mesh triangle-ray binding mismatch')
+    return dict(protocol='legacy_reference_triangle_ray_binding_v1',
+        sampling='32_evenly_spaced_row_major_valid_pixels_or_all_if_fewer',
+        tolerance_source_model_units=1e-3, camera_sha256=camera['record_sha256'],
+        max_error_source_model_units=float(np.max(errors)),
+        samples=[dict(x=int(px), y=int(py), triangle_id=int(tid),
+            triangle_vertices_source_xyz=tri.tolist(), barycentric=bary.tolist(),
+            depth=float(depth), error_source_model_units=float(error))
+            for px, py, tid, tri, bary, depth, error in zip(x, y, ids, triangles,
+                packet['barycentric'][y, x], z, errors)])
+
+
 def roi_mask(depth, valid, camera, transform, bounds, xy_transform):
     """Retain full-mesh first hits, including occlusion by outside-ROI objects."""
     k, pose = validate_camera(camera)
@@ -216,26 +268,28 @@ def materialize(args):
     if len(names) != count or len(set(names)) != count:
         raise ValueError('Frozen target count mismatch')
     refs = unique_rows(job['references'], 'image_name', names)
+    vertices = faces = None
+    if job['scene'] == 'five_k':
+        from tools.depth_reference_geometry_v2.openmvs_campaign_core import load_ply_mesh
+        vertices, faces, _ = load_ply_mesh(Path(audit['mesh_meta']['path']))
     transformer = Transformer.from_crs(4545, 32649, always_xy=True)
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / 'masks').mkdir()
     rows = []
     for index, name in enumerate(names):
         image = image_map[name]
-        camera = camera_record(image, cameras[image.camera_id])
+        camera = reference_camera(job['scene'], refs[name], image,
+            cameras[image.camera_id], audit['mesh_meta']['sha256'])
         record = refs[name]['reference']
-        if 'fingerprint' in refs[name]:
-            camera = fingerprint_camera_record(refs[name]['fingerprint'], name)
-            provenance = bound_json(refs[name]['reference_provenance'])
-            if (provenance['packet_sha256'] != record['sha256'] or provenance['target'] != name
-                    or provenance['mesh_ply_sha256'] != audit['mesh_meta']['sha256']
-                    or provenance['fingerprint_payload_sha256'] != refs[name]['fingerprint']['payload_sha256']
-                    or provenance['method_independent'] is not True or provenance['method_specific_alignment_used']):
-                raise ValueError('Canonical reference provenance mismatch')
         verify_sha(record['path'], record['sha256'])
         with np.load(record['path'], allow_pickle=False) as archive:
             packet = {key: archive[key] for key in archive.files}
         valid = validate_reference(packet, camera)
+        association = None
+        if job['scene'] == 'five_k':
+            association = validate_triangle_ray_binding(packet, camera, vertices, faces)
+            association.update(reference_sha256=record['sha256'],
+                mesh_sha256=audit['mesh_meta']['sha256'], image_name=name)
         mask, regions = roi_mask(packet['depth'], valid, camera, geometry['transform'], scene['roi_bounds_xy_m'], transformer.transform)
         path = args.output / 'masks' / f'{index:03d}.npy'
         with path.open('xb') as f:
@@ -246,6 +300,7 @@ def materialize(args):
         lo, hi = np.percentile(packet['depth'][valid], [2, 98])
         rows.append(dict(image_name=name, camera=camera, reference=record,
             reference_provenance=refs[name].get('reference_provenance'),
+            triangle_ray_binding=association,
             mask=dict(path=path.relative_to(args.output).as_posix(), sha256=sha256(path), matrix_sha256=mask_digest(mask)),
             subregions=dict(path=region_path.relative_to(args.output).as_posix(), sha256=sha256(region_path)),
             reference_roi_pixels=int(mask.sum()), full_mesh_pixels=int(valid.sum()),

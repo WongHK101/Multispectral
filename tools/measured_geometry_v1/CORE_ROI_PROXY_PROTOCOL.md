@@ -47,6 +47,15 @@ matrix inversion; do not orthogonalize them or substitute a same-size camera.
 Method export must match this reference camera/grid and source frame. An R8
 707x512 native packet cannot be resized into a 1200x869 proxy packet.
 
+Road requires its canonical fingerprint and producer manifest; missing either
+is an error, never a COLMAP fallback. For the legacy 5K cache without a
+per-packet producer manifest, verify 32 evenly spaced row-major valid pixels
+(all if fewer) against the bound mesh triangle IDs and perspective-correct
+barycentric reconstruction. The triangle point must match the camera ray/depth
+within 1e-3 source-model units, the existing CPU diagnosis tolerance. Save the
+sample inputs/errors and mesh/camera/cache hashes. This is a cache-association
+check, not a new geometric accuracy gate or proof of all-pixel correctness.
+
 Let V be finite, positive full-mesh reference first hits, and R be those hits
 strictly inside the frozen XY ROI. Compute the old five-method masks inside R:
 numeric-valid common primary C; opacity >= 0.5 intersection O; finite
