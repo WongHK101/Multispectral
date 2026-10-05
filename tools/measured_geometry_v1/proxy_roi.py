@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -104,9 +105,9 @@ def reference_camera(scene, ref, image, camera, mesh_sha256):
     if scene == 'road':
         if 'fingerprint' not in ref or 'reference_provenance' not in ref:
             raise ValueError('Road canonical fingerprint/provenance required; no COLMAP fallback')
-        result = fingerprint_camera_record(ref['fingerprint'], image.name)
+        result = fingerprint_camera_record(ref['fingerprint'], ref['image_name'])
         provenance = bound_json(ref['reference_provenance'])
-        if (provenance['packet_sha256'] != ref['reference']['sha256'] or provenance['target'] != image.name
+        if (provenance['packet_sha256'] != ref['reference']['sha256'] or provenance['target'] != ref['image_name']
                 or provenance['mesh_ply_sha256'] != mesh_sha256
                 or provenance['fingerprint_payload_sha256'] != ref['fingerprint']['payload_sha256']
                 or provenance['method_independent'] is not True or provenance['method_specific_alignment_used']):
@@ -115,6 +116,14 @@ def reference_camera(scene, ref, image, camera, mesh_sha256):
     if scene != 'five_k' or 'fingerprint' in ref:
         raise ValueError('Unsupported reference camera source')
     return camera_record(image, camera)
+
+
+def verify_target_population(path, expected_name_hash, count):
+    names = [line.strip() for line in Path(path).read_text().splitlines() if line.strip()]
+    name_hash = hashlib.sha256('\n'.join(sorted(names)).encode('utf-8')).hexdigest()
+    if len(names) != count or len(set(names)) != count or name_hash != expected_name_hash:
+        raise ValueError('Audit target population mismatch')
+    return names
 
 
 def validate_triangle_ray_binding(packet, camera, vertices, faces):
@@ -254,20 +263,29 @@ def materialize(args):
     if leakage['pass'] is not True or leakage['leakage_issue_count'] != 0:
         raise ValueError('Source-only reconstruction leakage')
     verify_sha(audit['mesh_meta']['path'], audit['mesh_meta']['sha256'])
-    for key in ('cameras', 'images', 'test_list'):
+    keys = ['test_list', 'registry'] if job['scene'] == 'road' else ['cameras', 'images', 'test_list']
+    for key in keys:
         verify_sha(job[key]['path'], job[key]['sha256'])
-    if job['test_list']['sha256'] != audit['split']['test_hash']:
-        raise ValueError('Audit target population mismatch')
-    from utils.read_write_model import read_cameras_binary, read_images_binary
-    cameras = read_cameras_binary(job['cameras']['path'])
-    images = read_images_binary(job['images']['path'])
-    image_map = {im.name: im for im in images.values()}
-    if len(image_map) != len(images):
-        raise ValueError('Duplicate source image name')
-    names = Path(job['test_list']['path']).read_text().splitlines()
-    if len(names) != count or len(set(names)) != count:
-        raise ValueError('Frozen target count mismatch')
+    names = verify_target_population(job['test_list']['path'], audit['split']['test_hash'], count)
     refs = unique_rows(job['references'], 'image_name', names)
+    cameras, image_map = {}, {}
+    if job['scene'] == 'road':
+        from .proxy_checkpoint_export import REGISTRY_SHA
+        verify_sha(job['registry']['path'], REGISTRY_SHA)
+        registry = read_json(job['registry']['path'])
+        source = next(s for s in registry['scenes'] if s['scene'] == 'road')
+        frozen = unique_rows(source['targets'], 'image_name', names)
+        for name in names:
+            if (refs[name]['reference'] != frozen[name]['reference_packet']
+                    or refs[name]['fingerprint']['payload_sha256'] != frozen[name]['fingerprint_sha256']):
+                raise ValueError('Road reference/camera differs from frozen registry')
+    else:
+        from utils.read_write_model import read_cameras_binary, read_images_binary
+        cameras = read_cameras_binary(job['cameras']['path'])
+        images = read_images_binary(job['images']['path'])
+        image_map = {im.name: im for im in images.values()}
+        if len(image_map) != len(images):
+            raise ValueError('Duplicate source image name')
     vertices = faces = None
     if job['scene'] == 'five_k':
         from tools.depth_reference_geometry_v2.openmvs_campaign_core import load_ply_mesh
@@ -277,9 +295,11 @@ def materialize(args):
     (args.output / 'masks').mkdir()
     rows = []
     for index, name in enumerate(names):
-        image = image_map[name]
+        image = image_map.get(name)
+        if job['scene'] == 'five_k' and image is None:
+            raise ValueError('Reference image missing from source camera model')
         camera = reference_camera(job['scene'], refs[name], image,
-            cameras[image.camera_id], audit['mesh_meta']['sha256'])
+            cameras[image.camera_id] if image is not None else None, audit['mesh_meta']['sha256'])
         record = refs[name]['reference']
         verify_sha(record['path'], record['sha256'])
         with np.load(record['path'], allow_pickle=False) as archive:
@@ -309,7 +329,7 @@ def materialize(args):
     eligibility = qualify_reference(audit, gates, rows, original)
     result = dict(schema=MANIFEST, protocol=PROTOCOL, scene=job['scene'], scene_id=scene_id,
         methods=list(CORE_METHODS), target_names=names, targets=rows, roi_bounds_xy_m=scene['roi_bounds_xy_m'],
-        inputs={k: job[k] for k in ('geometry', 'binding', 'audit', 'gates', 'qualification', 'source_only_leakage', 'cameras', 'images', 'test_list')},
+        inputs={k: job[k] for k in ['geometry', 'binding', 'audit', 'gates', 'qualification', 'source_only_leakage'] + keys},
         job_sha256=args.job_sha256, qualification=eligibility, gpu_used=False, method_values_read=False,
         original_assets_modified=False, full_mesh_occlusion_preserved=True,
         coordinate_chain='source_SfM -> frozen_control_only_Sim3 -> EPSG4545 -> EPSG32649; normal_height_unchanged',

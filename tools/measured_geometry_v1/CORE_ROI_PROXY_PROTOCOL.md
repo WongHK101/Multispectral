@@ -48,7 +48,10 @@ Method export must match this reference camera/grid and source frame. An R8
 707x512 native packet cannot be resized into a 1200x869 proxy packet.
 
 Road requires its canonical fingerprint and producer manifest; missing either
-is an error, never a COLMAP fallback. For the legacy 5K cache without a
+is an error, never a COLMAP fallback. Bind both to the frozen historical Road
+registry; its camera authority does not depend on the retired COLMAP copy.
+Keep file SHA and the old audit's sorted-name-list hash as separate checks.
+For the legacy 5K cache without a
 per-packet producer manifest, verify 32 evenly spaced row-major valid pixels
 (all if fewer) against the bound mesh triangle IDs and perspective-correct
 barycentric reconstruction. The triangle point must match the camera ray/depth

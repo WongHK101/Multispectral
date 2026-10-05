@@ -1,4 +1,7 @@
 import unittest
+import hashlib
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,7 +10,7 @@ import numpy as np
 from .contracts import record_hash
 from .proxy_common_score import CORE_METHODS, complete_mean
 from .proxy_roi import (camera_record, qualify_reference, roi_mask, roi_common_masks,
-    validate_camera, validate_reference, reference_camera, validate_triangle_ray_binding)
+    validate_camera, validate_reference, reference_camera, validate_triangle_ray_binding, verify_target_population)
 from .proxy_roi_score import validate_packet_index
 from .test_proxy_common_score import packet
 
@@ -78,6 +81,17 @@ class RoiTests(unittest.TestCase):
     def test_road_cannot_fall_back_to_colmap(self):
         with self.assertRaisesRegex(ValueError, 'no COLMAP fallback'):
             reference_camera('road', {}, None, None, '0' * 64)
+
+    def test_original_audit_hash_is_sorted_names_not_file_bytes(self):
+        with TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'test.txt'; p.write_text('b.JPG\na.JPG\n')
+            expected = hashlib.sha256(b'a.JPG\nb.JPG').hexdigest()
+            self.assertEqual(verify_target_population(p, expected, 2), ['b.JPG', 'a.JPG'])
+            with self.assertRaisesRegex(ValueError, 'population'):
+                verify_target_population(p, hashlib.sha256(p.read_bytes()).hexdigest(), 2)
+            p.write_text('a.JPG\na.JPG\n')
+            with self.assertRaisesRegex(ValueError, 'population'):
+                verify_target_population(p, expected, 2)
 
     def test_triangle_ray_binding_rejects_wrong_view_and_mesh(self):
         p = ref(); y, x = np.indices((3, 4))
